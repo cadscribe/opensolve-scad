@@ -12,7 +12,13 @@ use std::sync::Arc;
 
 use boolmesh::prelude::{Manifold, OpType, compute_boolean};
 
+mod export;
+mod stl;
 mod triangulate;
+mod zip;
+
+pub use export::{encode, step, three_mf};
+pub use stl::read_stl;
 
 pub use triangulate::triangulate;
 
@@ -35,7 +41,8 @@ pub struct Facets {
 }
 
 impl Facets {
-    fn add(&mut self, face: FaceId, normal: [f64; 3], on: [f64; 3]) -> u32 {
+    /// A new facet of `face`: the plane with `normal` through `on`.
+    pub fn add(&mut self, face: FaceId, normal: [f64; 3], on: [f64; 3]) -> u32 {
         let offset = dot(normal, on);
         self.all.push(Facet {
             face,
@@ -255,6 +262,16 @@ pub fn extrude(
     Ok(s)
 }
 
+/// An edge where two facets meet at an angle.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Crease {
+    pub a: [f64; 3],
+    pub b: [f64; 3],
+    /// The facet whose triangle runs from `a` to `b`, and the one beside it.
+    pub left: u32,
+    pub right: u32,
+}
+
 /// Value carried through a boolean: the facet, as a number.
 #[derive(Clone, Debug, Default, PartialEq)]
 struct Tag(f64);
@@ -313,6 +330,57 @@ impl Solid {
                 .iter()
                 .map(|p| std::array::from_fn(|i| snap(p[i] + delta[i])))
                 .collect(),
+            tris: self.tris.clone(),
+            facets: copied,
+            mesh: None,
+        }
+    }
+
+    /// A copy turned by `angle` radians about the axis through `origin` along
+    /// `axis`, on facets of its own named by `rename`.
+    pub fn rotated(
+        &self,
+        facets: &mut Facets,
+        origin: [f64; 3],
+        axis: [f64; 3],
+        angle: f64,
+        rename: impl Fn(FaceId) -> FaceId,
+    ) -> Solid {
+        let k = {
+            let l = dot(axis, axis).sqrt().max(1e-300);
+            axis.map(|x| x / l)
+        };
+        let (s, c) = angle.sin_cos();
+        // Rodrigues: v cos + (k × v) sin + k (k · v)(1 − cos).
+        let turn = |v: [f64; 3]| -> [f64; 3] {
+            let kv = cross(k, v);
+            let d = dot(k, v) * (1.0 - c);
+            std::array::from_fn(|i| v[i] * c + kv[i] * s + k[i] * d)
+        };
+        let mut map: HashMap<u32, u32> = HashMap::new();
+        let points: Vec<[f64; 3]> = self
+            .points
+            .iter()
+            .map(|p| {
+                let q = turn(sub(*p, origin));
+                std::array::from_fn(|i| snap(q[i] + origin[i]))
+            })
+            .collect();
+        let copied: Vec<u32> = self
+            .facets
+            .iter()
+            .map(|&f| {
+                *map.entry(f).or_insert_with(|| {
+                    let old = facets.get(f);
+                    let normal = turn(old.normal);
+                    let on = turn(sub(old.normal.map(|x| x * old.offset), origin));
+                    let on: [f64; 3] = std::array::from_fn(|i| on[i] + origin[i]);
+                    facets.add(rename(old.face), normal, on)
+                })
+            })
+            .collect();
+        Solid {
+            points,
             tris: self.tris.clone(),
             facets: copied,
             mesh: None,
@@ -478,6 +546,109 @@ impl Solid {
                     .is_some_and(|list| list.iter().any(|&o| covers(corners(o), mid, f.normal)))
             })
             .count()
+    }
+
+    /// Whether `p` lies inside: a ray's crossings, counted on a direction no
+    /// model edge is likely to run along.
+    pub fn contains(&self, p: [f64; 3]) -> bool {
+        let dir = [0.577_215_664_9, 0.312_345_678_9, 0.759_134_183_3];
+        let mut inside = false;
+        for t in &self.tris {
+            let [a, b, c] = t.map(|i| self.points[i as usize]);
+            let (e, f) = (sub(b, a), sub(c, a));
+            let q = cross(dir, f);
+            let det = dot(e, q);
+            if det.abs() < 1e-14 {
+                continue;
+            }
+            let s = sub(p, a);
+            let u = dot(s, q) / det;
+            let r = cross(s, e);
+            let v = dot(dir, r) / det;
+            let d = dot(f, r) / det;
+            if u >= 0.0 && v >= 0.0 && u + v < 1.0 && d > 0.0 {
+                inside = !inside;
+            }
+        }
+        inside
+    }
+
+    /// The edges where two facets meet that are not one plane: each once,
+    /// with the facet on either side (`left` runs `a` to `b`).
+    pub fn creases(&self, facets: &Facets) -> Vec<Crease> {
+        let mut out = Vec::new();
+        let mut seen: HashMap<(u32, u32), u32> = HashMap::new();
+        for (t, &facet) in self.tris.iter().zip(&self.facets) {
+            for k in 0..3 {
+                let (a, b) = (t[k], t[(k + 1) % 3]);
+                match seen.remove(&(b, a)) {
+                    Some(other) => {
+                        let (f, g) = (facets.get(facet), facets.get(other));
+                        if dot(f.normal, g.normal) < 1.0 - 1e-9 {
+                            out.push(Crease {
+                                a: self.points[a as usize],
+                                b: self.points[b as usize],
+                                left: facet,
+                                right: other,
+                            });
+                        }
+                    }
+                    None => {
+                        seen.insert((a, b), facet);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// A sphere of facets of one face, `n` around.
+    pub fn sphere(
+        facets: &mut Facets,
+        center: [f64; 3],
+        radius: f64,
+        n: usize,
+        face: FaceId,
+    ) -> Solid {
+        let (rings, around) = (n.max(4) / 2, n.max(4));
+        let mut s = Solid::default();
+        let at = |i: usize, j: usize| -> [f64; 3] {
+            let th = std::f64::consts::PI * i as f64 / rings as f64;
+            let ph = std::f64::consts::TAU * j as f64 / around as f64;
+            [
+                center[0] + radius * th.sin() * ph.cos(),
+                center[1] + radius * th.sin() * ph.sin(),
+                center[2] + radius * th.cos(),
+            ]
+        };
+        s.points.push(at(0, 0));
+        for i in 1..rings {
+            for j in 0..around {
+                s.points.push(at(i, j));
+            }
+        }
+        s.points.push(at(rings, 0));
+        let bottom = s.points.len() as u32 - 1;
+        let idx = |i: usize, j: usize| (1 + (i - 1) * around + j % around) as u32;
+        let mut tri = |s: &mut Solid, t: [u32; 3]| {
+            let [a, b, c] = t.map(|k| s.points[k as usize]);
+            let n = cross(sub(b, a), sub(c, a));
+            let l = dot(n, n).sqrt().max(1e-300);
+            let f = facets.add(face, n.map(|x| x / l), a);
+            s.push(t, f);
+        };
+        for j in 0..around {
+            tri(&mut s, [0, idx(1, j), idx(1, j + 1)]);
+            tri(&mut s, [bottom, idx(rings - 1, j + 1), idx(rings - 1, j)]);
+        }
+        for i in 1..rings - 1 {
+            for j in 0..around {
+                let (a, b, c, d) = (idx(i, j), idx(i, j + 1), idx(i + 1, j), idx(i + 1, j + 1));
+                tri(&mut s, [a, c, d]);
+                tri(&mut s, [a, d, b]);
+            }
+        }
+        s
     }
 
     /// `true` if every edge has exactly one partner running the other way.
@@ -738,6 +909,44 @@ mod tests {
         };
         let (a, b) = (top(&mut f, 2.0, 0), top(&mut f, 2.0 + 1e-13, 2000));
         assert_eq!(a.to_bits(), b.to_bits());
+    }
+
+    #[test]
+    fn a_turned_copy_keeps_its_volume_and_planes() {
+        let mut f = Facets::default();
+        let a = block(&mut f, rect(10.0, 0.0, 12.0, 2.0), 0.0, 3.0, 0);
+        let b = a.rotated(
+            &mut f,
+            [0.0; 3],
+            [0.0, 0.0, 1.0],
+            std::f64::consts::FRAC_PI_2,
+            |x| FaceId(x.0 + 9000),
+        );
+        assert!((b.volume() - a.volume()).abs() < 1e-9);
+        let (lo, hi) = b.bounds().unwrap();
+        assert!(
+            (lo[0] + 2.0).abs() < 1e-6 && (hi[1] - 12.0).abs() < 1e-6,
+            "{lo:?} {hi:?}"
+        );
+        for (t, &facet) in b.tris.iter().zip(&b.facets) {
+            assert!(f.fits(facet, t.map(|i| b.points[i as usize])));
+        }
+    }
+
+    #[test]
+    fn inside_creases_and_a_sphere() {
+        let mut f = Facets::default();
+        let a = block(&mut f, rect(0.0, 0.0, 10.0, 10.0), 0.0, 10.0, 0);
+        assert!(a.contains([5.0, 5.0, 5.0]) && !a.contains([15.0, 5.0, 5.0]));
+        assert_eq!(a.creases(&f).len(), 12);
+        let s = Solid::sphere(&mut f, [0.0; 3], 2.0, 32, FaceId(7));
+        assert!(s.is_closed());
+        let exact = 4.0 / 3.0 * std::f64::consts::PI * 8.0;
+        assert!(
+            s.volume() > 0.95 * exact && s.volume() < exact,
+            "{}",
+            s.volume()
+        );
     }
 
     #[test]
