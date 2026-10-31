@@ -603,6 +603,41 @@ impl Solid {
         self.sheets(facets).len()
     }
 
+    /// Fins: edges where two faces fold nearly back to back, wider than
+    /// `wider` (how far the narrower of the two triangles reaches from the
+    /// edge). Booleans meeting at a graze leave them; a printed part with no
+    /// knife edge has none.
+    pub fn fins(&self, facets: &Facets, wider: f64) -> Vec<([f64; 3], [f64; 3], f64)> {
+        let to_line = |p: [f64; 3], a: [f64; 3], b: [f64; 3]| {
+            let d = sub(b, a);
+            let t = (dot(sub(p, a), d) / dot(d, d).max(1e-300)).clamp(0.0, 1.0);
+            let q = sub(p, a);
+            let r = [q[0] - d[0] * t, q[1] - d[1] * t, q[2] - d[2] * t];
+            dot(r, r).sqrt()
+        };
+        let mut out = Vec::new();
+        for c in self.creases(facets) {
+            let (f, g) = (facets.get(c.left), facets.get(c.right));
+            let long = dot(sub(c.b, c.a), sub(c.b, c.a)).sqrt();
+            if dot(f.normal, g.normal) >= -0.7 || long <= 1e-4 {
+                continue;
+            }
+            let on = |p: [f64; 3]| p == c.a || p == c.b;
+            let width = self
+                .tris
+                .iter()
+                .map(|t| t.map(|i| self.points[i as usize]))
+                .filter(|t| t.iter().filter(|p| on(**p)).count() == 2)
+                .flat_map(|t| t.into_iter().filter(|p| !on(*p)))
+                .map(|p| to_line(p, c.a, c.b))
+                .fold(f64::MAX, f64::min);
+            if width > wider && width < f64::MAX {
+                out.push((c.a, c.b, width));
+            }
+        }
+        out
+    }
+
     /// Which triangles those are.
     pub fn sheets(&self, facets: &Facets) -> Vec<usize> {
         let key = |f: &Facet, sign: f64| {
