@@ -622,7 +622,8 @@ impl Solid {
             if dot(f.normal, g.normal) >= -0.7 || long <= 1e-4 {
                 continue;
             }
-            let on = |p: [f64; 3]| p == c.a || p == c.b;
+            let at = |p: [f64; 3], q: [f64; 3]| (0..3).all(|i| (p[i] - q[i]).abs() < 1e-12);
+            let on = |p: [f64; 3]| at(p, c.a) || at(p, c.b);
             let width = self
                 .tris
                 .iter()
