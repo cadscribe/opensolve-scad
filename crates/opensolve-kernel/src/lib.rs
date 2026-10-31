@@ -60,6 +60,19 @@ impl Facets {
         self.all[facet as usize]
     }
 
+    pub fn len(&self) -> usize {
+        self.all.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.all.is_empty()
+    }
+
+    /// Forgets the facets from `len` on, which no solid may still use.
+    pub fn truncate(&mut self, len: usize) {
+        self.all.truncate(len);
+    }
+
     fn fits(&self, facet: u32, tri: [[f64; 3]; 3]) -> bool {
         let f = self.get(facet);
         tri.iter()
