@@ -14,12 +14,14 @@ use boolmesh::prelude::{Manifold, OpType, compute_boolean};
 
 mod export;
 mod raster;
+mod revolve;
 mod stl;
 mod triangulate;
 mod zip;
 
 pub use export::{encode, step, three_mf};
 pub use raster::{Shot, render};
+pub use revolve::{revolve, revolve_radius};
 pub use stl::read_stl;
 
 pub use triangulate::triangulate;
@@ -121,6 +123,10 @@ pub enum Error {
     BadProfile,
     /// The mesh library refused, with its message.
     Boolean(String),
+    /// A revolve's axis is not in the profile's plane.
+    AxisOffPlane,
+    /// A revolve's profile lies on both sides of its axis.
+    CrossesAxis,
 }
 
 impl std::fmt::Display for Error {
@@ -128,6 +134,8 @@ impl std::fmt::Display for Error {
         match self {
             Error::BadProfile => f.write_str("the profile has no area"),
             Error::Boolean(m) => write!(f, "boolean failed: {m}"),
+            Error::AxisOffPlane => f.write_str("the axis is not in the sketch's plane"),
+            Error::CrossesAxis => f.write_str("the profile crosses the axis"),
         }
     }
 }
