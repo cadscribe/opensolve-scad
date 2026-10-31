@@ -244,7 +244,7 @@ mod tests {
             FaceId(301),
         )
         .unwrap();
-        (a.boolean(&h, Op::Subtract, &f).unwrap(), f)
+        (a.boolean(&h, Op::Subtract, &mut f).unwrap(), f)
     }
 
     #[test]

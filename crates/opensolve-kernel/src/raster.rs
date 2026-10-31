@@ -53,10 +53,10 @@ pub struct Shot {
 }
 
 impl Default for Shot {
-    /// From the front right, above, as the app's Iso view.
+    /// From the front left, above, as the app's Iso view.
     fn default() -> Shot {
         Shot {
-            toward: [0.52, -0.62, 0.59],
+            toward: [-0.563, -0.604, 0.565],
             up: [0.0, 0.0, 1.0],
             width: 800,
             height: 600,

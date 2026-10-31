@@ -429,7 +429,9 @@ impl Solid {
             .map_err(Error::Boolean)
     }
 
-    pub fn boolean(&self, other: &Solid, op: Op, facets: &Facets) -> Result<Solid, Error> {
+    /// The boolean of two solids. What a cut leaves of the cutter faces the
+    /// other way: such triangles get a facet turned round, of the same face.
+    pub fn boolean(&self, other: &Solid, op: Op, facets: &mut Facets) -> Result<Solid, Error> {
         if self.is_empty() || other.is_empty() {
             return Ok(match op {
                 Op::Add if self.is_empty() => other.clone(),
@@ -459,7 +461,7 @@ impl Solid {
         }
     }
 
-    fn from_manifold(mut m: Manifold<Tag>, facets: &Facets) -> Solid {
+    fn from_manifold(mut m: Manifold<Tag>, facets: &mut Facets) -> Solid {
         let points: Vec<[f64; 3]> = m.ps.iter().map(|p| [p.x, p.y, p.z]).collect();
         let tris: Vec<[u32; 3]> =
             m.hs.chunks(3)
@@ -509,10 +511,23 @@ impl Solid {
                 break;
             }
         }
+        let mut turned: HashMap<u32, u32> = HashMap::new();
         let facets_of: Vec<u32> = out
             .iter()
             .zip(&tris)
-            .map(|(f, t)| f.unwrap_or_else(|| nearest_facet(facets, at(*t))))
+            .map(|(f, t)| {
+                let f = f.unwrap_or_else(|| nearest_facet(facets, at(*t)));
+                let [p, q, r] = at(*t);
+                let n = cross(sub(q, p), sub(r, p));
+                let old = facets.get(f);
+                if dot(n, old.normal) >= 0.0 || dot(n, n) < 1e-24 {
+                    return f;
+                }
+                *turned.entry(f).or_insert_with(|| {
+                    let on = old.normal.map(|x| x * old.offset);
+                    facets.add(old.face, old.normal.map(|x| -x), on)
+                })
+            })
             .collect();
         // The next boolean starts from the repaired names.
         for (c, f) in m.vals.chunks_mut(3).zip(&facets_of) {
@@ -761,7 +776,7 @@ mod tests {
         let mut f = Facets::default();
         let a = block(&mut f, rect(0.0, 0.0, 10.0, 10.0), 0.0, 10.0, 0);
         let c = block(&mut f, rect(3.0, 3.0, 7.0, 7.0), 0.0, 10.0, 2000);
-        let r = a.boolean(&c, Op::Subtract, &f).unwrap();
+        let r = a.boolean(&c, Op::Subtract, &mut f).unwrap();
         assert!(r.is_closed());
         assert!((r.volume() - 840.0).abs() < 1e-9);
         let faces = r.faces(&f);
@@ -776,7 +791,7 @@ mod tests {
         let mut f = Facets::default();
         let a = block(&mut f, rect(0.0, 0.0, 10.0, 10.0), 0.0, 10.0, 0);
         let b = block(&mut f, rect(0.0, 0.0, 10.0, 10.0), 0.0, 10.0, 2000);
-        assert!(a.boolean(&b, Op::Subtract, &f).unwrap().is_empty());
+        assert!(a.boolean(&b, Op::Subtract, &mut f).unwrap().is_empty());
     }
 
     #[test]
@@ -789,7 +804,9 @@ mod tests {
                 block(&mut f, circle(x, y, 2.0, 32), 0.0, 3.0, 2000 + 2000 * i)
             })
             .collect();
-        let r = a.boolean(&Solid::merged(&holes), Op::Subtract, &f).unwrap();
+        let r = a
+            .boolean(&Solid::merged(&holes), Op::Subtract, &mut f)
+            .unwrap();
         assert!(r.is_closed());
         assert!(r.volume() > 0.0 && r.volume() < 7500.0);
     }
@@ -822,7 +839,7 @@ mod tests {
                 10.0,
                 2000 + i * 2000,
             );
-            a = a.boolean(&c, Op::Subtract, &f).unwrap();
+            a = a.boolean(&c, Op::Subtract, &mut f).unwrap();
             assert!(a.is_closed(), "cut {i}");
         }
         for (t, &facet) in a.tris.iter().zip(&a.facets) {
@@ -873,7 +890,7 @@ mod tests {
         for (t, &facet) in b.tris.iter().zip(&b.facets) {
             assert!(f.fits(facet, t.map(|i| b.points[i as usize])));
         }
-        let r = a.boolean(&b, Op::Add, &f).unwrap();
+        let r = a.boolean(&b, Op::Add, &mut f).unwrap();
         assert!(r.is_closed());
         assert!((r.volume() - 2.0).abs() < 1e-9);
     }
@@ -886,11 +903,11 @@ mod tests {
         let a = block(&mut f, rect(0.0, 0.0, 10.0, 10.0), 0.0, 5.0, 0);
         let c1 = block(&mut f, rect(5.0, 0.0, 10.0, 5.0), 0.0, 5.0, 2000);
         let c2 = block(&mut f, rect(0.0, 5.0, 5.0, 10.0), 0.0, 5.0, 4000);
-        let r = a.boolean(&c1, Op::Subtract, &f).unwrap();
-        let r = r.boolean(&c2, Op::Subtract, &f).unwrap();
+        let r = a.boolean(&c1, Op::Subtract, &mut f).unwrap();
+        let r = r.boolean(&c2, Op::Subtract, &mut f).unwrap();
         assert!((r.volume() - 250.0).abs() < 1e-9);
         let hole = block(&mut f, rect(1.0, 1.0, 2.0, 2.0), 0.0, 5.0, 6000);
-        let r = r.boolean(&hole, Op::Subtract, &f).unwrap();
+        let r = r.boolean(&hole, Op::Subtract, &mut f).unwrap();
         assert!((r.volume() - 245.0).abs() < 1e-9);
     }
 
