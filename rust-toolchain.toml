@@ -1,0 +1,6 @@
+[toolchain]
+channel = "1.95.0"
+components = ["rustfmt", "clippy"]
+# wasm32: the web app. The iOS targets are added by `make ios-core`
+# (scripts/build-ios-core.sh), so desktop developers and CI skip them.
+targets = ["wasm32-unknown-unknown"]
