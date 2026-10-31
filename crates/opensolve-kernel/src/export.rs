@@ -40,27 +40,44 @@ pub fn encode(solid: &Solid, facets: &Facets, ext: &str, name: &str) -> Option<V
 
 /// The solid as a 3MF package: one object, one build item.
 pub fn three_mf(solid: &Solid, name: &str) -> Vec<u8> {
-    let mut mesh = String::new();
-    mesh.push_str("<vertices>\n");
-    for p in &solid.points {
-        let _ = writeln!(mesh, r#"<vertex x="{}" y="{}" z="{}"/>"#, p[0], p[1], p[2]);
-    }
-    mesh.push_str("</vertices>\n<triangles>\n");
-    for t in &solid.tris {
+    three_mf_objects(&[(solid, name)])
+}
+
+/// Solids as a 3MF package, each an object of its own with a build item, so
+/// that a slicer takes them as parts to place one by one.
+pub fn three_mf_objects(objects: &[(&Solid, &str)]) -> Vec<u8> {
+    let mut resources = String::new();
+    let mut build = String::new();
+    for (k, (solid, name)) in objects.iter().enumerate() {
+        let id = k + 1;
         let _ = writeln!(
-            mesh,
-            r#"<triangle v1="{}" v2="{}" v3="{}"/>"#,
-            t[0], t[1], t[2]
+            resources,
+            "<object id=\"{id}\" type=\"model\" name=\"{}\">\n<mesh>\n<vertices>",
+            xml_text(name)
         );
+        for p in &solid.points {
+            let _ = writeln!(
+                resources,
+                r#"<vertex x="{}" y="{}" z="{}"/>"#,
+                p[0], p[1], p[2]
+            );
+        }
+        resources.push_str("</vertices>\n<triangles>\n");
+        for t in &solid.tris {
+            let _ = writeln!(
+                resources,
+                r#"<triangle v1="{}" v2="{}" v3="{}"/>"#,
+                t[0], t[1], t[2]
+            );
+        }
+        resources.push_str("</triangles>\n</mesh>\n</object>\n");
+        let _ = writeln!(build, "<item objectid=\"{id}\"/>");
     }
-    mesh.push_str("</triangles>\n");
     let xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <model unit=\"millimeter\" xml:lang=\"en-US\" \
          xmlns=\"http://schemas.microsoft.com/3dmanufacturing/core/2015/02\">\n\
-         <resources>\n<object id=\"1\" type=\"model\" name=\"{}\">\n<mesh>\n{mesh}</mesh>\n</object>\n\
-         </resources>\n<build>\n<item objectid=\"1\"/>\n</build>\n</model>\n",
-        xml_text(name)
+         <resources>\n{resources}</resources>\n<build>\n{build}</build>\n</model>\n"
     );
     let mut files = BTreeMap::new();
     files.insert(
@@ -254,6 +271,15 @@ mod tests {
         assert_eq!(&z[..2], b"PK");
         let text = String::from_utf8_lossy(&z);
         assert!(text.contains("<triangle ") && text.contains("A &amp; B"));
+    }
+
+    #[test]
+    fn three_mf_keeps_each_part_an_object() {
+        let (s, _) = holed_block();
+        let z = three_mf_objects(&[(&s, "Lid"), (&s, "Case")]);
+        let text = String::from_utf8_lossy(&z);
+        assert_eq!(text.matches("<object ").count(), 2);
+        assert!(text.contains(r#"<item objectid="2"/>"#) && text.contains(r#"name="Case""#));
     }
 
     #[test]
