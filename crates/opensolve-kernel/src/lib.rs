@@ -13,11 +13,13 @@ use std::sync::Arc;
 use boolmesh::prelude::{Manifold, OpType, compute_boolean};
 
 mod export;
+mod raster;
 mod stl;
 mod triangulate;
 mod zip;
 
 pub use export::{encode, step, three_mf};
+pub use raster::{Shot, render};
 pub use stl::read_stl;
 
 pub use triangulate::triangulate;
