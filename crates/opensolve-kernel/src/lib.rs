@@ -400,6 +400,33 @@ impl Solid {
         }))
     }
 
+    /// A solid from its triangles, each with the face it belongs to; every
+    /// triangle gets a facet of its own plane, its normal by its winding.
+    /// The caller sees to it that the mesh is closed.
+    pub fn from_mesh(
+        facets: &mut Facets,
+        points: Vec<[f64; 3]>,
+        tris: Vec<[u32; 3]>,
+        faces: &[FaceId],
+    ) -> Solid {
+        let tags = tris
+            .iter()
+            .zip(faces)
+            .map(|(t, &face)| {
+                let [a, b, c] = t.map(|i| points[i as usize]);
+                let n = cross(sub(b, a), sub(c, a));
+                let l = dot(n, n).sqrt().max(1e-300);
+                facets.add(face, n.map(|x| x / l), a)
+            })
+            .collect();
+        Solid {
+            points: points.into_iter().map(|p| p.map(snap)).collect(),
+            tris,
+            facets: tags,
+            mesh: None,
+        }
+    }
+
     /// Several solids that do not touch, as one. Cutting a batch at once is
     /// much faster than one after the other.
     pub fn merged(parts: &[Solid]) -> Solid {
