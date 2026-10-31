@@ -50,6 +50,9 @@ pub struct Shot {
     pub edge: [u8; 3],
     /// `None`: transparent.
     pub background: Option<[u8; 3]>,
+    /// A close-up: this point in the middle, this many millimetres across
+    /// the shorter side. `None`: the whole part.
+    pub around: Option<([f64; 3], f64)>,
 }
 
 impl Default for Shot {
@@ -63,6 +66,7 @@ impl Default for Shot {
             part: [139, 160, 196],
             edge: [36, 44, 62],
             background: Some([244, 244, 246]),
+            around: None,
         }
     }
 }
@@ -100,8 +104,13 @@ pub fn render(solid: &Solid, facets: &Facets, shot: &Shot) -> Vec<u8> {
         }
     }
     let span = [(hi[0] - lo[0]).max(1e-9), (hi[1] - lo[1]).max(1e-9)];
-    let scale = 0.9 * (w as f64 / span[0]).min(h as f64 / span[1]);
-    let mid = [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0];
+    let (scale, mid) = match shot.around {
+        Some((at, across)) => (w.min(h) as f64 / across.max(1e-9), [dot(at, r), dot(at, u)]),
+        None => (
+            0.9 * (w as f64 / span[0]).min(h as f64 / span[1]),
+            [(lo[0] + hi[0]) / 2.0, (lo[1] + hi[1]) / 2.0],
+        ),
+    };
     let (cx, cy) = (w as f64 / 2.0, h as f64 / 2.0);
     let project = |p: [f64; 3]| {
         [

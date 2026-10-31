@@ -520,7 +520,12 @@ impl Solid {
                 let [p, q, r] = at(*t);
                 let n = cross(sub(q, p), sub(r, p));
                 let old = facets.get(f);
-                if dot(n, old.normal) >= 0.0 || dot(n, n) < 1e-24 {
+                // A splinter's winding is noise: it keeps its facet.
+                let longest = [sub(q, p), sub(r, q), sub(p, r)]
+                    .map(|e| dot(e, e))
+                    .into_iter()
+                    .fold(0.0, f64::max);
+                if dot(n, old.normal) >= 0.0 || dot(n, n) < 1e-12 * longest * longest {
                     return f;
                 }
                 *turned.entry(f).or_insert_with(|| {
@@ -529,6 +534,22 @@ impl Solid {
                 })
             })
             .collect();
+        // One plane, one way round: one face, under the older name. A cut
+        // that ends on a face (a fillet's end on a floor) must not rename
+        // the floor.
+        let plane = |f: u32| {
+            let x = facets.get(f);
+            let r = |v: f64| (v * 1e6).round() as i64;
+            (x.normal.map(r), r(x.offset))
+        };
+        let mut oldest: HashMap<([i64; 3], i64), u32> = HashMap::new();
+        for &f in &facets_of {
+            oldest
+                .entry(plane(f))
+                .and_modify(|o| *o = (*o).min(f))
+                .or_insert(f);
+        }
+        let facets_of: Vec<u32> = facets_of.iter().map(|&f| oldest[&plane(f)]).collect();
         // The next boolean starts from the repaired names.
         for (c, f) in m.vals.chunks_mut(3).zip(&facets_of) {
             c.fill(Tag(f64::from(*f)));
@@ -544,6 +565,11 @@ impl Solid {
     /// Triangles covered by a triangle of the opposite side in the same plane:
     /// a sheet of no thickness, closed and without volume.
     pub fn sheet_triangles(&self, facets: &Facets) -> usize {
+        self.sheets(facets).len()
+    }
+
+    /// Which triangles those are.
+    pub fn sheets(&self, facets: &Facets) -> Vec<usize> {
         let key = |f: &Facet, sign: f64| {
             let round = |x: f64| (x * 1e5).round() as i64;
             (f.normal.map(|x| round(x * sign)), round(f.offset * sign))
@@ -557,12 +583,17 @@ impl Solid {
             .filter(|&t| {
                 let f = facets.get(self.facets[t]);
                 let [a, b, c] = corners(t);
+                // A splinter of no area has no side to speak of.
+                let n = cross(sub(b, a), sub(c, a));
+                if dot(n, n) < 4e-18 {
+                    return false;
+                }
                 let mid = std::array::from_fn(|i| (a[i] + b[i] + c[i]) / 3.0);
                 planes
                     .get(&key(&f, -1.0))
                     .is_some_and(|list| list.iter().any(|&o| covers(corners(o), mid, f.normal)))
             })
-            .count()
+            .collect()
     }
 
     /// Whether `p` lies inside: a ray's crossings, counted on a direction no
