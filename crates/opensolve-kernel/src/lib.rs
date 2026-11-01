@@ -467,6 +467,28 @@ impl Solid {
         }
     }
 
+    /// The solid with its facets, read from `from`, added to `into` anew:
+    /// a solid kept from another build, in this one's facets.
+    pub fn rehome(&self, from: &Facets, into: &mut Facets) -> Solid {
+        let mut moved: HashMap<u32, u32> = HashMap::new();
+        let facets = self
+            .facets
+            .iter()
+            .map(|&f| {
+                *moved.entry(f).or_insert_with(|| {
+                    into.all.push(from.get(f));
+                    into.all.len() as u32 - 1
+                })
+            })
+            .collect();
+        Solid {
+            points: self.points.clone(),
+            tris: self.tris.clone(),
+            facets,
+            mesh: None,
+        }
+    }
+
     /// Several solids that do not touch, as one. Cutting a batch at once is
     /// much faster than one after the other.
     pub fn merged(parts: &[Solid]) -> Solid {
