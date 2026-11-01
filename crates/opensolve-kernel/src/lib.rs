@@ -410,6 +410,23 @@ impl Solid {
         }
     }
 
+    /// Only the triangles whose facet `keep` keeps: to show, not to cut.
+    pub fn only(&self, keep: impl Fn(u32) -> bool) -> Solid {
+        let (tris, facets) = self
+            .tris
+            .iter()
+            .zip(&self.facets)
+            .filter(|&(_, &f)| keep(f))
+            .map(|(t, &f)| (*t, f))
+            .unzip();
+        Solid {
+            points: self.points.clone(),
+            tris,
+            facets,
+            mesh: None,
+        }
+    }
+
     /// The bounding box: lowest and highest corner.
     pub fn bounds(&self) -> Option<([f64; 3], [f64; 3])> {
         let first = *self.points.first()?;
