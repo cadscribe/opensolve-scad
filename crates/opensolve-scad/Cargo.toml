@@ -1,0 +1,13 @@
+[package]
+name = "opensolve-scad"
+description = "OpenSCAD files read and built into solids in Rust, without OpenSCAD"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+opensolve-kernel.workspace = true
+
+[lints]
+workspace = true
