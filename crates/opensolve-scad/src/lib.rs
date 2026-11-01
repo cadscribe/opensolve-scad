@@ -92,6 +92,12 @@ pub fn files(path: &Path, read: Reader<'_>) -> Vec<PathBuf> {
     out
 }
 
+/// Whether `text` is one value or expression as OpenSCAD writes it: what an
+/// override may be.
+pub fn check_value(text: &str) -> Result<(), Error> {
+    parser::parse_expr(text).map(|_| ())
+}
+
 /// The paths of `include <…>` and `use <…>` in a file's text, as written.
 pub fn includes(text: &str) -> Vec<String> {
     let Ok(tokens) = lexer::tokens(text) else {
