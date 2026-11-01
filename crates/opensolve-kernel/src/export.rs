@@ -62,46 +62,97 @@ fn uuid(seed: &str) -> String {
     )
 }
 
+/// An object to print: its name and its parts, each a solid with its name
+/// and its filament (extruder) slot, from 1.
+pub type PrintObject<'a> = (&'a str, Vec<(&'a Solid, &'a str, u32)>);
+
 /// Solids as a 3MF package, each an object of its own with a build item, so
 /// that a slicer takes them as parts to place one by one, each with the
-/// filament (extruder) slot given, from 1. Written as Bambu Studio writes
-/// its own (its namespace, UUIDs of the production extension, and
-/// `Metadata/model_settings.config` with the objects, their extruders and
-/// one plate), so that it takes more than the geometry; other slicers read
-/// the core 3MF in it.
+/// filament slot given. See [`three_mf_print`].
 pub fn three_mf_objects(objects: &[(&Solid, &str, u32)]) -> Vec<u8> {
+    let objects: Vec<PrintObject> = objects
+        .iter()
+        .map(|&(solid, name, extruder)| (name, vec![(solid, name, extruder)]))
+        .collect();
+    three_mf_print(&objects)
+}
+
+/// Solids as one object of a 3MF package made of them as its parts: put
+/// together they print together, each part in its colour.
+pub fn three_mf_assembly(name: &str, parts: &[(&Solid, &str, u32)]) -> Vec<u8> {
+    three_mf_print(&[(name, parts.to_vec())])
+}
+
+/// Objects to print as a 3MF package, each with a build item; an object of
+/// several parts is a slicer's multi-part object, printed as one, each part
+/// in its filament. Written as Bambu Studio writes its own (its namespace,
+/// UUIDs of the production extension, and `Metadata/model_settings.config`
+/// with the objects, their parts' extruders and one plate), so that it
+/// takes more than the geometry; other slicers read the core 3MF in it.
+pub fn three_mf_print(objects: &[PrintObject]) -> Vec<u8> {
     let identity = "1 0 0 0 1 0 0 0 1 0 0 0";
     let mut resources = String::new();
     let mut build = String::new();
     let mut settings = String::new();
     let mut instances = String::new();
     let mut assemble = String::new();
-    for (k, (solid, name, extruder)) in objects.iter().enumerate() {
-        let id = k + 1;
+    let mut next = 1;
+    for (k, (name, parts)) in objects.iter().enumerate() {
         let name = xml_text(name);
-        mesh_object(&mut resources, id, &name, solid);
+        let mut components = String::new();
+        let mut volumes = String::new();
+        let mut faces = 0;
+        let first = next;
+        for (v, (solid, part, extruder)) in parts.iter().enumerate() {
+            let id = next;
+            next += 1;
+            let part = xml_text(part);
+            mesh_object(&mut resources, id, &part, solid);
+            let _ = writeln!(
+                components,
+                "<component objectid=\"{id}\" p:UUID=\"{}\" transform=\"{identity}\"/>",
+                uuid(&format!("component {id} {part}"))
+            );
+            faces += solid.tris.len();
+            let _ = write!(
+                volumes,
+                "    <part id=\"{id}\" subtype=\"normal_part\">\n\
+                 \x20     <metadata key=\"name\" value=\"{part}\"/>\n\
+                 \x20     <metadata key=\"matrix\" value=\"1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1\"/>\n\
+                 \x20     <metadata key=\"source_object_id\" value=\"{k}\"/>\n\
+                 \x20     <metadata key=\"source_volume_id\" value=\"{v}\"/>\n\
+                 \x20     <metadata key=\"extruder\" value=\"{extruder}\"/>\n\
+                 \x20     <mesh_stat face_count=\"{}\" edges_fixed=\"0\" degenerate_facets=\"0\" \
+                 facets_removed=\"0\" facets_reversed=\"0\" backwards_edges=\"0\"/>\n\
+                 \x20   </part>\n",
+                solid.tris.len()
+            );
+        }
+        // One part: the mesh is the object; several: an object of them.
+        let id = if parts.len() == 1 {
+            first
+        } else {
+            let id = next;
+            next += 1;
+            let _ = writeln!(
+                resources,
+                "<object id=\"{id}\" name=\"{name}\" type=\"model\" p:UUID=\"{}\">\n<components>\n{components}</components>\n</object>",
+                uuid(&format!("object {id} {name}"))
+            );
+            id
+        };
+        let extruder = parts.first().map_or(1, |p| p.2);
         let _ = writeln!(
             build,
             "<item objectid=\"{id}\" p:UUID=\"{}\" transform=\"{identity}\" printable=\"1\"/>",
             uuid(&format!("item {id} {name}"))
         );
-        let faces = solid.tris.len();
         let _ = write!(
             settings,
             "  <object id=\"{id}\">\n\
              \x20   <metadata key=\"name\" value=\"{name}\"/>\n\
              \x20   <metadata key=\"extruder\" value=\"{extruder}\"/>\n\
-             \x20   <metadata key=\"\" face_count=\"{faces}\"/>\n\
-             \x20   <part id=\"{id}\" subtype=\"normal_part\">\n\
-             \x20     <metadata key=\"name\" value=\"{name}\"/>\n\
-             \x20     <metadata key=\"matrix\" value=\"1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1\"/>\n\
-             \x20     <metadata key=\"source_object_id\" value=\"{k}\"/>\n\
-             \x20     <metadata key=\"source_volume_id\" value=\"0\"/>\n\
-             \x20     <metadata key=\"extruder\" value=\"{extruder}\"/>\n\
-             \x20     <mesh_stat face_count=\"{faces}\" edges_fixed=\"0\" degenerate_facets=\"0\" \
-             facets_removed=\"0\" facets_reversed=\"0\" backwards_edges=\"0\"/>\n\
-             \x20   </part>\n\
-             \x20 </object>\n"
+             \x20   <metadata key=\"\" face_count=\"{faces}\"/>\n{volumes}  </object>\n"
         );
         let _ = write!(
             instances,
@@ -116,70 +167,6 @@ pub fn three_mf_objects(objects: &[(&Solid, &str, u32)]) -> Vec<u8> {
             "    <assemble_item object_id=\"{id}\" instance_id=\"0\" transform=\"{identity}\" offset=\"0 0 0\"/>"
         );
     }
-    package(&resources, &build, &settings, &instances, &assemble)
-}
-
-/// Solids as one object of a 3MF package made of them as its parts, each
-/// with its filament (extruder) slot: put together they print together,
-/// each part in its colour, as a slicer's multi-part object. In the shape
-/// Bambu Studio writes, as [`three_mf_objects`].
-pub fn three_mf_assembly(name: &str, parts: &[(&Solid, &str, u32)]) -> Vec<u8> {
-    let identity = "1 0 0 0 1 0 0 0 1 0 0 0";
-    let whole = parts.len() + 1;
-    let name = xml_text(name);
-    let mut resources = String::new();
-    let mut components = String::new();
-    let mut settings = String::new();
-    let mut faces = 0;
-    for (k, (solid, part, extruder)) in parts.iter().enumerate() {
-        let id = k + 1;
-        let part = xml_text(part);
-        mesh_object(&mut resources, id, &part, solid);
-        let _ = writeln!(
-            components,
-            "<component objectid=\"{id}\" p:UUID=\"{}\" transform=\"{identity}\"/>",
-            uuid(&format!("component {id} {part}"))
-        );
-        faces += solid.tris.len();
-        let _ = write!(
-            settings,
-            "    <part id=\"{id}\" subtype=\"normal_part\">\n\
-             \x20     <metadata key=\"name\" value=\"{part}\"/>\n\
-             \x20     <metadata key=\"matrix\" value=\"1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1\"/>\n\
-             \x20     <metadata key=\"source_object_id\" value=\"0\"/>\n\
-             \x20     <metadata key=\"source_volume_id\" value=\"{k}\"/>\n\
-             \x20     <metadata key=\"extruder\" value=\"{extruder}\"/>\n\
-             \x20     <mesh_stat face_count=\"{}\" edges_fixed=\"0\" degenerate_facets=\"0\" \
-             facets_removed=\"0\" facets_reversed=\"0\" backwards_edges=\"0\"/>\n\
-             \x20   </part>\n",
-            solid.tris.len()
-        );
-    }
-    let _ = writeln!(
-        resources,
-        "<object id=\"{whole}\" name=\"{name}\" type=\"model\" p:UUID=\"{}\">\n<components>\n{components}</components>\n</object>",
-        uuid(&format!("object {whole} {name}"))
-    );
-    let build = format!(
-        "<item objectid=\"{whole}\" p:UUID=\"{}\" transform=\"{identity}\" printable=\"1\"/>\n",
-        uuid(&format!("item {whole} {name}"))
-    );
-    let settings = format!(
-        "  <object id=\"{whole}\">\n\
-         \x20   <metadata key=\"name\" value=\"{name}\"/>\n\
-         \x20   <metadata key=\"extruder\" value=\"1\"/>\n\
-         \x20   <metadata key=\"\" face_count=\"{faces}\"/>\n{settings}  </object>\n"
-    );
-    let instances = format!(
-        "    <model_instance>\n\
-         \x20     <metadata key=\"object_id\" value=\"{whole}\"/>\n\
-         \x20     <metadata key=\"instance_id\" value=\"0\"/>\n\
-         \x20     <metadata key=\"identify_id\" value=\"{whole}\"/>\n\
-         \x20   </model_instance>\n"
-    );
-    let assemble = format!(
-        "    <assemble_item object_id=\"{whole}\" instance_id=\"0\" transform=\"{identity}\" offset=\"0 0 0\"/>\n"
-    );
     package(&resources, &build, &settings, &instances, &assemble)
 }
 
@@ -459,6 +446,22 @@ mod tests {
         // One object of two parts, each its filament.
         assert!(text.contains(r#"<part id="2" subtype="normal_part">"#));
         assert!(text.contains(r#"<metadata key="extruder" value="2"/>"#));
+    }
+
+    #[test]
+    fn three_mf_prints_objects_of_one_part_and_of_several() {
+        let (s, _) = holed_block();
+        let z = three_mf_print(&[
+            ("Lid", vec![(&s, "Lid", 1)]),
+            ("Front", vec![(&s, "Front", 1), (&s, "Base", 2)]),
+        ]);
+        let text = String::from_utf8_lossy(&z);
+        // Three meshes, one object of two of them; two built.
+        assert_eq!(text.matches("<mesh>").count(), 3);
+        assert_eq!(text.matches("<component objectid=").count(), 2);
+        assert_eq!(text.matches("<item ").count(), 2);
+        assert!(text.contains(r#"<item objectid="1" "#) && text.contains(r#"<item objectid="4" "#));
+        assert!(text.contains(r#"<part id="3" subtype="normal_part">"#));
     }
 
     #[test]

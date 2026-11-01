@@ -19,7 +19,9 @@ mod stl;
 mod triangulate;
 mod zip;
 
-pub use export::{encode, step, three_mf, three_mf_assembly, three_mf_objects};
+pub use export::{
+    PrintObject, encode, step, three_mf, three_mf_assembly, three_mf_objects, three_mf_print,
+};
 pub use raster::{Shot, render};
 pub use revolve::{revolve, revolve_radius};
 pub use stl::read_stl;
