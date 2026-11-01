@@ -74,32 +74,12 @@ pub fn three_mf_objects(objects: &[(&Solid, &str, u32)]) -> Vec<u8> {
     let mut resources = String::new();
     let mut build = String::new();
     let mut settings = String::new();
-    let mut plate = String::new();
+    let mut instances = String::new();
     let mut assemble = String::new();
     for (k, (solid, name, extruder)) in objects.iter().enumerate() {
         let id = k + 1;
         let name = xml_text(name);
-        let _ = writeln!(
-            resources,
-            "<object id=\"{id}\" name=\"{name}\" type=\"model\" p:UUID=\"{}\">\n<mesh>\n<vertices>",
-            uuid(&format!("object {id} {name}"))
-        );
-        for p in &solid.points {
-            let _ = writeln!(
-                resources,
-                r#"<vertex x="{}" y="{}" z="{}"/>"#,
-                p[0], p[1], p[2]
-            );
-        }
-        resources.push_str("</vertices>\n<triangles>\n");
-        for t in &solid.tris {
-            let _ = writeln!(
-                resources,
-                r#"<triangle v1="{}" v2="{}" v3="{}"/>"#,
-                t[0], t[1], t[2]
-            );
-        }
-        resources.push_str("</triangles>\n</mesh>\n</object>\n");
+        mesh_object(&mut resources, id, &name, solid);
         let _ = writeln!(
             build,
             "<item objectid=\"{id}\" p:UUID=\"{}\" transform=\"{identity}\" printable=\"1\"/>",
@@ -124,7 +104,7 @@ pub fn three_mf_objects(objects: &[(&Solid, &str, u32)]) -> Vec<u8> {
              \x20 </object>\n"
         );
         let _ = write!(
-            plate,
+            instances,
             "    <model_instance>\n\
              \x20     <metadata key=\"object_id\" value=\"{id}\"/>\n\
              \x20     <metadata key=\"instance_id\" value=\"0\"/>\n\
@@ -136,6 +116,103 @@ pub fn three_mf_objects(objects: &[(&Solid, &str, u32)]) -> Vec<u8> {
             "    <assemble_item object_id=\"{id}\" instance_id=\"0\" transform=\"{identity}\" offset=\"0 0 0\"/>"
         );
     }
+    package(&resources, &build, &settings, &instances, &assemble)
+}
+
+/// Solids as one object of a 3MF package made of them as its parts, each
+/// with its filament (extruder) slot: put together they print together,
+/// each part in its colour, as a slicer's multi-part object. In the shape
+/// Bambu Studio writes, as [`three_mf_objects`].
+pub fn three_mf_assembly(name: &str, parts: &[(&Solid, &str, u32)]) -> Vec<u8> {
+    let identity = "1 0 0 0 1 0 0 0 1 0 0 0";
+    let whole = parts.len() + 1;
+    let name = xml_text(name);
+    let mut resources = String::new();
+    let mut components = String::new();
+    let mut settings = String::new();
+    let mut faces = 0;
+    for (k, (solid, part, extruder)) in parts.iter().enumerate() {
+        let id = k + 1;
+        let part = xml_text(part);
+        mesh_object(&mut resources, id, &part, solid);
+        let _ = writeln!(
+            components,
+            "<component objectid=\"{id}\" p:UUID=\"{}\" transform=\"{identity}\"/>",
+            uuid(&format!("component {id} {part}"))
+        );
+        faces += solid.tris.len();
+        let _ = write!(
+            settings,
+            "    <part id=\"{id}\" subtype=\"normal_part\">\n\
+             \x20     <metadata key=\"name\" value=\"{part}\"/>\n\
+             \x20     <metadata key=\"matrix\" value=\"1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1\"/>\n\
+             \x20     <metadata key=\"source_object_id\" value=\"0\"/>\n\
+             \x20     <metadata key=\"source_volume_id\" value=\"{k}\"/>\n\
+             \x20     <metadata key=\"extruder\" value=\"{extruder}\"/>\n\
+             \x20     <mesh_stat face_count=\"{}\" edges_fixed=\"0\" degenerate_facets=\"0\" \
+             facets_removed=\"0\" facets_reversed=\"0\" backwards_edges=\"0\"/>\n\
+             \x20   </part>\n",
+            solid.tris.len()
+        );
+    }
+    let _ = writeln!(
+        resources,
+        "<object id=\"{whole}\" name=\"{name}\" type=\"model\" p:UUID=\"{}\">\n<components>\n{components}</components>\n</object>",
+        uuid(&format!("object {whole} {name}"))
+    );
+    let build = format!(
+        "<item objectid=\"{whole}\" p:UUID=\"{}\" transform=\"{identity}\" printable=\"1\"/>\n",
+        uuid(&format!("item {whole} {name}"))
+    );
+    let settings = format!(
+        "  <object id=\"{whole}\">\n\
+         \x20   <metadata key=\"name\" value=\"{name}\"/>\n\
+         \x20   <metadata key=\"extruder\" value=\"1\"/>\n\
+         \x20   <metadata key=\"\" face_count=\"{faces}\"/>\n{settings}  </object>\n"
+    );
+    let instances = format!(
+        "    <model_instance>\n\
+         \x20     <metadata key=\"object_id\" value=\"{whole}\"/>\n\
+         \x20     <metadata key=\"instance_id\" value=\"0\"/>\n\
+         \x20     <metadata key=\"identify_id\" value=\"{whole}\"/>\n\
+         \x20   </model_instance>\n"
+    );
+    let assemble = format!(
+        "    <assemble_item object_id=\"{whole}\" instance_id=\"0\" transform=\"{identity}\" offset=\"0 0 0\"/>\n"
+    );
+    package(&resources, &build, &settings, &instances, &assemble)
+}
+
+/// A mesh as an object of a 3MF package.
+fn mesh_object(out: &mut String, id: usize, name: &str, solid: &Solid) {
+    let _ = writeln!(
+        out,
+        "<object id=\"{id}\" name=\"{name}\" type=\"model\" p:UUID=\"{}\">\n<mesh>\n<vertices>",
+        uuid(&format!("object {id} {name}"))
+    );
+    for p in &solid.points {
+        let _ = writeln!(out, r#"<vertex x="{}" y="{}" z="{}"/>"#, p[0], p[1], p[2]);
+    }
+    out.push_str("</vertices>\n<triangles>\n");
+    for t in &solid.tris {
+        let _ = writeln!(
+            out,
+            r#"<triangle v1="{}" v2="{}" v3="{}"/>"#,
+            t[0], t[1], t[2]
+        );
+    }
+    out.push_str("</triangles>\n</mesh>\n</object>\n");
+}
+
+/// The package round the objects: the model with Bambu Studio's namespace
+/// and the production extension, and its model settings.
+fn package(
+    resources: &str,
+    build: &str,
+    settings: &str,
+    instances: &str,
+    assemble: &str,
+) -> Vec<u8> {
     let xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <model unit=\"millimeter\" xml:lang=\"en-US\" \
@@ -152,7 +229,7 @@ pub fn three_mf_objects(objects: &[(&Solid, &str, u32)]) -> Vec<u8> {
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<config>\n{settings}  <plate>\n\
          \x20   <metadata key=\"plater_id\" value=\"1\"/>\n\
          \x20   <metadata key=\"plater_name\" value=\"\"/>\n\
-         \x20   <metadata key=\"locked\" value=\"false\"/>\n{plate}  </plate>\n  <assemble>\n{assemble}  </assemble>\n</config>\n"
+         \x20   <metadata key=\"locked\" value=\"false\"/>\n{instances}  </plate>\n  <assemble>\n{assemble}  </assemble>\n</config>\n"
     );
     let mut files = BTreeMap::new();
     files.insert(
@@ -367,6 +444,21 @@ mod tests {
         assert!(text.contains(r#"<assemble_item object_id="2""#));
         // Same input, same ids.
         assert_eq!(three_mf_objects(&[(&s, "Lid", 1), (&s, "Case & Co", 2)]), z);
+    }
+
+    #[test]
+    fn three_mf_puts_parts_together_as_one_object() {
+        let (s, _) = holed_block();
+        let z = three_mf_assembly("Case", &[(&s, "Front", 1), (&s, "Base", 2)]);
+        let text = String::from_utf8_lossy(&z);
+        // Two meshes and the object made of them, which alone is built.
+        assert_eq!(text.matches(r#"type="model""#).count(), 3);
+        assert_eq!(text.matches("<component objectid=").count(), 2);
+        assert!(text.contains(r#"<item objectid="3" "#));
+        assert_eq!(text.matches("<item ").count(), 1);
+        // One object of two parts, each its filament.
+        assert!(text.contains(r#"<part id="2" subtype="normal_part">"#));
+        assert!(text.contains(r#"<metadata key="extruder" value="2"/>"#));
     }
 
     #[test]
