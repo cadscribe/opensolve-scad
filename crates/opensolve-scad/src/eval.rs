@@ -19,6 +19,8 @@ use crate::value::{self, MOST, Value, item, repr};
 
 /// Deeper calls than this end the evaluation: a recursion without end.
 const DEPTH: usize = 3000;
+/// The most pieces a circle is cut into.
+const PIECES: usize = 1000;
 /// More notes than this are counted, not kept.
 const NOTES: usize = 40;
 
@@ -460,13 +462,22 @@ impl Interp {
             .unwrap_or(0.0)
     }
 
-    fn fragments(a: &Args, f: &Rc<Frame>, r: f64) -> usize {
+    /// OpenSCAD's number of pieces of a circle, at most [`PIECES`]: more
+    /// would keep the app busy for minutes.
+    fn fragments(&mut self, a: &Args, f: &Rc<Frame>, r: f64, pos: Pos) -> usize {
         let (fn_, fs, fa) = (
             Self::special(a, f, "$fn"),
             Self::special(a, f, "$fs"),
             Self::special(a, f, "$fa"),
         );
-        fragments(r, fn_, fs, fa)
+        let n = fragments(r, fn_, fs, fa);
+        if n > PIECES {
+            self.note(
+                Some(pos),
+                format!("{n} pieces of a circle are too many: {PIECES} made"),
+            );
+        }
+        n.min(PIECES)
     }
 
     fn call_module(
@@ -521,7 +532,7 @@ impl Interp {
                     .num("r", 0)
                     .or_else(|| a.num("d", usize::MAX).map(|d| d / 2.0))
                     .unwrap_or(1.0);
-                let n = Self::fragments(&a, f, r);
+                let n = self.fragments(&a, f, r, pos);
                 self.geo.sphere(r, n).map(Geom::D3)
             }
             "cylinder" => {
@@ -539,7 +550,7 @@ impl Interp {
                     .or_else(|| a.num("d2", usize::MAX).map(|d| d / 2.0))
                     .or(r)
                     .unwrap_or(1.0);
-                let n = Self::fragments(&a, f, r1.max(r2));
+                let n = self.fragments(&a, f, r1.max(r2), pos);
                 self.geo
                     .cylinder(h, r1, r2, a.bool("center", 3), n)
                     .map(Geom::D3)
@@ -580,7 +591,7 @@ impl Interp {
                     .num("r", 0)
                     .or_else(|| a.num("d", usize::MAX).map(|d| d / 2.0))
                     .unwrap_or(1.0);
-                let n = Self::fragments(&a, f, r);
+                let n = self.fragments(&a, f, r, pos);
                 self.geo.circle(r, n).map(Geom::D2)
             }
             "polygon" => {
@@ -817,15 +828,37 @@ impl Interp {
         } else {
             (solid, false)
         };
-        let mut out: Option<opensolve_kernel::Solid> = None;
-        for g in list {
-            let (Geom::D2(s) | Geom::D3(s)) = g;
-            out = Some(match out {
-                None => s,
-                Some(o) => self.boolean(&o, &s, Op::Add, is_flat, pos)?,
-            });
-        }
+        let solids = list
+            .into_iter()
+            .map(|g| {
+                let (Geom::D2(s) | Geom::D3(s)) = g;
+                s
+            })
+            .collect();
+        let out = self.join(solids, is_flat, pos)?;
         Ok(out.map(|s| if is_flat { Geom::D2(s) } else { Geom::D3(s) }))
+    }
+
+    /// Solids joined in pairs, the pairs again, and so on: the meshes the
+    /// booleans take stay small, and those apart are only put together.
+    fn join(
+        &mut self,
+        mut list: Vec<opensolve_kernel::Solid>,
+        flat: bool,
+        pos: Option<Pos>,
+    ) -> R<Option<opensolve_kernel::Solid>> {
+        while list.len() > 1 {
+            let mut next = Vec::with_capacity(list.len().div_ceil(2));
+            let mut it = list.into_iter();
+            while let Some(a) = it.next() {
+                next.push(match it.next() {
+                    Some(b) => self.boolean(&a, &b, Op::Add, flat, pos)?,
+                    None => a,
+                });
+            }
+            list = next;
+        }
+        Ok(list.pop())
     }
 
     fn boolean(
@@ -850,15 +883,24 @@ impl Interp {
         };
         let flat = matches!(first, Geom::D2(_));
         let (Geom::D2(mut acc) | Geom::D3(mut acc)) = first;
+        let mut others = Vec::new();
         for g in it {
-            match (&g, flat) {
-                (Geom::D2(s), true) | (Geom::D3(s), false) => {
-                    acc = self.boolean(&acc, s, op, flat, Some(pos))?;
-                }
+            match (g, flat) {
+                (Geom::D2(s), true) | (Geom::D3(s), false) => others.push(s),
                 _ => self.note(
                     Some(pos),
                     "2D and 3D shapes together: the others are left out",
                 ),
+            }
+        }
+        if op == Op::Subtract {
+            // All that is cut away at once: much faster than one by one.
+            if let Some(cut) = self.join(others, flat, Some(pos))? {
+                acc = self.boolean(&acc, &cut, op, flat, Some(pos))?;
+            }
+        } else {
+            for s in &others {
+                acc = self.boolean(&acc, s, op, flat, Some(pos))?;
             }
         }
         Ok(Some(if flat { Geom::D2(acc) } else { Geom::D3(acc) }))
@@ -958,7 +1000,7 @@ impl Interp {
                 return Ok(None);
             }
             let max_x = slab.points.iter().map(|p| p[0].abs()).fold(0.0, f64::max);
-            let n = Self::fragments(a, f, max_x) as f64 * angle.abs() / 360.0;
+            let n = self.fragments(a, f, max_x, pos) as f64 * angle.abs() / 360.0;
             let n = n.ceil().max(1.0) as usize;
             return match self.geo.rotate_extrude(&slab, angle, n) {
                 Ok(s) => Ok(s.map(Geom::D3)),
@@ -980,7 +1022,7 @@ impl Interp {
         let slices = match a.num("slices", 4) {
             Some(s) => s.max(1.0) as usize,
             None if twist != 0.0 => {
-                let n = Self::fragments(a, f, far) as f64 * twist.abs() / 360.0;
+                let n = self.fragments(a, f, far, pos) as f64 * twist.abs() / 360.0;
                 n.ceil().max(1.0) as usize
             }
             None => 1,

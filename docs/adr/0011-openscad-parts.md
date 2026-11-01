@@ -39,6 +39,8 @@ OpenSCAD does is the part that matters for parts that fit.
   places, with OpenSCAD's exact sines and cosines at multiples of 30°, the
   sphere's rings at the middle of even bands, a twisted extrusion's sides split
   as OpenSCAD splits them. A part thus fits what was printed from OpenSCAD.
+  The one difference: at most 1,000 pieces, with a note, so that a huge `$fn`
+  does not keep the app busy for minutes.
 - A 2D shape is a slab one unit thick: its booleans are the kernel's, and its
   top is the shape an extrusion takes. No polygon clipper of its own.
 - Not supported yet, and named in a note rather than left out silently:

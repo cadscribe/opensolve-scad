@@ -289,3 +289,14 @@ fn not_supported_is_said() {
     );
     assert!(out.notes.iter().any(|n| n.contains("not supported: text")));
 }
+
+#[test]
+fn too_many_pieces_are_capped_and_said() {
+    let out = solid("cylinder(h = 1, r = 5, $fn = 100000);");
+    assert!(
+        out.notes.iter().any(|n| n.contains("too many")),
+        "{:?}",
+        out.notes
+    );
+    near(out.solid.volume(), ngon(5.0, 1000));
+}
