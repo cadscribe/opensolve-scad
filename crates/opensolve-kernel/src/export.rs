@@ -40,20 +40,49 @@ pub fn encode(solid: &Solid, facets: &Facets, ext: &str, name: &str) -> Option<V
 
 /// The solid as a 3MF package: one object, one build item.
 pub fn three_mf(solid: &Solid, name: &str) -> Vec<u8> {
-    three_mf_objects(&[(solid, name)])
+    three_mf_objects(&[(solid, name, 1)])
+}
+
+/// A name for an id that stays the same for the same input, shaped as a
+/// UUID, which Bambu Studio wants on objects and build items.
+fn uuid(seed: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    seed.hash(&mut h);
+    let a = h.finish();
+    (seed, a).hash(&mut h);
+    let b = h.finish();
+    format!(
+        "{:08x}-{:04x}-4{:03x}-8{:03x}-{:012x}",
+        a >> 32,
+        (a >> 16) & 0xffff,
+        a & 0xfff,
+        b >> 52,
+        b & 0xffff_ffff_ffff
+    )
 }
 
 /// Solids as a 3MF package, each an object of its own with a build item, so
-/// that a slicer takes them as parts to place one by one.
-pub fn three_mf_objects(objects: &[(&Solid, &str)]) -> Vec<u8> {
+/// that a slicer takes them as parts to place one by one, each with the
+/// filament (extruder) slot given, from 1. Written as Bambu Studio writes
+/// its own (its namespace, UUIDs of the production extension, and
+/// `Metadata/model_settings.config` with the objects, their extruders and
+/// one plate), so that it takes more than the geometry; other slicers read
+/// the core 3MF in it.
+pub fn three_mf_objects(objects: &[(&Solid, &str, u32)]) -> Vec<u8> {
+    let identity = "1 0 0 0 1 0 0 0 1 0 0 0";
     let mut resources = String::new();
     let mut build = String::new();
-    for (k, (solid, name)) in objects.iter().enumerate() {
+    let mut settings = String::new();
+    let mut plate = String::new();
+    let mut assemble = String::new();
+    for (k, (solid, name, extruder)) in objects.iter().enumerate() {
         let id = k + 1;
+        let name = xml_text(name);
         let _ = writeln!(
             resources,
-            "<object id=\"{id}\" type=\"model\" name=\"{}\">\n<mesh>\n<vertices>",
-            xml_text(name)
+            "<object id=\"{id}\" name=\"{name}\" type=\"model\" p:UUID=\"{}\">\n<mesh>\n<vertices>",
+            uuid(&format!("object {id} {name}"))
         );
         for p in &solid.points {
             let _ = writeln!(
@@ -71,13 +100,59 @@ pub fn three_mf_objects(objects: &[(&Solid, &str)]) -> Vec<u8> {
             );
         }
         resources.push_str("</triangles>\n</mesh>\n</object>\n");
-        let _ = writeln!(build, "<item objectid=\"{id}\"/>");
+        let _ = writeln!(
+            build,
+            "<item objectid=\"{id}\" p:UUID=\"{}\" transform=\"{identity}\" printable=\"1\"/>",
+            uuid(&format!("item {id} {name}"))
+        );
+        let faces = solid.tris.len();
+        let _ = write!(
+            settings,
+            "  <object id=\"{id}\">\n\
+             \x20   <metadata key=\"name\" value=\"{name}\"/>\n\
+             \x20   <metadata key=\"extruder\" value=\"{extruder}\"/>\n\
+             \x20   <metadata key=\"\" face_count=\"{faces}\"/>\n\
+             \x20   <part id=\"{id}\" subtype=\"normal_part\">\n\
+             \x20     <metadata key=\"name\" value=\"{name}\"/>\n\
+             \x20     <metadata key=\"matrix\" value=\"1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 1\"/>\n\
+             \x20     <metadata key=\"source_object_id\" value=\"{k}\"/>\n\
+             \x20     <metadata key=\"source_volume_id\" value=\"0\"/>\n\
+             \x20     <metadata key=\"extruder\" value=\"{extruder}\"/>\n\
+             \x20     <mesh_stat face_count=\"{faces}\" edges_fixed=\"0\" degenerate_facets=\"0\" \
+             facets_removed=\"0\" facets_reversed=\"0\" backwards_edges=\"0\"/>\n\
+             \x20   </part>\n\
+             \x20 </object>\n"
+        );
+        let _ = write!(
+            plate,
+            "    <model_instance>\n\
+             \x20     <metadata key=\"object_id\" value=\"{id}\"/>\n\
+             \x20     <metadata key=\"instance_id\" value=\"0\"/>\n\
+             \x20     <metadata key=\"identify_id\" value=\"{id}\"/>\n\
+             \x20   </model_instance>\n"
+        );
+        let _ = writeln!(
+            assemble,
+            "    <assemble_item object_id=\"{id}\" instance_id=\"0\" transform=\"{identity}\" offset=\"0 0 0\"/>"
+        );
     }
     let xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <model unit=\"millimeter\" xml:lang=\"en-US\" \
-         xmlns=\"http://schemas.microsoft.com/3dmanufacturing/core/2015/02\">\n\
-         <resources>\n{resources}</resources>\n<build>\n{build}</build>\n</model>\n"
+         xmlns=\"http://schemas.microsoft.com/3dmanufacturing/core/2015/02\" \
+         xmlns:p=\"http://schemas.microsoft.com/3dmanufacturing/production/2015/06\" \
+         xmlns:BambuStudio=\"http://schemas.bambulab.com/package/2021\" requiredextensions=\"p\">\n\
+         <metadata name=\"Application\">OpenSolve</metadata>\n\
+         <metadata name=\"BambuStudio:3mfVersion\">1</metadata>\n\
+         <resources>\n{resources}</resources>\n\
+         <build p:UUID=\"{}\">\n{build}</build>\n</model>\n",
+        uuid("build")
+    );
+    let config = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<config>\n{settings}  <plate>\n\
+         \x20   <metadata key=\"plater_id\" value=\"1\"/>\n\
+         \x20   <metadata key=\"plater_name\" value=\"\"/>\n\
+         \x20   <metadata key=\"locked\" value=\"false\"/>\n{plate}  </plate>\n  <assemble>\n{assemble}  </assemble>\n</config>\n"
     );
     let mut files = BTreeMap::new();
     files.insert(
@@ -86,6 +161,10 @@ pub fn three_mf_objects(objects: &[(&Solid, &str)]) -> Vec<u8> {
     );
     files.insert("_rels/.rels".to_string(), RELATIONSHIPS.as_bytes().to_vec());
     files.insert("3D/3dmodel.model".to_string(), xml.into_bytes());
+    files.insert(
+        "Metadata/model_settings.config".to_string(),
+        config.into_bytes(),
+    );
     zip::write(&files)
 }
 
@@ -276,10 +355,18 @@ mod tests {
     #[test]
     fn three_mf_keeps_each_part_an_object() {
         let (s, _) = holed_block();
-        let z = three_mf_objects(&[(&s, "Lid"), (&s, "Case")]);
+        let z = three_mf_objects(&[(&s, "Lid", 1), (&s, "Case & Co", 2)]);
         let text = String::from_utf8_lossy(&z);
-        assert_eq!(text.matches("<object ").count(), 2);
-        assert!(text.contains(r#"<item objectid="2"/>"#) && text.contains(r#"name="Case""#));
+        assert_eq!(text.matches("<object id=").count(), 4);
+        assert!(text.contains(r#"<item objectid="2" p:UUID=""#));
+        assert!(text.contains(r#"name="Case &amp; Co""#));
+        // What Bambu Studio looks for to take it as its own.
+        assert!(text.contains("Metadata/model_settings.config"));
+        assert!(text.contains(r#"<metadata name="BambuStudio:3mfVersion">1</metadata>"#));
+        assert!(text.contains(r#"<metadata key="extruder" value="2"/>"#));
+        assert!(text.contains(r#"<assemble_item object_id="2""#));
+        // Same input, same ids.
+        assert_eq!(three_mf_objects(&[(&s, "Lid", 1), (&s, "Case & Co", 2)]), z);
     }
 
     #[test]
