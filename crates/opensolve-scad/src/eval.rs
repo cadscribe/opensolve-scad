@@ -23,6 +23,8 @@ const DEPTH: usize = 3000;
 const PIECES: usize = 1000;
 /// More notes than this are counted, not kept.
 const NOTES: usize = 40;
+/// More marks than this are dropped.
+const MARKS: usize = 500;
 
 /// A scope: its names, the scope it is written in (`parent`), and for a
 /// call the scope it was called from (`caller`), where `$` names are found.
@@ -152,6 +154,9 @@ pub struct Interp {
     sources: HashMap<PathBuf, String>,
     used: Vec<Rc<Frame>>,
     pub notes: Vec<String>,
+    /// The notes again with where they are, for an editor: no place in
+    /// their text, echoes too, all of them up to [`MARKS`].
+    pub marks: Vec<crate::Note>,
     dropped: usize,
     pub geo: Builder,
     depth: usize,
@@ -166,6 +171,7 @@ impl Interp {
             sources,
             used: Vec::new(),
             notes: Vec::new(),
+            marks: Vec::new(),
             dropped: 0,
             geo: Builder::default(),
             depth: 0,
@@ -174,10 +180,43 @@ impl Interp {
     }
 
     pub fn note(&mut self, pos: Option<Pos>, text: impl Into<String>) {
+        let text = text.into();
+        self.mark(pos, &text, false);
         let text = match pos {
-            Some(p) => format!("{}: {}", self.place(p), text.into()),
-            None => text.into(),
+            Some(p) => format!("{}: {text}", self.place(p)),
+            None => text,
         };
+        self.keep(text);
+    }
+
+    /// What `echo` writes: a note without its place, a mark with it.
+    fn echo(&mut self, pos: Pos, text: String) {
+        let text = format!("ECHO: {text}");
+        self.mark(Some(pos), &text, true);
+        self.keep(text);
+    }
+
+    fn mark(&mut self, pos: Option<Pos>, text: &str, echo: bool) {
+        if self.marks.len() >= MARKS {
+            return;
+        }
+        let p = pos.unwrap_or_default();
+        let file = (p.file != 0)
+            .then(|| self.files.get(p.file as usize).map(|f| f.0.clone()))
+            .flatten();
+        let mark = crate::Note {
+            file,
+            line: p.line,
+            col: p.col,
+            message: text.to_string(),
+            echo,
+        };
+        if !self.marks.contains(&mark) {
+            self.marks.push(mark);
+        }
+    }
+
+    fn keep(&mut self, text: String) {
         if self.notes.contains(&text) {
             return;
         }
@@ -666,7 +705,7 @@ impl Interp {
             "children" => self.children(&a, f, pos)?,
             "echo" => {
                 let text = echo_text(&a);
-                self.note(None, format!("ECHO: {text}"));
+                self.echo(pos, text);
                 let made = kids(self)?;
                 self.union(made, Some(pos))?
             }
@@ -1114,9 +1153,9 @@ impl Interp {
                 let inner = self.lets(args, f)?;
                 self.eval(body, &inner)?
             }
-            Expr::Echo(args, body, _) => {
+            Expr::Echo(args, body, pos) => {
                 let a = self.args(args, f)?;
-                self.note(None, format!("ECHO: {}", echo_text(&a)));
+                self.echo(*pos, echo_text(&a));
                 self.eval(body, f)?
             }
             Expr::Assert(args, body, pos) => {

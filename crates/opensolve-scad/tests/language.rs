@@ -296,3 +296,35 @@ fn only_2d_or_nothing_is_said() {
     let e = run_with(&[("main.scad", "x = 1;")], &[]).unwrap_err();
     assert!(e.contains("no solid"), "{e}");
 }
+
+#[test]
+fn a_diagnosis_says_where() {
+    let files: HashMap<PathBuf, String> = [
+        (
+            "/p/main.scad",
+            "use <lib.scad>\nx = 1;\n  nothing(2);\necho(x);\nlib();\nassert(x > 2, \"small\");",
+        ),
+        ("/p/lib.scad", "module lib() { gone(); }"),
+    ]
+    .into_iter()
+    .map(|(n, t)| (PathBuf::from(n), t.to_string()))
+    .collect();
+    let read = |p: &Path| {
+        files
+            .get(p)
+            .map(|t| t.as_bytes().to_vec())
+            .ok_or_else(|| format!("{} not found", p.display()))
+    };
+    let d = opensolve_scad::diagnose(Path::new("/p/main.scad"), &read, &[]);
+    let at = |m: &str| d.notes.iter().find(|n| n.message.contains(m)).cloned();
+    let unknown = at("unknown module nothing").expect("unknown module");
+    assert_eq!((unknown.file, unknown.line, unknown.col), (None, 3, 3));
+    let echo = at("ECHO: 1").expect("echo");
+    assert!(echo.echo);
+    assert_eq!(echo.line, 4);
+    let gone = at("unknown module gone").expect("in the library");
+    assert_eq!(gone.file, Some(PathBuf::from("/p/lib.scad")));
+    let e = d.error.expect("the assertion");
+    assert_eq!(e.line, 6);
+    assert!(e.message.contains("small"), "{}", e.message);
+}
