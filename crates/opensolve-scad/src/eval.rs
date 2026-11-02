@@ -88,7 +88,7 @@ impl<T> Names<T> {
 
 /// The hash of rustc's own tables (FxHash): quick for short names.
 #[derive(Clone, Copy, Debug, Default)]
-struct Fx;
+pub(crate) struct Fx;
 
 impl std::hash::BuildHasher for Fx {
     type Hasher = FxHasher;
@@ -98,7 +98,7 @@ impl std::hash::BuildHasher for Fx {
 }
 
 #[derive(Debug)]
-struct FxHasher(u64);
+pub(crate) struct FxHasher(u64);
 
 impl std::hash::Hasher for FxHasher {
     fn write(&mut self, bytes: &[u8]) {
@@ -130,6 +130,9 @@ pub struct Frame {
     caller: Option<Rc<Frame>>,
     /// A module's children and the scope they were written in.
     children: Option<(Arc<[Stmt]>, Rc<Frame>)>,
+    /// In the scope of a file: the files it uses, each a scope of its own
+    /// definitions. What these use in turn is theirs alone.
+    used: RefCell<Vec<Rc<Frame>>>,
 }
 
 impl std::fmt::Debug for Frame {
@@ -192,6 +195,15 @@ impl Frame {
         }
     }
 
+    /// The scope of the file this one is in.
+    fn file(self: &Rc<Frame>) -> &Rc<Frame> {
+        let mut f: &Rc<Frame> = self;
+        while let Some(p) = &f.parent {
+            f = p;
+        }
+        f
+    }
+
     /// The children of the module being run here.
     fn children(self: &Rc<Frame>) -> Option<(Arc<[Stmt]>, Rc<Frame>)> {
         let mut f: &Rc<Frame> = self;
@@ -205,6 +217,10 @@ impl Frame {
 }
 
 type R<T> = Result<T, Error>;
+
+/// What a module made, with the module and its scope: kept alive, so that
+/// what a key names (their addresses) is not used again by another.
+type Made = (Option<Geom>, Arc<Module>, Rc<Frame>);
 
 /// What the tail of a function comes to: a value, or a call of a function
 /// (with its home, its arguments and the frame it is made in).
@@ -235,6 +251,8 @@ fn sets_specials(f: &Rc<Frame>, upto: &Rc<Frame>) -> bool {
 struct Args {
     pos: Vec<Value>,
     named: Vec<(Arc<str>, Value)>,
+    /// For each value by position, how many named ones come before it.
+    before: Vec<usize>,
 }
 
 impl Args {
@@ -261,11 +279,14 @@ pub struct Interp {
     main: u32,
     /// The files read, parsed once they are needed.
     sources: HashMap<PathBuf, Arc<Parsed>>,
+    /// The files imported, read before (those named as text).
+    blobs: HashMap<PathBuf, Arc<Vec<u8>>>,
     /// The files whose statements were taken: a file is used only once.
     loaded: Vec<PathBuf>,
     /// The folders an include is looked for in after the file's own.
     search: Vec<PathBuf>,
-    used: Vec<Rc<Frame>>,
+    /// The scope of each file used, made once.
+    used: HashMap<PathBuf, Rc<Frame>>,
     pub notes: Vec<String>,
     /// The notes again with where they are, for an editor: no place in
     /// their text, echoes too, all of them up to [`MARKS`].
@@ -280,16 +301,35 @@ pub struct Interp {
     /// What `rands` draws from: seeded anew by a seed, else the same
     /// numbers in each run, so that a part is built the same each time.
     rng: builtins::Mt19937,
+    /// What a module made, by what it was called with (see
+    /// [`Interp::call_key`]): a module called again alike is not run again,
+    /// as OpenSCAD keeps what it made too.
+    made: HashMap<Vec<u8>, Made>,
+    /// Font files named by `use <…>`, as OpenSCAD takes them.
+    font_files: Vec<PathBuf>,
+    /// Whether a file asks for the modules it is called in: then they are
+    /// part of what a call depends on. BOSL2 asks only to say what is
+    /// wrong when it stops.
+    parents_matter: bool,
 }
 
 impl Interp {
-    pub fn new(sources: HashMap<PathBuf, Arc<Parsed>>) -> Interp {
+    pub fn new(
+        sources: HashMap<PathBuf, Arc<Parsed>>,
+        blobs: HashMap<PathBuf, Arc<Vec<u8>>>,
+    ) -> Interp {
+        let parents_matter = sources.iter().any(|(p, f)| {
+            f.text.contains("parent_module") && !p.components().any(|c| c.as_os_str() == "BOSL2")
+        });
         Interp {
             main: 0,
+            parents_matter,
+            font_files: Vec::new(),
             sources,
+            blobs,
             loaded: Vec::new(),
             search: crate::library::search(),
-            used: Vec::new(),
+            used: HashMap::new(),
             notes: Vec::new(),
             marks: Vec::new(),
             dropped: 0,
@@ -298,6 +338,7 @@ impl Interp {
             root: None,
             modules: Vec::new(),
             rng: builtins::Mt19937::new(5489),
+            made: HashMap::new(),
         }
     }
 
@@ -481,39 +522,70 @@ impl Interp {
     }
 
     /// `use <…>`: the file's modules and functions, its assignments in a
-    /// scope of its own, nothing it makes.
-    fn use_file(&mut self, path: &str, pos: Pos) -> R<()> {
+    /// scope of its own, nothing it makes; known in the file that uses it
+    /// (`into`), not in those that use or include that one.
+    fn use_file(&mut self, path: &str, pos: Pos, into: &Rc<Frame>) -> R<()> {
         let file = self.path_of(pos, path);
+        // `use <font.ttf>` makes the font known to `text()`.
+        let ext = file
+            .extension()
+            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        if ["ttf", "otf", "ttc", "otc"].contains(&ext.as_str()) {
+            if !self.font_files.contains(&file) {
+                self.font_files.push(file);
+            }
+            return Ok(());
+        }
         if !self.sources.contains_key(&file) {
             return Err(self.error(pos, format!("use <{path}>: the file cannot be read")));
         }
-        if self.loaded.contains(&file) {
-            return Ok(());
+        let home = into.file();
+        let frame = match self.used.get(&file) {
+            Some(f) => f.clone(),
+            None => {
+                let frame = Interp::root();
+                // Before its statements run: a file that uses this one
+                // back finds it.
+                self.used.insert(file.clone(), frame.clone());
+                let stmts = self.load(file, &mut Vec::new())?;
+                let defs: Vec<Stmt> = stmts
+                    .into_iter()
+                    .filter(|s| {
+                        matches!(
+                            s,
+                            Stmt::Assign { .. }
+                                | Stmt::Module(..)
+                                | Stmt::Function(..)
+                                | Stmt::Use(..)
+                        )
+                    })
+                    .collect();
+                self.exec(&defs, &frame, None)?;
+                frame
+            }
+        };
+        let mut used = home.used.borrow_mut();
+        if !Rc::ptr_eq(&frame, home) && !used.iter().any(|u| Rc::ptr_eq(u, &frame)) {
+            used.push(frame);
         }
-        let stmts = self.load(file, &mut Vec::new())?;
-        let frame = Interp::root();
-        let defs: Vec<Stmt> = stmts
-            .into_iter()
-            .filter(|s| {
-                matches!(
-                    s,
-                    Stmt::Assign { .. } | Stmt::Module(..) | Stmt::Function(..) | Stmt::Use(..)
-                )
-            })
-            .collect();
-        self.exec(&defs, &frame, None)?;
-        self.used.push(frame);
         Ok(())
     }
 
     fn find_func(&self, f: &Rc<Frame>, name: &str) -> Option<(Arc<Func>, Rc<Frame>)> {
-        f.func(name)
-            .or_else(|| self.used.iter().find_map(|u| u.func(name)))
+        f.func(name).or_else(|| {
+            let used = f.file().used.borrow();
+            used.iter()
+                .find_map(|u| u.funcs.borrow().find(name).map(|d| (d.clone(), u.clone())))
+        })
     }
 
     fn find_module(&self, f: &Rc<Frame>, name: &str) -> Option<(Arc<Module>, Rc<Frame>)> {
-        f.module(name)
-            .or_else(|| self.used.iter().find_map(|u| u.module(name)))
+        f.module(name).or_else(|| {
+            let used = f.file().used.borrow();
+            used.iter()
+                .find_map(|u| u.mods.borrow().find(name).map(|d| (d.clone(), u.clone())))
+        })
     }
 
     /// The statements of a scope; with `only`, of the instantiations just
@@ -542,7 +614,7 @@ impl Interp {
                 // The last definition of a name wins, as in OpenSCAD.
                 Stmt::Module(n, m) => f.mods.borrow_mut().set(n, m.clone()),
                 Stmt::Function(n, d) => f.funcs.borrow_mut().set(n, d.clone()),
-                Stmt::Use(p, pos) => self.use_file(p, *pos)?,
+                Stmt::Use(p, pos) => self.use_file(p, *pos, f)?,
                 _ => {}
             }
         }
@@ -587,6 +659,15 @@ impl Interp {
                 modifier: Modifier::Disable | Modifier::Background,
                 ..
             } => return Ok(None),
+            // A module that does not exist is no instantiation: OpenSCAD
+            // leaves it out with a warning, so that in `difference()` the
+            // next child is what is cut from.
+            Stmt::Call { name, pos, .. }
+                if !BUILT_IN_MODULES.contains(&&**name) && self.find_module(f, name).is_none() =>
+            {
+                self.note(Some(*pos), format!("unknown module {name}"));
+                return Ok(None);
+            }
             Stmt::Call {
                 name,
                 args,
@@ -628,6 +709,7 @@ impl Interp {
         let mut out = Args {
             pos: Vec::new(),
             named: Vec::new(),
+            before: Vec::new(),
         };
         for a in args {
             let v = match &a.value {
@@ -636,7 +718,10 @@ impl Interp {
             };
             match &a.name {
                 Some(n) => out.named.push((n.clone(), v)),
-                None => out.pos.push(v),
+                None => {
+                    out.pos.push(v);
+                    out.before.push(out.named.len());
+                }
             }
         }
         Ok(out)
@@ -926,7 +1011,8 @@ impl Interp {
                 }
             }
             "text" => self.text(&a, pos),
-            "import" | "surface" | "roof" | "fill" => {
+            "import" => self.import(&a, f, pos),
+            "surface" | "roof" | "fill" => {
                 self.note(Some(pos), format!("not supported: {name}"));
                 None
             }
@@ -948,19 +1034,93 @@ impl Interp {
         f: &Rc<Frame>,
     ) -> R<Option<Geom>> {
         let a = self.args(args, f)?;
+        let count = children.iter().filter(|s| is_instance(s)).count();
+        let key = if count == 0 {
+            self.call_key(def, home, &a, f)
+        } else {
+            None
+        };
+        if let Some(k) = &key
+            && let Some((g, ..)) = self.made.get(k)
+        {
+            return Ok(g.clone());
+        }
         let frame = Rc::new(Frame {
             parent: Some(home.clone()),
             caller: Some(f.clone()),
             children: Some((children.clone(), f.clone())),
             ..Frame::default()
         });
-        let count = children.iter().filter(|s| is_instance(s)).count();
         frame.set(&"$children".into(), Value::Num(count as f64));
         self.bind(&def.params, a, &frame)?;
         self.enter(pos)?;
         let made = self.exec(&def.body, &frame, None);
         self.depth -= 1;
-        self.union(made?, Some(pos))
+        let made = self.union(made?, Some(pos))?;
+        // A `!` inside counts once: not kept.
+        if let Some(k) = key
+            && self.root.is_none()
+        {
+            self.made
+                .insert(k, (made.clone(), def.clone(), home.clone()));
+        }
+        Ok(made)
+    }
+
+    /// What a call of a module without children depends on, as bytes: the
+    /// module and where it is defined, its arguments, every `$` name its
+    /// caller sees, and the modules it is called in (`parent_module`).
+    /// `None` when a value is a function literal, which knows its scope.
+    fn call_key(
+        &self,
+        def: &Arc<Module>,
+        home: &Rc<Frame>,
+        a: &Args,
+        f: &Rc<Frame>,
+    ) -> Option<Vec<u8>> {
+        let mut k = Vec::with_capacity(256);
+        k.extend((Arc::as_ptr(def) as usize).to_le_bytes());
+        k.extend((Rc::as_ptr(home) as usize).to_le_bytes());
+        for (v, before) in a.pos.iter().zip(&a.before) {
+            k.extend(before.to_le_bytes());
+            key_of(v, &mut k)?;
+        }
+        k.push(b';');
+        for (n, v) in &a.named {
+            k.extend(n.as_bytes());
+            k.push(b'=');
+            key_of(v, &mut k)?;
+        }
+        k.push(b';');
+        // The `$` names as the call sees them: the nearest of each name.
+        let mut seen: Vec<Arc<str>> = Vec::new();
+        let mut x: Option<&Rc<Frame>> = Some(f);
+        // Deep in a recursion the walk would cost more than it saves.
+        let mut steps = 0;
+        while let Some(fr) = x {
+            steps += 1;
+            if steps > 200 {
+                return None;
+            }
+            for (n, v) in fr.vars.borrow().list.iter() {
+                if n.starts_with('$') && &**n != "$children" && !seen.contains(n) {
+                    seen.push(n.clone());
+                    k.extend(n.as_bytes());
+                    k.push(b'=');
+                    key_of(v, &mut k)?;
+                }
+            }
+            x = fr.caller.as_ref().or(fr.parent.as_ref());
+        }
+        k.push(b';');
+        if self.parents_matter {
+            for m in &self.modules {
+                k.extend(m.as_bytes());
+                k.push(b'/');
+            }
+        }
+        k.push(u8::from(self.modules.len() > 1));
+        Some(k)
     }
 
     fn enter(&mut self, pos: Pos) -> R<()> {
@@ -972,32 +1132,53 @@ impl Interp {
         Ok(())
     }
 
-    /// Parameters bound in `frame`: by position, by name, else their
-    /// defaults; `$` names given go along.
+    /// Parameters bound in `frame` as OpenSCAD binds them: the arguments
+    /// in their order, one by name to that name (the last one wins), one
+    /// by position to the next parameter not named before it; else their
+    /// defaults. Named ones that are no parameter are set too.
     fn bind(&mut self, params: &[Arg], a: Args, frame: &Rc<Frame>) -> R<()> {
-        let mut pos = a.pos.into_iter();
-        for p in params {
+        let index = |n: &str| params.iter().position(|p| p.name.as_deref() == Some(n));
+        let mut given: Vec<Option<Value>> = vec![None; params.len()];
+        let mut extra: Vec<(Arc<str>, Value)> = Vec::new();
+        let mut named = a.named.into_iter();
+        let mut seen: Vec<Arc<str>> = Vec::new();
+        let mut at = 0;
+        let mut take = |n: Arc<str>, v: Value, given: &mut Vec<Option<Value>>| match index(&n) {
+            Some(i) => given[i] = Some(v),
+            None => extra.push((n, v)),
+        };
+        for (v, before) in a.pos.into_iter().zip(a.before) {
+            while seen.len() < before {
+                let Some((n, v)) = named.next() else { break };
+                seen.push(n.clone());
+                take(n, v, &mut given);
+            }
+            while at < params.len() && params[at].name.as_ref().is_some_and(|n| seen.contains(n)) {
+                at += 1;
+            }
+            if at < params.len() {
+                given[at] = Some(v);
+                at += 1;
+            }
+        }
+        for (n, v) in named {
+            take(n, v, &mut given);
+        }
+        for (i, (p, v)) in params.iter().zip(given).enumerate() {
             let Some(name) = &p.name else { continue };
-            let given = a
-                .named
-                .iter()
-                .find(|(n, _)| n == name)
-                .map(|(_, v)| v.clone());
-            let next = pos.next();
-            let v = match (given, next) {
+            // A parameter named twice: the first counts, as in OpenSCAD.
+            if params[..i].iter().any(|q| q.name.as_ref() == Some(name)) {
+                continue;
+            }
+            let v = match (v, &p.value) {
                 (Some(v), _) => v,
-                (None, Some(v)) => v,
-                (None, None) => match &p.value {
-                    Some(e) => self.eval(e, frame)?,
-                    None => Value::Undef,
-                },
+                (None, Some(e)) => self.eval(e, frame)?,
+                (None, None) => Value::Undef,
             };
             frame.set(name, v);
         }
-        for (n, v) in a.named {
-            if n.starts_with('$') {
-                frame.set(&n, v);
-            }
+        for (n, v) in extra {
+            frame.set(&n, v);
         }
         Ok(())
     }
@@ -1036,14 +1217,17 @@ impl Interp {
         let Some(var) = vars.get(k) else {
             return body(self, f);
         };
-        let (Some(name), Some(e)) = (&var.name, &var.value) else {
+        let Some(e) = &var.value else {
             return self.each(vars, k + 1, f, body);
         };
         let over = self.eval(e, f)?;
         let items = over.items().map_err(|m| Error::at(0, 0, m))?;
+        // Without a name it runs as often, binding nothing.
         for v in items {
             let inner = Frame::inner(f);
-            inner.set(name, v);
+            if let Some(name) = &var.name {
+                inner.set(name, v);
+            }
             self.each(vars, k + 1, &inner, body)?;
         }
         Ok(())
@@ -1063,21 +1247,23 @@ impl Interp {
         Err(self.error(pos, format!("assertion failed: {what}")))
     }
 
-    /// Several shapes as one: the 3D ones joined, or else the 2D ones.
+    /// Several shapes as one: those of the kind of the first joined, the
+    /// others left out, as OpenSCAD does.
     fn union(&mut self, made: Vec<Geom>, pos: Option<Pos>) -> R<Option<Geom>> {
         if made.len() <= 1 {
             return Ok(made.into_iter().next());
         }
-        let (flat, solid): (Vec<Geom>, Vec<Geom>) =
-            made.into_iter().partition(|g| matches!(g, Geom::D2(_)));
-        if !flat.is_empty() && !solid.is_empty() {
-            self.note(pos, "2D and 3D shapes together: the 2D ones are left out");
+        let is_flat = matches!(made[0], Geom::D2(_));
+        let (list, other): (Vec<Geom>, Vec<Geom>) = made
+            .into_iter()
+            .partition(|g| matches!(g, Geom::D2(_)) == is_flat);
+        if !other.is_empty() {
+            let left = if is_flat { "3D" } else { "2D" };
+            self.note(
+                pos,
+                format!("2D and 3D shapes together: the {left} ones are left out"),
+            );
         }
-        let (list, is_flat) = if solid.is_empty() {
-            (flat, true)
-        } else {
-            (solid, false)
-        };
         let solids = list
             .into_iter()
             .map(|g| {
@@ -1090,25 +1276,23 @@ impl Interp {
     }
 
     /// Solids joined in pairs, the pairs again, and so on: the meshes the
-    /// booleans take stay small, and those apart are only put together.
+    /// booleans take stay small, and those apart are only put together
+    /// (see [`Builder::union_many`]). Shapes that fail to join are put
+    /// together as they are, said in a note; OpenSCAD shows them so too.
     fn join(
         &mut self,
-        mut list: Vec<opensolve_kernel::Solid>,
+        list: Vec<opensolve_kernel::Solid>,
         flat: bool,
         pos: Option<Pos>,
     ) -> R<Option<opensolve_kernel::Solid>> {
-        while list.len() > 1 {
-            let mut next = Vec::with_capacity(list.len().div_ceil(2));
-            let mut it = list.into_iter();
-            while let Some(a) = it.next() {
-                next.push(match it.next() {
-                    Some(b) => self.boolean(&a, &b, Op::Add, flat, pos)?,
-                    None => a,
-                });
-            }
-            list = next;
+        let (out, errors) = self.geo.union_many(list, flat);
+        for e in errors {
+            self.note(
+                pos,
+                format!("union: the shapes are put together without joining them ({e})"),
+            );
         }
-        Ok(list.pop())
+        Ok(out)
     }
 
     fn boolean(
@@ -1131,7 +1315,16 @@ impl Interp {
                 );
                 Ok(opensolve_kernel::Solid::merged(&[a.clone(), b.clone()]))
             }
-            Err(e) => Err(self.error(pos.unwrap_or_default(), e)),
+            // One that fails is left out, not the whole file.
+            Err(e) => {
+                let what = if op == Op::Subtract {
+                    "difference: a cut is left out"
+                } else {
+                    "intersection: a shape is left out"
+                };
+                self.note(pos, format!("{what} ({e})"));
+                Ok(a.clone())
+            }
         }
     }
 
@@ -1155,9 +1348,17 @@ impl Interp {
             }
         }
         if op == Op::Subtract {
-            // All that is cut away at once: much faster than one by one.
-            if let Some(cut) = self.join(others, flat, Some(pos))? {
-                acc = self.boolean(&acc, &cut, op, flat, Some(pos))?;
+            // All that is cut away at once: much faster than one by one;
+            // where that fails, one by one.
+            if let Some(cut) = self.join(others.clone(), flat, Some(pos))? {
+                match self.geo.boolean(&acc, &cut, op, flat) {
+                    Ok(s) => acc = s,
+                    Err(_) => {
+                        for s in &others {
+                            acc = self.boolean(&acc, s, op, flat, Some(pos))?;
+                        }
+                    }
+                }
             }
         } else {
             for s in &others {
@@ -1217,11 +1418,10 @@ impl Interp {
     }
 
     /// `text(text, size, font, halign, valign, spacing)`: the letters of
-    /// a TrueType font, its em `size / 0.72` as in OpenSCAD, so that a
-    /// capital H of size 10 is about 9.5 high. The font is looked for by
-    /// its file's name among the machine's fonts; else the one OpenSolve
-    /// carries (Bitstream Vera Sans) stands in for OpenSCAD's Liberation
-    /// Sans: the letters are about as large, not the same.
+    /// a TrueType or OpenType font, its em `size / 0.72` as in OpenSCAD,
+    /// so that a capital H of size 10 is about 9.5 high. The font is found
+    /// by family and style as OpenSCAD finds it (see [`crate::fonts`]):
+    /// Liberation Sans without a name or for one the machine lacks.
     fn text(&mut self, a: &Args, pos: Pos) -> Option<Geom> {
         let words = match a.get("text", 0) {
             Some(Value::Str(s)) => s.to_string(),
@@ -1233,29 +1433,24 @@ impl Interp {
             Some(Value::Str(f)) => f.to_string(),
             _ => String::new(),
         };
-        let font = font.split(':').next().unwrap_or("").trim().to_string();
-        let found = !font.is_empty() && opensolve_sketch::text::has_font(&font);
-        if !font.is_empty() && !found {
+        let found = crate::fonts::find(&font, &self.font_files);
+        if found.stand_in {
+            let family = crate::fonts::parse(&font).0;
             self.note(
                 Some(pos),
-                format!("text: the font {font} is not found: Bitstream Vera Sans stands in"),
+                format!("text: the font {family} is not found: Liberation Sans stands in"),
             );
         }
+        let (data, index) = (found.data, found.index);
         let spacing = a.num("spacing", usize::MAX).unwrap_or(1.0);
         // In cap heights; a chord within a thousandth of the letters.
-        let outlines = opensolve_sketch::text::outlines(&words, &font, 1e-3);
+        let outlines = opensolve_sketch::text::outlines_in(&words, data, index, 1e-3);
         if outlines.is_empty() {
             return None;
         }
-        // The stand-in's capitals as high as Liberation Sans' would be
-        // (1409 of 2048 to the em).
-        let cap = if found {
-            opensolve_sketch::text::cap_per_em(&font)
-        } else {
-            1409.0 / 2048.0
-        };
+        let cap = opensolve_sketch::text::cap_per_em_in(data, index);
         let k = size / 0.72 * cap;
-        let width = opensolve_sketch::text::width(&words, &font) * k;
+        let width = opensolve_sketch::text::width_in(&words, data, index) * k;
         let mut paths: Vec<Vec<V2>> = outlines
             .into_iter()
             .map(|o| {
@@ -1297,6 +1492,139 @@ impl Interp {
             Ok(s) => s.map(Geom::D2),
             Err(e) => {
                 self.note(Some(pos), format!("text: {e}"));
+                None
+            }
+        }
+    }
+
+    /// `import(file, layer, convexity, origin, scale, center, dpi, id)`:
+    /// a mesh of an STL, OFF or OBJ file, the outlines of an SVG or DXF
+    /// file, the path from the folder of the file that imports it.
+    fn import(&mut self, a: &Args, f: &Rc<Frame>, pos: Pos) -> Option<Geom> {
+        let name = match a.get("file", 0).or_else(|| a.get("filename", usize::MAX)) {
+            Some(Value::Str(s)) => s.to_string(),
+            _ => {
+                self.note(Some(pos), "import: no file is named");
+                return None;
+            }
+        };
+        let file = if pos.file == 0 { self.main } else { pos.file };
+        let dir = crate::cache::path(file)
+            .and_then(|f| f.parent().map(PathBuf::from))
+            .unwrap_or_default();
+        let path = crate::plain(&dir.join(&name));
+        let bytes = match self.blobs.get(&path) {
+            Some(b) => b.clone(),
+            None => match read_file(&path) {
+                Ok(b) => {
+                    let b = Arc::new(b);
+                    self.blobs.insert(path.clone(), b.clone());
+                    b
+                }
+                Err(e) => {
+                    self.note(Some(pos), format!("import: {name} cannot be read ({e})"));
+                    return None;
+                }
+            },
+        };
+        let ext = path
+            .extension()
+            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        let center = matches!(a.get("center", usize::MAX), Some(Value::Bool(true)));
+        let (fn_, fs, fa) = (
+            Self::special(a, f, "$fn"),
+            Self::special(a, f, "$fs"),
+            Self::special(a, f, "$fa"),
+        );
+        let origin = a
+            .get("origin", 3)
+            .and_then(Value::nums)
+            .filter(|n| n.len() >= 2)
+            .map_or([0.0; 2], |n| [n[0], n[1]]);
+        let str_of = |n: &str, at: usize| match a.get(n, at) {
+            Some(Value::Str(s)) => Some(s.to_string()),
+            _ => None,
+        };
+        let o = crate::import::Options {
+            center,
+            dpi: a
+                .num("dpi", usize::MAX)
+                .filter(|d| *d >= 0.001)
+                .unwrap_or(72.0),
+            layer: str_of("layer", 1).or_else(|| str_of("layername", usize::MAX)),
+            id: str_of("id", usize::MAX),
+            origin,
+            scale: a.num("scale", 4).filter(|s| *s > 0.0).unwrap_or(1.0),
+            fragments: Rc::new(move |r| fragments(r, fn_, fs, fa).min(PIECES)),
+            fn_,
+        };
+        let centered = |me: &mut Self, g: Geom| {
+            let (Geom::D2(s) | Geom::D3(s)) = &g;
+            let Some((lo, hi)) = s.bounds() else {
+                return g;
+            };
+            let flat = matches!(g, Geom::D2(_));
+            let c: Vec<f64> = (0..3).map(|i| -(lo[i] + hi[i]) / 2.0).collect();
+            let m = [
+                [1.0, 0.0, 0.0, c[0]],
+                [0.0, 1.0, 0.0, c[1]],
+                [0.0, 0.0, 1.0, if flat { 0.0 } else { c[2] }],
+            ];
+            me.transform(g, &m)
+        };
+        match ext.as_str() {
+            "stl" | "off" | "obj" => match crate::import::mesh(&ext, &bytes) {
+                Ok(faces) => {
+                    let g = self.geo.mesh(&faces).map(Geom::D3)?;
+                    Some(if center { centered(self, g) } else { g })
+                }
+                Err(e) => {
+                    self.note(Some(pos), format!("import: {name}: {e}"));
+                    None
+                }
+            },
+            "svg" => {
+                let shapes = match crate::import::svg(&String::from_utf8_lossy(&bytes), &o) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        self.note(Some(pos), format!("import: {name}: {e}"));
+                        return None;
+                    }
+                };
+                let mut made = Vec::new();
+                for paths in shapes {
+                    match self.geo.polygon(&paths) {
+                        Ok(s) => made.extend(s.map(Geom::D2)),
+                        Err(e) => self.note(Some(pos), format!("import: {name}: {e}")),
+                    }
+                }
+                match self.union(made, Some(pos)) {
+                    Ok(g) => g,
+                    Err(e) => {
+                        self.note(Some(pos), format!("import: {name}: {}", e.message));
+                        None
+                    }
+                }
+            }
+            "dxf" => {
+                let paths = crate::import::dxf(&String::from_utf8_lossy(&bytes), &o);
+                match self.geo.polygon(&paths) {
+                    Ok(g) => {
+                        let g = g.map(Geom::D2)?;
+                        Some(if center { centered(self, g) } else { g })
+                    }
+                    Err(e) => {
+                        self.note(Some(pos), format!("import: {name}: {e}"));
+                        None
+                    }
+                }
+            }
+            _ => {
+                self.note(
+                    Some(pos),
+                    format!("import: {name}: {ext} files are not supported"),
+                );
                 None
             }
         }
@@ -1358,7 +1686,7 @@ impl Interp {
     }
 
     fn hull(&mut self, made: Vec<Geom>, pos: Pos) -> Option<Geom> {
-        let solid = made.iter().any(|g| matches!(g, Geom::D3(_)));
+        let solid = matches!(made.first(), Some(Geom::D3(_)));
         let mut points: Vec<V3> = Vec::new();
         for g in &made {
             match (g, solid) {
@@ -1758,6 +2086,90 @@ impl Interp {
         }
         Ok(())
     }
+}
+
+/// A value as bytes that tell it apart exactly; `None` for a function
+/// literal.
+fn key_of(v: &Value, out: &mut Vec<u8>) -> Option<()> {
+    match v {
+        Value::Undef => out.push(0),
+        Value::Bool(b) => out.extend([1, u8::from(*b)]),
+        Value::Num(x) => {
+            out.push(2);
+            out.extend(x.to_bits().to_le_bytes());
+        }
+        Value::Str(s) => {
+            out.push(3);
+            out.extend(s.len().to_le_bytes());
+            out.extend(s.as_bytes());
+        }
+        Value::List(l) => {
+            out.push(4);
+            out.extend(l.len().to_le_bytes());
+            for x in l.iter() {
+                key_of(x, out)?;
+            }
+        }
+        Value::Range(a, b, c) => {
+            out.push(5);
+            for x in [a, b, c] {
+                out.extend(x.to_bits().to_le_bytes());
+            }
+        }
+        Value::Func(..) => return None,
+    }
+    Some(())
+}
+
+/// The modules OpenSCAD has.
+const BUILT_IN_MODULES: &[&str] = &[
+    "cube",
+    "sphere",
+    "cylinder",
+    "polyhedron",
+    "square",
+    "circle",
+    "polygon",
+    "translate",
+    "rotate",
+    "scale",
+    "mirror",
+    "multmatrix",
+    "resize",
+    "union",
+    "group",
+    "render",
+    "color",
+    "difference",
+    "intersection",
+    "hull",
+    "linear_extrude",
+    "rotate_extrude",
+    "children",
+    "echo",
+    "assert",
+    "minkowski",
+    "offset",
+    "projection",
+    "text",
+    "import",
+    "surface",
+    "roof",
+    "fill",
+    "for",
+    "intersection_for",
+    "let",
+];
+
+/// A file imported but not named as text: read when it is needed.
+#[cfg(not(target_arch = "wasm32"))]
+fn read_file(path: &std::path::Path) -> Result<Vec<u8>, String> {
+    std::fs::read(path).map_err(|e| e.to_string())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn read_file(_: &std::path::Path) -> Result<Vec<u8>, String> {
+    Err("not read here".to_string())
 }
 
 fn is_instance(s: &Stmt) -> bool {

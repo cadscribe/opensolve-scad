@@ -40,11 +40,13 @@ struct Lexer<'a> {
 
 /// The tokens of `text`, the last one [`Tok::End`].
 pub fn tokens(text: &str) -> Result<Vec<Token>, Error> {
+    // A byte order mark at the start is no text.
+    let bom = if text.starts_with('\u{feff}') { 3 } else { 0 };
     let mut l = Lexer {
         text,
-        at: 0,
+        at: bom,
         line: 1,
-        line_start: 0,
+        line_start: bom,
     };
     let mut out = Vec::new();
     loop {
@@ -129,7 +131,15 @@ impl Lexer<'_> {
             return Ok(Tok::End);
         };
         if c.is_ascii_digit() || (c == '.' && self.peek2().is_some_and(|d| d.is_ascii_digit())) {
-            return self.number();
+            // As OpenSCAD's lexer takes the longest match: `2D` is a name,
+            // `2e3` a number.
+            let number = self.number_len();
+            let name = self.text[self.at..]
+                .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .unwrap_or(self.text.len() - self.at);
+            if name <= number {
+                return self.number();
+            }
         }
         if c == '"' {
             return self.string();
@@ -175,6 +185,31 @@ impl Lexer<'_> {
             }
         }
         Err(self.error(format!("unexpected “{c}”")))
+    }
+
+    /// How many bytes a number from here takes.
+    fn number_len(&self) -> usize {
+        let b = &self.text.as_bytes()[self.at..];
+        let digits = |mut i: usize| {
+            while b.get(i).is_some_and(u8::is_ascii_digit) {
+                i += 1;
+            }
+            i
+        };
+        let mut i = digits(0);
+        if b.get(i) == Some(&b'.') && b.get(i + 1) != Some(&b'.') {
+            i = digits(i + 1);
+        }
+        if matches!(b.get(i), Some(b'e' | b'E')) {
+            let mut j = i + 1;
+            if matches!(b.get(j), Some(b'+' | b'-')) {
+                j += 1;
+            }
+            if b.get(j).is_some_and(u8::is_ascii_digit) {
+                i = digits(j);
+            }
+        }
+        i
     }
 
     fn number(&mut self) -> Result<Tok, Error> {
@@ -289,6 +324,28 @@ mod tests {
             toks("[0:1:2]")[1..4],
             [Tok::Num(0.0), Tok::Sym(":"), Tok::Num(1.0)]
         );
+    }
+
+    #[test]
+    fn names_may_start_with_a_digit() {
+        assert_eq!(
+            toks("2D 3d_x 2e3 1.5 0x 7"),
+            [
+                Tok::Name("2D".into()),
+                Tok::Name("3d_x".into()),
+                Tok::Num(2000.0),
+                Tok::Num(1.5),
+                Tok::Name("0x".into()),
+                Tok::Num(7.0),
+                Tok::End,
+            ]
+        );
+    }
+
+    #[test]
+    fn a_byte_order_mark_is_skipped() {
+        assert_eq!(toks("\u{feff}a"), [Tok::Name("a".into()), Tok::End]);
+        assert_eq!(tokens("\u{feff}a").unwrap()[0].col, 1);
     }
 
     #[test]

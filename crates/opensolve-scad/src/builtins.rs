@@ -154,12 +154,14 @@ pub fn call(name: &str, args: &Args) -> Option<Value> {
             _ => Value::Undef,
         }),
         "search" => Some(search(args)),
+        // The release whose language this follows where files check: older
+        // than 2022 makes libraries refuse (Gridfinity Extended).
         "version" => Some(Value::list(vec![
-            Value::Num(2021.0),
-            Value::Num(1.0),
-            Value::Num(0.0),
+            Value::Num(2026.0),
+            Value::Num(10.0),
+            Value::Num(11.0),
         ])),
-        "version_num" => Some(Value::Num(20210100.0)),
+        "version_num" => Some(Value::Num(20261011.0)),
         "is_undef" => Some(Value::Bool(matches!(
             arg(args, "", 0),
             Some(Value::Undef) | None

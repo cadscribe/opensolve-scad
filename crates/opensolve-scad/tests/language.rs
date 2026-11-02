@@ -436,3 +436,162 @@ fn a_diagnosis_says_where() {
     assert_eq!(e.line, 6);
     assert!(e.message.contains("small"), "{}", e.message);
 }
+
+#[test]
+fn for_without_a_name_runs_as_often() {
+    assert_eq!(echo("a = [for ([0:2]) 5]; echo(a);"), "[5, 5, 5]");
+    let out = run_with(
+        &[("main.scad", "n = 0; for ([0:2]) echo(\"x\"); cube(1);")],
+        &[],
+    )
+    .unwrap();
+    let echoes = out.notes.iter().filter(|n| n.starts_with("ECHO")).count();
+    // Notes are kept once each: the echo ran, the loop did not fail.
+    assert_eq!(echoes, 1, "{:?}", out.notes);
+}
+
+#[test]
+fn names_may_start_with_a_digit_and_a_byte_order_mark_is_skipped() {
+    assert_eq!(
+        echo("\u{feff}2D = true; module 3d() {} function 1x(a) = a + 1; echo(2D, 1x(2));"),
+        "true, 3"
+    );
+}
+
+#[test]
+fn an_unknown_module_is_no_child() {
+    // As OpenSCAD: the unknown call is left out, so the cube is what is cut
+    // from.
+    let out = run_with(
+        &[(
+            "main.scad",
+            "difference() { nothing_here(); cube(2); translate([1, 0, 0]) cube(2); }",
+        )],
+        &[],
+    )
+    .unwrap();
+    assert!((out.solid.volume() - 4.0).abs() < 1e-6);
+    assert!(
+        out.notes
+            .iter()
+            .any(|n| n.contains("unknown module nothing_here")),
+        "{:?}",
+        out.notes
+    );
+}
+
+#[test]
+fn a_used_file_finds_what_it_uses_itself() {
+    // Two folders, each with its own `s.scad`: a module of a used file
+    // calls the `s` of the file it uses, not the first `s` used anywhere.
+    let files = [
+        ("main.scad", "use <a/a.scad>\nuse <b/b.scad>\nb();"),
+        ("a/a.scad", "use <s.scad>\nmodule a() s();"),
+        ("a/s.scad", "module s() cube(1);"),
+        ("b/b.scad", "use <s.scad>\nmodule b() s();"),
+        ("b/s.scad", "module s() cube(5);"),
+    ];
+    let out = run_with(&files, &[]).unwrap();
+    assert!((out.solid.volume() - 125.0).abs() < 1e-6);
+    // What a used file uses is not known in the file that uses it.
+    let files = [
+        ("main.scad", "use <a/a.scad>\ns();\ncube(2);"),
+        ("a/a.scad", "use <s.scad>\nmodule a() s();"),
+        ("a/s.scad", "module s() cube(1);"),
+    ];
+    let out = run_with(&files, &[]).unwrap();
+    assert!((out.solid.volume() - 8.0).abs() < 1e-6);
+    assert!(out.notes.iter().any(|n| n.contains("unknown module s")));
+}
+
+#[test]
+fn a_value_by_position_after_named_ones_takes_the_next_free_parameter() {
+    // As OpenSCAD binds them: `3` goes to `r`, the first not named before.
+    assert_eq!(
+        echo(
+            "function f(width, length, r = 1) = [width, length, r];\n\
+             echo(f(width = 2, length = 70, 3));"
+        ),
+        "[2, 70, 3]"
+    );
+    assert_eq!(
+        echo(
+            "function f(a, b, c) = [a, b, c];\n\
+             echo(f(b = 2, 1, 3), f(1, a = 5), f(c = 1, 2, b = 4));"
+        ),
+        "[1, 2, 3], [5, undef, undef], [2, 4, 1]"
+    );
+    // A parameter named twice: its first default counts.
+    assert_eq!(
+        echo("function f(a = 1, a = 2) = a;\necho(f(), f(3));"),
+        "1, 3"
+    );
+}
+
+#[test]
+fn the_first_child_says_2d_or_3d() {
+    // OpenSCAD keeps the kind of the first and leaves out the others.
+    let e = run_with(&[("main.scad", "union() { square(2); cube(3); }")], &[]).unwrap_err();
+    assert!(e.contains("2D"), "{e}");
+    let out = run_with(&[("main.scad", "union() { cube(3); square(2); }")], &[]).unwrap();
+    assert!((out.solid.volume() - 27.0).abs() < 1e-6);
+}
+
+/// A cube of side 2 as an ASCII STL file.
+fn cube_stl() -> String {
+    let p = |i: usize| {
+        [
+            (i & 1) as f64 * 2.0,
+            (i >> 1 & 1) as f64 * 2.0,
+            (i >> 2) as f64 * 2.0,
+        ]
+    };
+    let quads = [
+        [0, 2, 3, 1],
+        [4, 5, 7, 6],
+        [0, 1, 5, 4],
+        [2, 6, 7, 3],
+        [0, 4, 6, 2],
+        [1, 3, 7, 5],
+    ];
+    let mut s = String::from("solid cube\n");
+    for q in quads {
+        for t in [[q[0], q[1], q[2]], [q[0], q[2], q[3]]] {
+            s += " facet normal 0 0 0\n  outer loop\n";
+            for i in t {
+                let v = p(i);
+                s += &format!("   vertex {} {} {}\n", v[0], v[1], v[2]);
+            }
+            s += "  endloop\n endfacet\n";
+        }
+    }
+    s + "endsolid cube\n"
+}
+
+#[test]
+fn import_reads_meshes_and_outlines_beside_the_file() {
+    let stl = cube_stl();
+    let svg = "<svg width=\"10mm\" height=\"10mm\" viewBox=\"0 0 10 10\">\
+               <rect x=\"0\" y=\"0\" width=\"4\" height=\"5\"/></svg>";
+    let dxf = "0\nSECTION\n2\nENTITIES\n0\nLWPOLYLINE\n8\n0\n70\n1\n\
+               10\n0\n20\n0\n10\n3\n20\n0\n10\n3\n20\n3\n10\n0\n20\n3\n0\nENDSEC\n0\nEOF\n";
+    let files = [
+        (
+            "main.scad",
+            "use <parts/p.scad>\nbox();\ntranslate([10, 0, 0]) linear_extrude(1) import(\"a.svg\");\n\
+             translate([20, 0, 0]) linear_extrude(2) import(file = \"a.dxf\", center = true);",
+        ),
+        (
+            "parts/p.scad",
+            "module box() import(\"cube.stl\", center = true);",
+        ),
+        ("parts/cube.stl", &stl),
+        ("a.svg", svg),
+        ("a.dxf", dxf),
+    ];
+    let out = run_with(&files, &[]).unwrap();
+    assert!(out.notes.is_empty(), "{:?}", out.notes);
+    assert!((out.solid.volume() - (8.0 + 20.0 + 18.0)).abs() < 1e-6);
+    let (lo, hi) = out.solid.bounds().unwrap();
+    assert_eq!((lo, hi), ([-1.0, -1.5, -1.0], [21.5, 10.0, 2.0]));
+}

@@ -112,6 +112,28 @@ fn booleans() {
 }
 
 #[test]
+fn cutters_that_meet_along_an_edge() {
+    // Two cutters meet along an edge of the result: an edge of four
+    // triangles, on which the mesh library panicked. OpenSCAD: 250000.
+    near(
+        volume(
+            "difference() { translate([-50, 0, -50]) cube([100, 50, 100]);\n\
+             translate([0, -10, 0]) { rotate([0, -30, 0]) translate([-300, 0, 0]) cube([300, 70, 300]);\n\
+             rotate([0, 40, 0]) cube([300, 70, 300]); } }",
+        ),
+        250_000.0,
+    );
+    // Parts joined along an edge, moved, and cut from.
+    near(
+        volume(
+            "difference() { translate([-5, -5, -5]) cube([30, 20, 30]);\n\
+             translate([1, 0, 0]) union() { cube(10); translate([10, 0, 10]) cube(10); } }",
+        ),
+        18_000.0 - 2000.0,
+    );
+}
+
+#[test]
 fn transformations_keep_or_scale_volumes() {
     near(volume("rotate([30, 45, 60]) cube(2);"), 8.0);
     near(volume("rotate(45, [1, 1, 0]) cube(2);"), 8.0);
@@ -141,6 +163,11 @@ fn hulls() {
     let ball = volume("sphere(1, $fn = 8);");
     let v = volume("hull() { sphere(1, $fn = 8); translate([5, 0, 0]) sphere(1, $fn = 8); }");
     assert!(v > 2.0 * ball && v < 7.0 * 2.0 * 2.0, "{v}");
+    // Many points: the hull of a fine sphere's is the sphere.
+    near(
+        volume("hull() sphere(5, $fn = 120);"),
+        volume("sphere(5, $fn = 120);"),
+    );
     // 2D: a stadium.
     let a = ngon(1.0, 12);
     near(
@@ -281,7 +308,7 @@ fn polyhedrons_either_way_round() {
 
 #[test]
 fn not_supported_is_said() {
-    let out = solid("cube(1); surface(\"a.png\"); import(\"a.stl\");");
+    let out = solid("cube(1); surface(\"a.png\"); import(\"a.amf\");");
     assert!(
         out.notes
             .iter()
@@ -290,18 +317,43 @@ fn not_supported_is_said() {
     assert!(
         out.notes
             .iter()
-            .any(|n| n.contains("not supported: import"))
+            .any(|n| n.contains("amf files are not supported")),
+        "{:?}",
+        out.notes
     );
 }
 
 #[test]
 fn text_has_letters_about_openscads_size() {
-    // OpenSCAD's H of size 10 (Liberation Sans) is 9.55 high; the font
-    // that stands in has capitals as high.
+    // OpenSCAD's H of size 10 (Liberation Sans) is 9.555 high, from 1.139
+    // to 8.897 in x.
     let s = solid("linear_extrude(1) text(\"H\", size = 10);").solid;
     let (lo, hi) = s.bounds().unwrap();
     assert!((hi[1] - lo[1] - 9.555).abs() < 0.05, "{lo:?} {hi:?}");
     assert!(lo[1].abs() < 1e-6);
+    assert!(
+        (lo[0] - 1.139).abs() < 0.05 && (hi[0] - 8.897).abs() < 0.05,
+        "{lo:?} {hi:?}"
+    );
+    // By family and style; a family the machine lacks: Liberation Sans,
+    // said in a note. Its kerning: "AV" is narrower than "A" and "V".
+    let wide = |t: &str| {
+        let (lo, hi) = solid(&format!("linear_extrude(1) text({t});"))
+            .solid
+            .bounds()
+            .unwrap();
+        hi[0] - lo[0]
+    };
+    assert!(wide("\"H\", font = \"Liberation Sans:style=Bold\"") > 8.1);
+    let out = solid("linear_extrude(1) text(\"H\", font = \"No Such Font\");");
+    assert!(
+        out.notes
+            .iter()
+            .any(|n| n.contains("No Such Font is not found: Liberation Sans")),
+        "{:?}",
+        out.notes
+    );
+    assert!(wide("\"AV\"") < wide("\"A\"") + wide("\"V\"") - 0.5);
     // Centred both ways; an "o" has its hole.
     let s =
         solid("linear_extrude(1) text(\"Hello\", halign = \"center\", valign = \"center\");").solid;
@@ -447,4 +499,24 @@ fn too_many_pieces_are_capped_and_said() {
         out.notes
     );
     near(out.solid.volume(), ngon(5.0, 1000));
+}
+
+#[test]
+fn many_parts_apart_and_a_module_called_again() {
+    // Rings of twisted ribs: apart from each other, though their boxes
+    // overlap, they are put together without booleans and still closed.
+    let ribs = "for (r = [10, 14]) for (i = [0:5]) rotate([0, 0, i * 60]) \
+                linear_extrude(height = 10, twist = 45) translate([r, 0]) circle(1, $fn = 12);";
+    let one =
+        volume("linear_extrude(height = 10, twist = 45) translate([10, 0]) circle(1, $fn = 12);");
+    near(volume(ribs), 12.0 * one);
+    // A module called again alike is made once; with another `$fn` it
+    // is made anew.
+    near(
+        volume(
+            "module m() cylinder(r = 5, h = 1); m(); translate([20, 0, 0]) m();\n\
+             translate([40, 0, 0]) m($fn = 6); translate([60, 0, 0]) { $fn = 6; m(); }",
+        ),
+        2.0 * ngon(5.0, 16) + 2.0 * ngon(5.0, 6),
+    );
 }
