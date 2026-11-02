@@ -95,3 +95,33 @@ fn an_attachment_tree() {
         assert!((a - b).abs() < 1e-6, "{lo:?} {hi:?}");
     }
 }
+
+#[test]
+fn the_bundled_copy_is_written_out_and_never_over_ones_own() {
+    use opensolve_scad::library::{BUNDLED_VERSION, Installed, MARKER, install, installed};
+    let dir = std::env::temp_dir().join(format!("opensolve-bosl2-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let bosl2 = dir.join("BOSL2");
+    assert_eq!(installed(&bosl2), Installed::Missing);
+    install(&bosl2).unwrap();
+    assert_eq!(
+        installed(&bosl2),
+        Installed::Bundled(BUNDLED_VERSION.into())
+    );
+    for f in ["std.scad", "attachments.scad", "LICENSE"] {
+        let ours = std::fs::read(bosl2.join(f)).unwrap();
+        let source = std::fs::read(scadtest::library().join("BOSL2").join(f)).unwrap();
+        assert_eq!(ours, source, "{f}");
+    }
+    // An older bundled copy is replaced, one's own never.
+    std::fs::write(bosl2.join(MARKER), "2.0.1\n").unwrap();
+    install(&bosl2).unwrap();
+    assert_eq!(
+        installed(&bosl2),
+        Installed::Bundled(BUNDLED_VERSION.into())
+    );
+    std::fs::remove_file(bosl2.join(MARKER)).unwrap();
+    assert_eq!(installed(&bosl2), Installed::Own);
+    assert!(install(&bosl2).is_err());
+    let _ = std::fs::remove_dir_all(&dir);
+}

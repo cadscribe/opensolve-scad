@@ -348,6 +348,40 @@ fn include_and_use_from_the_files_folder() {
 }
 
 #[test]
+fn includes_are_found_in_the_library_folders() {
+    // Beside the file first, then in the library folders in their order.
+    let root = std::env::temp_dir().join(format!("opensolve-libs-{}", std::process::id()));
+    let (first, second) = (root.join("first"), root.join("second"));
+    for (dir, size) in [(&first, 2), (&second, 3)] {
+        std::fs::create_dir_all(dir.join("mylib")).unwrap();
+        std::fs::write(dir.join("mylib/sizes.scad"), format!("size = {size};")).unwrap();
+        std::fs::write(dir.join("mylib/only.scad"), format!("other = {size};")).unwrap();
+    }
+    std::fs::remove_file(first.join("mylib/only.scad")).unwrap();
+    opensolve_scad::library::set_dirs(Some(vec![first, second]));
+    let main =
+        "include <mylib/sizes.scad>\ninclude <mylib/only.scad>\necho(size, other);\ncube(1);";
+    let out = run_with(&[("main.scad", main)], &[]).unwrap();
+    assert!(
+        out.notes.contains(&"ECHO: 2, 3".to_string()),
+        "{:?}",
+        out.notes
+    );
+    let out = run_with(
+        &[("main.scad", main), ("mylib/sizes.scad", "size = 7;")],
+        &[],
+    )
+    .unwrap();
+    assert!(
+        out.notes.contains(&"ECHO: 7, 3".to_string()),
+        "{:?}",
+        out.notes
+    );
+    opensolve_scad::library::set_dirs(None);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
 fn overrides_set_top_level_variables_as_d_does() {
     let text = "w = 2; // [1:10]\nh = w * 2;\ncube([w, w, h]);";
     let v = |o: &[(&str, &str)]| run_with(&[("main.scad", text)], o).unwrap().solid.volume();
