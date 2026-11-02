@@ -521,6 +521,11 @@ fn a_value_by_position_after_named_ones_takes_the_next_free_parameter() {
         ),
         "[1, 2, 3], [5, undef, undef], [2, 4, 1]"
     );
+    // A parameter named twice: its first default counts.
+    assert_eq!(
+        echo("function f(a = 1, a = 2) = a;\necho(f(), f(3));"),
+        "1, 3"
+    );
 }
 
 #[test]

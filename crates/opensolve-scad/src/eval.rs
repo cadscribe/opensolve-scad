@@ -1164,8 +1164,12 @@ impl Interp {
         for (n, v) in named {
             take(n, v, &mut given);
         }
-        for (p, v) in params.iter().zip(given) {
+        for (i, (p, v)) in params.iter().zip(given).enumerate() {
             let Some(name) = &p.name else { continue };
+            // A parameter named twice: the first counts, as in OpenSCAD.
+            if params[..i].iter().any(|q| q.name.as_ref() == Some(name)) {
+                continue;
+            }
             let v = match (v, &p.value) {
                 (Some(v), _) => v,
                 (None, Some(e)) => self.eval(e, frame)?,
