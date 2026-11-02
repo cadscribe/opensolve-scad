@@ -66,6 +66,48 @@ OpenSCAD does is the part that matters for parts that fit.
   quotes); a value as in the file is not stored. The MCP server lists a link's
   values and parameters in `get_feature` and sets them with
   `set_link_parameters`, also for the assistant in the app.
+- The model's own parameters reach the file (2026-11-02). A value a link sets
+  may be an expression in the model's parameters (`wall`,
+  `width - 2 * wall`, `ring_abstand / 2`): a value that names something
+  other than OpenSCAD's `true`, `false`, `undef` and `PI`, and is no string
+  or list. The model's evaluator (that of dimensions) gives it in mm, and the
+  file gets the number; a text parameter named alone gives its words. Other
+  values are OpenSCAD's, as before, except that a number with a unit or a
+  sum the model can work out (`1cm + 5`) is given as its number. So an
+  override that named one of the file's own variables (`depth = width / 2`)
+  is now an unknown name: the Customizer only ever writes plain values.
+- A link may pass the model's parameters (`Feature::Link::model_params`,
+  "Modellparameter übergeben" in its properties): each number parameter and
+  each text parameter, as far as it has a value, is a top-level variable of
+  the file, as OpenSCAD's `-D` makes one, in the model's order, then the
+  link's own values; the later of one name wins at the place of the first.
+  The model's value thus wins over the file's own top-level assignment, the
+  link's over the model's, and a name the file does not assign is still
+  defined. It is on for a newly linked OpenSCAD file, off for links read
+  from older files and for other files: a model's parameters are its
+  user's names for its sizes, so a file that uses the same name means the
+  same size; a clash shows, as the properties mark a file parameter given
+  by the model and say so on hover, and the switch turns it off. A link
+  that passes them is written with a line `model-params` after it; files
+  without it read as before.
+- The linked solid is kept by file and the values it is built with, the
+  evaluated ones (`Model::link_values`, `Model::link_key_of`): a changed
+  parameter of the model makes a new key, and the app, the MCP server and
+  the CLI read what is not there yet after each change. Every change of a
+  passed parameter builds the file again, used by it or not. A value that
+  cannot be worked out (an unknown name, a parameter that depends on
+  itself, words where a number goes) is the link's problem, naming the
+  value and why; the rest of the model builds.
+- The editor's language server is told the variables a file is given
+  (`Workspace::set_external`): the app gives each open file the parameters
+  of the links that pass them. They are not unknown when the file is
+  checked, completion offers them as variables ("Modellparameter = 73"),
+  and hover shows their value and expression, before the file's own
+  top-level value of the name, which they replace. The stdio server has
+  none.
+- The MCP server's `set_link_parameters` takes such expressions and
+  `model_parameters`; `get_feature` shows `model_parameters` and
+  `built_with`, the values the file gets.
 - Evaluation runs on a thread with a large stack: OpenSCAD files loop by
   recursion. Calls deeper than 3,000 end with an error.
 

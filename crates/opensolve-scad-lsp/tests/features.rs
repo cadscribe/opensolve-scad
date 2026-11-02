@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use opensolve_scad_lsp::{CompletionKind, DefKind, Severity, Workspace};
+use opensolve_scad_lsp::{CompletionKind, DefKind, External, Severity, Workspace};
 
 /// A workspace whose files on "disk" are `files`, below `/p`.
 fn workspace(files: &[(&str, &str)]) -> Workspace {
@@ -214,4 +214,51 @@ fn in_a_call_the_parameters_are_offered_and_no_modules() {
     w.set(main_path(), text.to_string());
     let items = w.completion(main_path(), text.len());
     assert!(!items.iter().any(|c| c.kind == CompletionKind::Parameter));
+}
+
+#[test]
+fn variables_given_from_outside_are_known_completed_and_shown() {
+    // `wall` is given by the model; `size` is the file's own and given too.
+    let text = "size = 4;\ncube([size, wa, wall]);\nmodule m(wall) { cube(wall); }\n";
+    let mut w = workspace(&[]);
+    w.set(main_path(), text.to_string());
+    let unknown = |w: &Workspace| {
+        w.diagnostics(main_path())
+            .into_iter()
+            .filter(|d| d.message.contains("unknown variable"))
+            .map(|d| d.message)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        unknown(&w),
+        ["unknown variable wa", "unknown variable wall"]
+    );
+    let given = |name: &str, value: &str| External {
+        name: name.into(),
+        value: value.into(),
+        detail: format!("model parameter = {value}"),
+        doc: format!("Model parameter `{name} = ring / 2`"),
+    };
+    assert!(w.set_external(main_path(), vec![given("wall", "73"), given("size", "9")]));
+    assert!(!w.set_external(main_path(), vec![given("wall", "73"), given("size", "9")]));
+    assert_eq!(unknown(&w), ["unknown variable wa"]);
+    // Completion offers it as a variable, with its value.
+    let items = w.completion(main_path(), after(text, "size, wa"));
+    let wall = items.iter().find(|c| c.label == "wall").unwrap();
+    assert_eq!(wall.kind, CompletionKind::Variable);
+    assert_eq!(wall.detail, "model parameter = 73");
+    // The given value wins over the file's own.
+    let items = w.completion(main_path(), after(text, "cube([si"));
+    let size: Vec<_> = items.iter().filter(|c| c.label == "size").collect();
+    assert_eq!(size.len(), 1, "{items:?}");
+    assert_eq!(size[0].detail, "model parameter = 9");
+    // Hover shows its value and expression; not on a parameter of a module.
+    let h = w.hover(main_path(), after(text, "size, wa, wa")).unwrap();
+    assert_eq!(h.signature, "wall = 73");
+    assert!(h.markdown.contains("ring / 2"), "{}", h.markdown);
+    let h = w.hover(main_path(), after(text, "cube(wa"));
+    assert!(h.is_none_or(|h| h.signature != "wall = 73"));
+    // None given: unknown again.
+    assert!(w.set_external(main_path(), Vec::new()));
+    assert_eq!(unknown(&w).len(), 2);
 }
