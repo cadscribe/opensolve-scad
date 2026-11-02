@@ -18,6 +18,8 @@ pub struct Parsed {
     pub text: Arc<str>,
     /// The paths of its `include <…>` and `use <…>`, as written.
     pub includes: Vec<String>,
+    /// The paths its `import` calls name as text, as written.
+    pub imports: Vec<String>,
     stmts: OnceLock<Result<Arc<Vec<Stmt>>, Error>>,
 }
 
@@ -78,10 +80,12 @@ pub fn file(path: &Path, text: String) -> Arc<Parsed> {
         return p.clone();
     }
     let includes = crate::includes(&text);
+    let imports = crate::imports(&text);
     let parsed = Arc::new(Parsed {
         id,
         text: text.into(),
         includes,
+        imports,
         stmts: OnceLock::new(),
     });
     let mut c = cache();

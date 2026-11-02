@@ -531,3 +531,62 @@ fn the_first_child_says_2d_or_3d() {
     let out = run_with(&[("main.scad", "union() { cube(3); square(2); }")], &[]).unwrap();
     assert!((out.solid.volume() - 27.0).abs() < 1e-6);
 }
+
+/// A cube of side 2 as an ASCII STL file.
+fn cube_stl() -> String {
+    let p = |i: usize| {
+        [
+            (i & 1) as f64 * 2.0,
+            (i >> 1 & 1) as f64 * 2.0,
+            (i >> 2) as f64 * 2.0,
+        ]
+    };
+    let quads = [
+        [0, 2, 3, 1],
+        [4, 5, 7, 6],
+        [0, 1, 5, 4],
+        [2, 6, 7, 3],
+        [0, 4, 6, 2],
+        [1, 3, 7, 5],
+    ];
+    let mut s = String::from("solid cube\n");
+    for q in quads {
+        for t in [[q[0], q[1], q[2]], [q[0], q[2], q[3]]] {
+            s += " facet normal 0 0 0\n  outer loop\n";
+            for i in t {
+                let v = p(i);
+                s += &format!("   vertex {} {} {}\n", v[0], v[1], v[2]);
+            }
+            s += "  endloop\n endfacet\n";
+        }
+    }
+    s + "endsolid cube\n"
+}
+
+#[test]
+fn import_reads_meshes_and_outlines_beside_the_file() {
+    let stl = cube_stl();
+    let svg = "<svg width=\"10mm\" height=\"10mm\" viewBox=\"0 0 10 10\">\
+               <rect x=\"0\" y=\"0\" width=\"4\" height=\"5\"/></svg>";
+    let dxf = "0\nSECTION\n2\nENTITIES\n0\nLWPOLYLINE\n8\n0\n70\n1\n\
+               10\n0\n20\n0\n10\n3\n20\n0\n10\n3\n20\n3\n10\n0\n20\n3\n0\nENDSEC\n0\nEOF\n";
+    let files = [
+        (
+            "main.scad",
+            "use <parts/p.scad>\nbox();\ntranslate([10, 0, 0]) linear_extrude(1) import(\"a.svg\");\n\
+             translate([20, 0, 0]) linear_extrude(2) import(file = \"a.dxf\", center = true);",
+        ),
+        (
+            "parts/p.scad",
+            "module box() import(\"cube.stl\", center = true);",
+        ),
+        ("parts/cube.stl", &stl),
+        ("a.svg", svg),
+        ("a.dxf", dxf),
+    ];
+    let out = run_with(&files, &[]).unwrap();
+    assert!(out.notes.is_empty(), "{:?}", out.notes);
+    assert!((out.solid.volume() - (8.0 + 20.0 + 18.0)).abs() < 1e-6);
+    let (lo, hi) = out.solid.bounds().unwrap();
+    assert_eq!((lo, hi), ([-1.0, -1.5, -1.0], [21.5, 10.0, 2.0]));
+}

@@ -10,6 +10,7 @@ mod cache;
 mod customizer;
 mod eval;
 mod geom;
+mod import;
 mod lexer;
 pub mod library;
 mod parser;
@@ -101,7 +102,7 @@ pub fn build(
     overrides: &[(String, String)],
 ) -> Result<Output, String> {
     let path = plain(path);
-    let mut sources = HashMap::new();
+    let mut sources = Sources::default();
     gather(&path, read, &mut sources)?;
     deep(move || evaluate(path, sources, overrides))?
 }
@@ -110,7 +111,7 @@ pub fn build(
 /// with places: what an editor marks. The shapes it makes do not matter.
 pub fn diagnose(path: &Path, read: Reader<'_>, overrides: &[(String, String)]) -> Diagnosis {
     let path = plain(path);
-    let mut sources = HashMap::new();
+    let mut sources = Sources::default();
     if let Err(e) = gather(&path, read, &mut sources) {
         return Diagnosis {
             error: Some(Error::at(0, 0, e)),
@@ -118,7 +119,7 @@ pub fn diagnose(path: &Path, read: Reader<'_>, overrides: &[(String, String)]) -
         };
     }
     deep(move || {
-        let mut it = eval::Interp::new(sources);
+        let mut it = eval::Interp::new(sources.files, sources.blobs);
         let error = it
             .load(path, &mut Vec::new())
             .and_then(|mut stmts| {
@@ -137,12 +138,13 @@ pub fn diagnose(path: &Path, read: Reader<'_>, overrides: &[(String, String)]) -
     })
 }
 
-/// The file at `path` and those it includes and uses, as far as they can
-/// be read: what to watch for changes.
+/// The file at `path` and those it includes, uses and imports (those
+/// named as text), as far as they can be read: what to watch for changes.
 pub fn files(path: &Path, read: Reader<'_>) -> Vec<PathBuf> {
-    let mut sources = HashMap::new();
+    let mut sources = Sources::default();
     let _ = gather(&plain(path), read, &mut sources);
-    let mut out: Vec<PathBuf> = sources.into_keys().collect();
+    let mut out: Vec<PathBuf> = sources.files.into_keys().collect();
+    out.extend(sources.blobs.into_keys());
     out.sort();
     out
 }
@@ -167,8 +169,41 @@ pub fn includes(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// The files read, each parsed once (see [`cache`]).
-type Sources = HashMap<PathBuf, std::sync::Arc<cache::Parsed>>;
+/// The paths `import(…)` names as text in a file's text, as written:
+/// `import("a.stl")`, `import(file = "a.svg")`.
+pub fn imports(text: &str) -> Vec<String> {
+    let Ok(tokens) = lexer::tokens(text) else {
+        return Vec::new();
+    };
+    let at = |i: usize| tokens.get(i).map(|t| &t.tok);
+    let mut out = Vec::new();
+    for i in 0..tokens.len() {
+        if at(i) != Some(&lexer::Tok::Name("import".into()))
+            || at(i + 1) != Some(&lexer::Tok::Sym("("))
+        {
+            continue;
+        }
+        let path = match (at(i + 2), at(i + 3), at(i + 4)) {
+            (Some(lexer::Tok::Str(s)), _, _) => Some(s),
+            (Some(lexer::Tok::Name(n)), Some(lexer::Tok::Sym("=")), Some(lexer::Tok::Str(s)))
+                if n == "file" || n == "filename" =>
+            {
+                Some(s)
+            }
+            _ => None,
+        };
+        out.extend(path.cloned());
+    }
+    out
+}
+
+/// The files read: the OpenSCAD files, each parsed once (see [`cache`]),
+/// and those imported.
+#[derive(Default)]
+struct Sources {
+    files: HashMap<PathBuf, std::sync::Arc<cache::Parsed>>,
+    blobs: HashMap<PathBuf, std::sync::Arc<Vec<u8>>>,
+}
 
 /// Reads a file and, as far as they can be read, those it names: from
 /// the folder of the file that names them, else from the library folders.
@@ -182,7 +217,7 @@ fn gather_in(
     sources: &mut Sources,
     search: &[PathBuf],
 ) -> Result<(), String> {
-    if sources.contains_key(path) {
+    if sources.files.contains_key(path) {
         return Ok(());
     }
     let bytes = match read(path) {
@@ -196,7 +231,15 @@ fn gather_in(
         .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
     let parsed = cache::file(path, text);
     let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
-    sources.insert(path.to_path_buf(), parsed.clone());
+    sources.files.insert(path.to_path_buf(), parsed.clone());
+    for p in &parsed.imports {
+        let file = plain(&dir.join(p));
+        if !sources.blobs.contains_key(&file)
+            && let Ok(b) = read(&file)
+        {
+            sources.blobs.insert(file, std::sync::Arc::new(b));
+        }
+    }
     for p in &parsed.includes {
         let local = plain(&dir.join(p));
         if gather_in(&local, read, sources, search).is_ok() || Path::new(p).is_absolute() {
@@ -220,7 +263,7 @@ fn evaluate(
     sources: Sources,
     overrides: &[(String, String)],
 ) -> Result<Output, String> {
-    let mut it = eval::Interp::new(sources);
+    let mut it = eval::Interp::new(sources.files, sources.blobs);
     let mut stmts = it.load(path, &mut Vec::new()).map_err(|e| e.to_string())?;
     override_values(&mut it, &mut stmts, overrides);
     let made = it

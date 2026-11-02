@@ -275,6 +275,8 @@ pub struct Interp {
     main: u32,
     /// The files read, parsed once they are needed.
     sources: HashMap<PathBuf, Arc<Parsed>>,
+    /// The files imported, read before (those named as text).
+    blobs: HashMap<PathBuf, Arc<Vec<u8>>>,
     /// The files whose statements were taken: a file is used only once.
     loaded: Vec<PathBuf>,
     /// The folders an include is looked for in after the file's own.
@@ -298,10 +300,14 @@ pub struct Interp {
 }
 
 impl Interp {
-    pub fn new(sources: HashMap<PathBuf, Arc<Parsed>>) -> Interp {
+    pub fn new(
+        sources: HashMap<PathBuf, Arc<Parsed>>,
+        blobs: HashMap<PathBuf, Arc<Vec<u8>>>,
+    ) -> Interp {
         Interp {
             main: 0,
             sources,
+            blobs,
             loaded: Vec::new(),
             search: crate::library::search(),
             used: HashMap::new(),
@@ -974,7 +980,8 @@ impl Interp {
                 }
             }
             "text" => self.text(&a, pos),
-            "import" | "surface" | "roof" | "fill" => {
+            "import" => self.import(&a, f, pos),
+            "surface" | "roof" | "fill" => {
                 self.note(Some(pos), format!("not supported: {name}"));
                 None
             }
@@ -1367,6 +1374,139 @@ impl Interp {
             Ok(s) => s.map(Geom::D2),
             Err(e) => {
                 self.note(Some(pos), format!("text: {e}"));
+                None
+            }
+        }
+    }
+
+    /// `import(file, layer, convexity, origin, scale, center, dpi, id)`:
+    /// a mesh of an STL, OFF or OBJ file, the outlines of an SVG or DXF
+    /// file, the path from the folder of the file that imports it.
+    fn import(&mut self, a: &Args, f: &Rc<Frame>, pos: Pos) -> Option<Geom> {
+        let name = match a.get("file", 0).or_else(|| a.get("filename", usize::MAX)) {
+            Some(Value::Str(s)) => s.to_string(),
+            _ => {
+                self.note(Some(pos), "import: no file is named");
+                return None;
+            }
+        };
+        let file = if pos.file == 0 { self.main } else { pos.file };
+        let dir = crate::cache::path(file)
+            .and_then(|f| f.parent().map(PathBuf::from))
+            .unwrap_or_default();
+        let path = crate::plain(&dir.join(&name));
+        let bytes = match self.blobs.get(&path) {
+            Some(b) => b.clone(),
+            None => match read_file(&path) {
+                Ok(b) => {
+                    let b = Arc::new(b);
+                    self.blobs.insert(path.clone(), b.clone());
+                    b
+                }
+                Err(e) => {
+                    self.note(Some(pos), format!("import: {name} cannot be read ({e})"));
+                    return None;
+                }
+            },
+        };
+        let ext = path
+            .extension()
+            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        let center = matches!(a.get("center", usize::MAX), Some(Value::Bool(true)));
+        let (fn_, fs, fa) = (
+            Self::special(a, f, "$fn"),
+            Self::special(a, f, "$fs"),
+            Self::special(a, f, "$fa"),
+        );
+        let origin = a
+            .get("origin", 3)
+            .and_then(Value::nums)
+            .filter(|n| n.len() >= 2)
+            .map_or([0.0; 2], |n| [n[0], n[1]]);
+        let str_of = |n: &str, at: usize| match a.get(n, at) {
+            Some(Value::Str(s)) => Some(s.to_string()),
+            _ => None,
+        };
+        let o = crate::import::Options {
+            center,
+            dpi: a
+                .num("dpi", usize::MAX)
+                .filter(|d| *d >= 0.001)
+                .unwrap_or(72.0),
+            layer: str_of("layer", 1).or_else(|| str_of("layername", usize::MAX)),
+            id: str_of("id", usize::MAX),
+            origin,
+            scale: a.num("scale", 4).filter(|s| *s > 0.0).unwrap_or(1.0),
+            fragments: Rc::new(move |r| fragments(r, fn_, fs, fa).min(PIECES)),
+            fn_,
+        };
+        let centered = |me: &mut Self, g: Geom| {
+            let (Geom::D2(s) | Geom::D3(s)) = &g;
+            let Some((lo, hi)) = s.bounds() else {
+                return g;
+            };
+            let flat = matches!(g, Geom::D2(_));
+            let c: Vec<f64> = (0..3).map(|i| -(lo[i] + hi[i]) / 2.0).collect();
+            let m = [
+                [1.0, 0.0, 0.0, c[0]],
+                [0.0, 1.0, 0.0, c[1]],
+                [0.0, 0.0, 1.0, if flat { 0.0 } else { c[2] }],
+            ];
+            me.transform(g, &m)
+        };
+        match ext.as_str() {
+            "stl" | "off" | "obj" => match crate::import::mesh(&ext, &bytes) {
+                Ok(faces) => {
+                    let g = self.geo.mesh(&faces).map(Geom::D3)?;
+                    Some(if center { centered(self, g) } else { g })
+                }
+                Err(e) => {
+                    self.note(Some(pos), format!("import: {name}: {e}"));
+                    None
+                }
+            },
+            "svg" => {
+                let shapes = match crate::import::svg(&String::from_utf8_lossy(&bytes), &o) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        self.note(Some(pos), format!("import: {name}: {e}"));
+                        return None;
+                    }
+                };
+                let mut made = Vec::new();
+                for paths in shapes {
+                    match self.geo.polygon(&paths) {
+                        Ok(s) => made.extend(s.map(Geom::D2)),
+                        Err(e) => self.note(Some(pos), format!("import: {name}: {e}")),
+                    }
+                }
+                match self.union(made, Some(pos)) {
+                    Ok(g) => g,
+                    Err(e) => {
+                        self.note(Some(pos), format!("import: {name}: {}", e.message));
+                        None
+                    }
+                }
+            }
+            "dxf" => {
+                let paths = crate::import::dxf(&String::from_utf8_lossy(&bytes), &o);
+                match self.geo.polygon(&paths) {
+                    Ok(g) => {
+                        let g = g.map(Geom::D2)?;
+                        Some(if center { centered(self, g) } else { g })
+                    }
+                    Err(e) => {
+                        self.note(Some(pos), format!("import: {name}: {e}"));
+                        None
+                    }
+                }
+            }
+            _ => {
+                self.note(
+                    Some(pos),
+                    format!("import: {name}: {ext} files are not supported"),
+                );
                 None
             }
         }
@@ -1869,6 +2009,17 @@ const BUILT_IN_MODULES: &[&str] = &[
     "intersection_for",
     "let",
 ];
+
+/// A file imported but not named as text: read when it is needed.
+#[cfg(not(target_arch = "wasm32"))]
+fn read_file(path: &std::path::Path) -> Result<Vec<u8>, String> {
+    std::fs::read(path).map_err(|e| e.to_string())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn read_file(_: &std::path::Path) -> Result<Vec<u8>, String> {
+    Err("not read here".to_string())
+}
 
 fn is_instance(s: &Stmt) -> bool {
     matches!(s, Stmt::Call { .. } | Stmt::If { .. } | Stmt::Block(_))

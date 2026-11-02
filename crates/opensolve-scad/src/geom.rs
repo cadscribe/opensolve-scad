@@ -217,6 +217,14 @@ impl Builder {
         Ok(s)
     }
 
+    /// A mesh read from a file, its faces counter-clockwise from outside;
+    /// `None` if it has none.
+    pub fn mesh(&mut self, faces: &[Vec<V3>]) -> Option<Solid> {
+        let tris: Vec<[V3; 3]> = faces.iter().flat_map(|f| face_triangles(f)).collect();
+        let s = self.outward(tris);
+        (!s.is_empty()).then_some(s)
+    }
+
     /// A slab of polygons, the even-odd rule deciding what is inside, as in
     /// OpenSCAD's `polygon` with several paths or a path that crosses
     /// itself.

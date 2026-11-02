@@ -281,7 +281,7 @@ fn polyhedrons_either_way_round() {
 
 #[test]
 fn not_supported_is_said() {
-    let out = solid("cube(1); surface(\"a.png\"); import(\"a.stl\");");
+    let out = solid("cube(1); surface(\"a.png\"); import(\"a.amf\");");
     assert!(
         out.notes
             .iter()
@@ -290,7 +290,9 @@ fn not_supported_is_said() {
     assert!(
         out.notes
             .iter()
-            .any(|n| n.contains("not supported: import"))
+            .any(|n| n.contains("amf files are not supported")),
+        "{:?}",
+        out.notes
     );
 }
 
