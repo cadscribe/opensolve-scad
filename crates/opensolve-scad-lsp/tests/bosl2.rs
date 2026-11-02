@@ -100,3 +100,19 @@ fn completion_offers_bosl2_but_not_its_inner_names() {
     let c = w.completion(&main, text.len());
     assert!(c.iter().any(|c| c.label == "gears.scad"), "{c:?}");
 }
+
+#[test]
+fn signature_help_for_a_bosl2_module() {
+    let (mut w, main) = workspace();
+    let text = format!("{TEXT}cuboid([10, 10, 10], r = 1);\n");
+    w.set(&main, text.clone());
+    let s = w.signature(&main, text.find("r = 1").unwrap()).unwrap();
+    assert!(s.label.starts_with("cuboid("), "{}", s.label);
+    assert!(
+        s.parameters.iter().any(|p| p.starts_with("rounding")),
+        "{:?}",
+        s.parameters
+    );
+    assert_eq!(s.active, 1);
+    assert!(s.doc.starts_with("Creates a cube"), "{}", s.doc);
+}

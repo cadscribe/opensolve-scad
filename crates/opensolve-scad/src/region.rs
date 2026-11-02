@@ -282,7 +282,7 @@ pub fn bridge(outer: &[V2], holes: &[Vec<V2>]) -> Vec<V2> {
             })
             .unwrap_or(0)
     };
-    holes.sort_by(|a, b| b[right(a)][0].total_cmp(&a[right(b)][0]));
+    holes.sort_by(|a, b| b[right(b)][0].total_cmp(&a[right(a)][0]));
     for h in holes {
         let mi = right(h);
         let m = h[mi];

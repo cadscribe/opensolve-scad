@@ -388,6 +388,13 @@ fn polygons_that_cross_themselves_are_filled_even_odd() {
              [4, 5, 6, 7], [8, 9, 10, 11]]);",
             332.0,
         ),
+        // Holes of different sizes, each joined to the outline.
+        (
+            "polygon(points = concat([[0, 0], [20, 0], [20, 20], [0, 20], [2, 2], [2, 5], [5, 2]], \
+             [for (i = [0:7]) [14, 14] + 3 * [cos(45 * i), sin(45 * i)]]), \
+             paths = [[0, 1, 2, 3], [4, 5, 6], [for (i = [7:14]) i]]);",
+            400.0 - 4.5 - 18.0 * 2f64.sqrt(),
+        ),
     ] {
         let v2 = volume(&format!("linear_extrude(1) {text}"));
         assert!((v2 - v).abs() < 2e-3, "{v2} is not {v}: {text}");
