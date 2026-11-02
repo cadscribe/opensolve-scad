@@ -7,10 +7,7 @@ use std::path::Path;
 mod scadtest;
 
 /// The tests of BOSL2's suite that do not pass yet, and why.
-const KNOWN: &[(&str, &str)] = &[
-    ("test_cyl", "minkowski"),
-    ("test_convex_offset_extrude", "offset"),
-];
+const KNOWN: &[(&str, &str)] = &[];
 
 #[test]
 fn bosl2s_own_tests_pass() {

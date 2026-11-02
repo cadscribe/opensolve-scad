@@ -744,8 +744,16 @@ impl Interp {
                 let made = kids(self)?;
                 self.union(made, Some(pos))?
             }
-            "minkowski" | "offset" | "projection" | "text" | "import" | "surface" | "roof"
-            | "fill" => {
+            "minkowski" => {
+                let made = kids(self)?;
+                self.minkowski(made, pos)?
+            }
+            "offset" => {
+                let made = kids(self)?;
+                let shape = self.union(made, Some(pos))?;
+                self.offset(shape, &a, f, pos)?
+            }
+            "projection" | "text" | "import" | "surface" | "roof" | "fill" => {
                 self.note(Some(pos), format!("not supported: {name}"));
                 None
             }
@@ -1022,6 +1030,61 @@ impl Interp {
             [0.0, 0.0, k[2], 0.0],
         ];
         self.transform(g, &m)
+    }
+
+    /// `minkowski()`: the sum of its children, one after the other.
+    fn minkowski(&mut self, made: Vec<Geom>, pos: Pos) -> R<Option<Geom>> {
+        let mut it = made.into_iter();
+        let Some(mut acc) = it.next() else {
+            return Ok(None);
+        };
+        for g in it {
+            let sum = match (&acc, &g) {
+                (Geom::D3(a), Geom::D3(b)) => self.geo.minkowski(a, b).map(|s| s.map(Geom::D3)),
+                (Geom::D2(a), Geom::D2(b)) => self.geo.minkowski_2d(a, b).map(|s| s.map(Geom::D2)),
+                _ => {
+                    self.note(Some(pos), "minkowski: 2D and 3D shapes together");
+                    continue;
+                }
+            };
+            match sum {
+                Ok(Some(s)) => acc = s,
+                Ok(None) => return Ok(None),
+                Err(e) => return Err(self.error(pos, e)),
+            }
+        }
+        Ok(Some(acc))
+    }
+
+    /// `offset(r)`, `offset(delta, chamfer)` of a 2D shape.
+    fn offset(
+        &mut self,
+        shape: Option<Geom>,
+        a: &Args,
+        f: &Rc<Frame>,
+        pos: Pos,
+    ) -> R<Option<Geom>> {
+        let slab = match shape {
+            None => return Ok(None),
+            Some(Geom::D3(_)) => {
+                self.note(Some(pos), "offset: needs a 2D shape");
+                return Ok(None);
+            }
+            Some(Geom::D2(s)) => s,
+        };
+        let (d, join) = match (a.num("r", 0), a.num("delta", usize::MAX)) {
+            (Some(r), _) => {
+                let n = self.fragments(a, f, r.abs(), pos);
+                (r, geom::Join::Round(n))
+            }
+            (None, Some(d)) if a.bool("chamfer", usize::MAX) => (d, geom::Join::Chamfer),
+            (None, Some(d)) => (d, geom::Join::Miter),
+            (None, None) => (1.0, geom::Join::Miter),
+        };
+        match self.geo.offset(&slab, d, join) {
+            Ok(s) => Ok(s.map(Geom::D2)),
+            Err(e) => Err(self.error(pos, e)),
+        }
     }
 
     fn hull(&mut self, made: Vec<Geom>, pos: Pos) -> Option<Geom> {

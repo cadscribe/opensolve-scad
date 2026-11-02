@@ -177,17 +177,17 @@ pub const BUILTINS: &[Builtin] = &[
         "color(c, alpha = 1.0)",
         "Colours its children. OpenSolve keeps the shape and drops the colour: colours are per part.",
     ),
-    no(m(
+    m(
         "offset",
         "offset(r, delta, chamfer = false)",
-        "Grows or shrinks a 2D shape by `r` (rounded) or `delta` (sharp). Not supported by OpenSolve yet.",
-    )),
+        "Grows or shrinks a 2D shape by `r` (rounded) or `delta` (sharp, or cut off with `chamfer`).",
+    ),
     m("hull", "hull()", "The convex hull of its children."),
-    no(m(
+    m(
         "minkowski",
         "minkowski(convexity)",
-        "The Minkowski sum of its children. Not supported by OpenSolve yet.",
-    )),
+        "The Minkowski sum of its children: the first grown by the shape of the others.",
+    ),
     // Booleans
     m("union", "union()", "Its children joined into one."),
     m(

@@ -281,13 +281,70 @@ fn polyhedrons_either_way_round() {
 
 #[test]
 fn not_supported_is_said() {
-    let out = solid("cube(1); offset(1) square(1); text(\"a\");");
+    let out = solid("cube(1); projection() cube(1); text(\"a\");");
     assert!(
         out.notes
             .iter()
-            .any(|n| n.contains("not supported: offset"))
+            .any(|n| n.contains("not supported: projection"))
     );
     assert!(out.notes.iter().any(|n| n.contains("not supported: text")));
+}
+
+/// Minkowski sums and offsets, their volumes as OpenSCAD makes them.
+#[test]
+fn minkowski_sums() {
+    // Convex: the hull of the sums.
+    near(
+        volume("minkowski() { cube([20, 30, 10], center = true); sphere(2, $fn = 16); }"),
+        volume(
+            "hull() for (x = [-10, 10], y = [-15, 15], z = [-5, 5]) translate([x, y, z]) sphere(2, $fn = 16);",
+        ),
+    );
+    // Not convex: an L and a sphere, a frame and a cube, in 2D an L and a
+    // circle.
+    near(
+        volume(
+            "minkowski() { union() { cube([20, 5, 5]); cube([5, 20, 5]); } sphere(1, $fn = 8); }",
+        ),
+        1694.762,
+    );
+    near(
+        volume(
+            "minkowski() { difference() { cube(20, center = true); \
+             cube([10, 10, 30], center = true); } cube(2, center = true); }",
+        ),
+        9240.0,
+    );
+    near(
+        volume(
+            "linear_extrude(2) minkowski() { polygon([[0, 0], [20, 0], [20, 5], [5, 5], \
+             [5, 20], [0, 20]]); circle(1, $fn = 8); }",
+        ),
+        515.071,
+    );
+}
+
+#[test]
+fn offsets() {
+    let l = "polygon([[0, 0], [20, 0], [20, 20], [11, 20], [11, 5], [9, 5], [9, 20], [0, 20]])";
+    let ring = "difference() { square(20); translate([5, 5]) square(10); }";
+    for (text, v) in [
+        ("offset(r = 2, $fn = 16) square(10);".to_string(), 192.246),
+        (
+            "offset(delta = 2, chamfer = true) square(10);".into(),
+            193.255,
+        ),
+        ("offset(r = -2, $fn = 16) square(10);".into(), 36.0),
+        ("offset(delta = -3) circle(10, $fn = 30);".into(), 152.094),
+        ("offset(delta = 3) circle(10, $fn = 30);".into(), 528.397),
+        (format!("offset(delta = 1.5) {ring}"), 480.0),
+        (format!("offset(r = -1.5, $fn = 20) {ring}"), 122.047),
+        // The slot closes: the outlines moved out cross.
+        (format!("offset(delta = 2) {l};"), 576.0),
+        (format!("offset(r = 2, $fn = 16) {l};"), 572.021),
+    ] {
+        near(volume(&format!("linear_extrude(1) {text}")), v);
+    }
 }
 
 #[test]

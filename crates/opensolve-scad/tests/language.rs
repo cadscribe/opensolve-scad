@@ -216,7 +216,7 @@ fn errors_and_notes_say_where() {
     let out = run_with(
         &[(
             "main.scad",
-            "cube(size);\nminkowski() { cube(1); sphere(1); }\nfoo();",
+            "cube(size);\nprojection() { cube(1); sphere(1); }\nfoo();",
         )],
         &[],
     )
@@ -229,7 +229,7 @@ fn errors_and_notes_say_where() {
     );
     assert!(
         out.notes
-            .contains(&"line 2: not supported: minkowski".to_string())
+            .contains(&"line 2: not supported: projection".to_string())
     );
     assert!(
         out.notes
