@@ -105,12 +105,27 @@ pub struct Signature {
     pub doc: String,
 }
 
+/// A top-level variable a file is given from outside, as OpenSCAD's `-D`
+/// gives it: the app passes a model's parameters (ADR 0011).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct External {
+    pub name: String,
+    /// As OpenSCAD writes a value.
+    pub value: String,
+    /// What completion says beside it, as "model parameter = 73".
+    pub detail: String,
+    /// What hover says of it: Markdown.
+    pub doc: String,
+}
+
 /// The open files, and how others are read.
 pub struct Workspace {
     open: HashMap<PathBuf, Arc<Parsed>>,
     /// Files read from the disk, by their text.
     cache: Mutex<HashMap<PathBuf, Arc<Parsed>>>,
     read: Box<Read>,
+    /// The variables files are given from outside, by file.
+    external: HashMap<PathBuf, Vec<External>>,
 }
 
 impl std::fmt::Debug for Workspace {
@@ -151,7 +166,29 @@ impl Workspace {
             open: HashMap::new(),
             cache: Mutex::new(HashMap::new()),
             read,
+            external: HashMap::new(),
         }
+    }
+
+    /// The variables `path` is given from outside, as OpenSCAD's `-D` gives
+    /// them: they are known in it, completed and shown on hover. Whether
+    /// they changed.
+    pub fn set_external(&mut self, path: &Path, values: Vec<External>) -> bool {
+        let path = plain(path);
+        if self.external.get(&path).map_or(&[][..], Vec::as_slice) == values.as_slice() {
+            return false;
+        }
+        if values.is_empty() {
+            self.external.remove(&path);
+        } else {
+            self.external.insert(path, values);
+        }
+        true
+    }
+
+    /// The variables `path` is given from outside.
+    pub fn external(&self, path: &Path) -> &[External] {
+        self.external.get(&plain(path)).map_or(&[], Vec::as_slice)
     }
 
     /// A file opened, or its text changed.
@@ -229,7 +266,16 @@ impl Workspace {
             .into_iter()
             .filter_map(|p| self.file(&p).map(|f| (p, f.text.clone())))
             .collect();
-        Evaluation { path, sources }
+        let external = self
+            .external(&path)
+            .iter()
+            .map(|e| (e.name.clone(), e.value.clone()))
+            .collect();
+        Evaluation {
+            path,
+            sources,
+            external,
+        }
     }
 
     /// The syntax errors and, when there are none, what evaluating the file
@@ -381,8 +427,35 @@ impl Workspace {
         }
     }
 
+    /// A variable given from outside at `offset`, not one of a block
+    /// around it: it wins over the file's own top-level value.
+    fn external_at(&self, path: &Path, offset: usize) -> Option<(&External, Range<usize>)> {
+        let p = self.file(path)?;
+        let (node, want) = Self::name_at(&p, offset)?;
+        let name = &p.text[node.byte_range()];
+        if want != Want::Variable
+            || locals(&p.tree, &p.text, offset)
+                .iter()
+                .any(|d| d.name == name && want.fits(d.kind))
+        {
+            return None;
+        }
+        let e = self.external(path).iter().find(|e| e.name == name)?;
+        Some((e, node.byte_range()))
+    }
+
     /// The signature and explanation of the name at `offset`.
     pub fn hover(&self, path: &Path, offset: usize) -> Option<Hover> {
+        if let Some((e, range)) = self.external_at(path, offset) {
+            let signature = format!("{} = {}", e.name, e.value);
+            let markdown = format!("```openscad\n{signature}\n```\n\n{}", e.doc);
+            return Some(Hover {
+                range,
+                markdown,
+                signature,
+                doc: e.doc.clone(),
+            });
+        }
         let (resolved, range) = self.resolve(path, offset)?;
         let (signature, doc) = match resolved {
             Resolved::User(d, file) => {
@@ -459,28 +532,30 @@ impl Workspace {
                 });
             }
         }
-        let defs = locals(&p.tree, text, offset)
-            .into_iter()
-            .map(|d| (d, plain(path)))
-            .chain(self.visible(path));
-        for (d, _) in defs {
+        let locals = locals(&p.tree, text, offset);
+        for d in &locals {
+            if d.name_range.end != offset {
+                add(def_completion(d, replace.clone()));
+            }
+        }
+        // Given from outside: before the file's own of the same name, which
+        // they replace.
+        for e in self.external(path) {
+            add(Completion {
+                label: e.name.clone(),
+                kind: CompletionKind::Variable,
+                detail: e.detail.clone(),
+                doc: e.doc.clone(),
+                replace: replace.clone(),
+                insert: e.name.clone(),
+            });
+        }
+        for (d, _) in self.visible(path) {
             // Not the name being typed.
             if d.name_range.end == offset {
                 continue;
             }
-            add(Completion {
-                label: d.name.clone(),
-                kind: match d.kind {
-                    DefKind::Module => CompletionKind::Module,
-                    DefKind::Function => CompletionKind::Function,
-                    DefKind::Variable => CompletionKind::Variable,
-                    DefKind::Parameter => CompletionKind::Parameter,
-                },
-                insert: d.name.clone(),
-                detail: d.signature,
-                doc: d.doc,
-                replace: replace.clone(),
-            });
+            add(def_completion(&d, replace.clone()));
         }
         for b in BUILTINS {
             add(builtin_completion(b, replace.clone()));
@@ -666,6 +741,22 @@ impl Workspace {
     }
 }
 
+fn def_completion(d: &Def, replace: Range<usize>) -> Completion {
+    Completion {
+        label: d.name.clone(),
+        kind: match d.kind {
+            DefKind::Module => CompletionKind::Module,
+            DefKind::Function => CompletionKind::Function,
+            DefKind::Variable => CompletionKind::Variable,
+            DefKind::Parameter => CompletionKind::Parameter,
+        },
+        insert: d.name.clone(),
+        detail: d.signature.clone(),
+        doc: d.doc.clone(),
+        replace,
+    }
+}
+
 fn builtin_completion(b: &Builtin, replace: Range<usize>) -> Completion {
     Completion {
         label: b.name.to_string(),
@@ -720,6 +811,8 @@ enum Resolved {
 pub struct Evaluation {
     pub path: PathBuf,
     pub sources: HashMap<PathBuf, String>,
+    /// The variables it is given from outside: name, value.
+    pub external: Vec<(String, String)>,
 }
 
 impl Evaluation {
@@ -736,7 +829,7 @@ impl Evaluation {
                 .map(|t| t.as_bytes().to_vec())
                 .ok_or_else(|| format!("{} cannot be read", p.display()))
         };
-        let found = opensolve_scad::diagnose(&self.path, &read, &[]);
+        let found = opensolve_scad::diagnose(&self.path, &read, &self.external);
         let lines = Lines::new(&main);
         let here = |file: Option<&Path>| file.is_none_or(|f| plain(f) == self.path);
         let range = |line: u32, col: u32| {

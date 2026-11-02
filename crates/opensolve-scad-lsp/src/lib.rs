@@ -17,7 +17,7 @@ use std::ops::Range;
 pub use index::DefKind;
 pub use syntax::{Span, Token};
 pub use workspace::{
-    Completion, CompletionKind, Evaluation, Hover, Location, Signature, Symbol, Workspace,
+    Completion, CompletionKind, Evaluation, External, Hover, Location, Signature, Symbol, Workspace,
 };
 
 /// How bad a diagnostic is.
