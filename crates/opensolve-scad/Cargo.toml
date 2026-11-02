@@ -8,6 +8,8 @@ license.workspace = true
 
 [dependencies]
 opensolve-kernel.workspace = true
+# The letters of text(): glyph outlines of a TrueType font.
+opensolve-sketch.workspace = true
 
 [lints]
 workspace = true

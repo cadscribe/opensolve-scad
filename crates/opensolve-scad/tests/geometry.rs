@@ -281,13 +281,38 @@ fn polyhedrons_either_way_round() {
 
 #[test]
 fn not_supported_is_said() {
-    let out = solid("cube(1); surface(\"a.png\"); text(\"a\");");
+    let out = solid("cube(1); surface(\"a.png\"); import(\"a.stl\");");
     assert!(
         out.notes
             .iter()
             .any(|n| n.contains("not supported: surface"))
     );
-    assert!(out.notes.iter().any(|n| n.contains("not supported: text")));
+    assert!(
+        out.notes
+            .iter()
+            .any(|n| n.contains("not supported: import"))
+    );
+}
+
+#[test]
+fn text_has_letters_about_openscads_size() {
+    // OpenSCAD's H of size 10 (Liberation Sans) is 9.55 high; the font
+    // that stands in has capitals as high.
+    let s = solid("linear_extrude(1) text(\"H\", size = 10);").solid;
+    let (lo, hi) = s.bounds().unwrap();
+    assert!((hi[1] - lo[1] - 9.555).abs() < 0.05, "{lo:?} {hi:?}");
+    assert!(lo[1].abs() < 1e-6);
+    // Centred both ways; an "o" has its hole.
+    let s =
+        solid("linear_extrude(1) text(\"Hello\", halign = \"center\", valign = \"center\");").solid;
+    let (lo, hi) = s.bounds().unwrap();
+    assert!(
+        (lo[0] + hi[0]).abs() < 1.5 && (lo[1] + hi[1]).abs() < 0.1,
+        "{lo:?} {hi:?}"
+    );
+    let o = volume("linear_extrude(1) text(\"o\");");
+    let filled = volume("linear_extrude(1) hull() text(\"o\");");
+    assert!(o < 0.7 * filled, "{o} {filled}");
 }
 
 /// Minkowski sums and offsets, their volumes as OpenSCAD makes them.

@@ -111,11 +111,11 @@ pub const BUILTINS: &[Builtin] = &[
         "polygon(points, paths, convexity = 1)",
         "A 2D shape of `points`; `paths` lists the outline and holes as point indices.",
     ),
-    no(m(
+    m(
         "text",
         "text(text, size = 10, font, halign, valign, spacing, direction, language, script, $fn)",
-        "Text as a 2D shape. Not supported by OpenSolve yet.",
-    )),
+        "Text as a 2D shape: the letters of a TrueType font of the machine, else of Bitstream Vera Sans standing in for OpenSCAD's Liberation Sans.",
+    ),
     no(m(
         "import",
         "import(file, convexity, layer)",

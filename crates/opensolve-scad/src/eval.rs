@@ -925,7 +925,8 @@ impl Interp {
                     None => None,
                 }
             }
-            "text" | "import" | "surface" | "roof" | "fill" => {
+            "text" => self.text(&a, pos),
+            "import" | "surface" | "roof" | "fill" => {
                 self.note(Some(pos), format!("not supported: {name}"));
                 None
             }
@@ -1213,6 +1214,92 @@ impl Interp {
             [0.0, 0.0, k[2], 0.0],
         ];
         self.transform(g, &m)
+    }
+
+    /// `text(text, size, font, halign, valign, spacing)`: the letters of
+    /// a TrueType font, its em `size / 0.72` as in OpenSCAD, so that a
+    /// capital H of size 10 is about 9.5 high. The font is looked for by
+    /// its file's name among the machine's fonts; else the one OpenSolve
+    /// carries (Bitstream Vera Sans) stands in for OpenSCAD's Liberation
+    /// Sans: the letters are about as large, not the same.
+    fn text(&mut self, a: &Args, pos: Pos) -> Option<Geom> {
+        let words = match a.get("text", 0) {
+            Some(Value::Str(s)) => s.to_string(),
+            Some(v) => v.to_string(),
+            None => return None,
+        };
+        let size = a.num("size", 1).unwrap_or(10.0);
+        let font = match a.get("font", 2) {
+            Some(Value::Str(f)) => f.to_string(),
+            _ => String::new(),
+        };
+        let font = font.split(':').next().unwrap_or("").trim().to_string();
+        let found = !font.is_empty() && opensolve_sketch::text::has_font(&font);
+        if !font.is_empty() && !found {
+            self.note(
+                Some(pos),
+                format!("text: the font {font} is not found: Bitstream Vera Sans stands in"),
+            );
+        }
+        let spacing = a.num("spacing", usize::MAX).unwrap_or(1.0);
+        // In cap heights; a chord within a thousandth of the letters.
+        let outlines = opensolve_sketch::text::outlines(&words, &font, 1e-3);
+        if outlines.is_empty() {
+            return None;
+        }
+        // The stand-in's capitals as high as Liberation Sans' would be
+        // (1409 of 2048 to the em).
+        let cap = if found {
+            opensolve_sketch::text::cap_per_em(&font)
+        } else {
+            1409.0 / 2048.0
+        };
+        let k = size / 0.72 * cap;
+        let width = opensolve_sketch::text::width(&words, &font) * k;
+        let mut paths: Vec<Vec<V2>> = outlines
+            .into_iter()
+            .map(|o| {
+                o.into_iter()
+                    .map(|p| [p[0] * k * spacing, p[1] * k])
+                    .collect()
+            })
+            .collect();
+        let (lo, hi) =
+            paths
+                .iter()
+                .flatten()
+                .fold(([f64::MAX; 2], [f64::MIN; 2]), |(lo, hi), p| {
+                    (
+                        [lo[0].min(p[0]), lo[1].min(p[1])],
+                        [hi[0].max(p[0]), hi[1].max(p[1])],
+                    )
+                });
+        let str_of = |n: &str, at: usize| match a.get(n, at) {
+            Some(Value::Str(s)) => s.to_string(),
+            _ => String::new(),
+        };
+        let dx = match str_of("halign", usize::MAX).as_str() {
+            "center" => -width * spacing / 2.0,
+            "right" => -width * spacing,
+            _ => 0.0,
+        };
+        let dy = match str_of("valign", usize::MAX).as_str() {
+            "top" => -hi[1],
+            "center" => -(lo[1] + hi[1]) / 2.0,
+            "bottom" => -lo[1],
+            _ => 0.0,
+        };
+        for p in paths.iter_mut().flatten() {
+            p[0] += dx;
+            p[1] += dy;
+        }
+        match self.geo.polygon(&paths) {
+            Ok(s) => s.map(Geom::D2),
+            Err(e) => {
+                self.note(Some(pos), format!("text: {e}"));
+                None
+            }
+        }
     }
 
     /// `minkowski()`: the sum of its children, one after the other.
