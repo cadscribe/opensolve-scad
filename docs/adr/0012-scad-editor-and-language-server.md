@@ -68,7 +68,15 @@ newest from 2026-10-08).
   hover, go to definition (Cmd+click or F12, also into included and used
   files, as tabs), find (Cmd+F), undo and redo of its own (quick edits as
   one step; the menu's Undo, Redo and Save go to the editor while it is
-  typed in), and Cmd/Ctrl+S to save. A file changed on the disk and not
+  typed in), and Cmd/Ctrl+S to save. Typing as in a code editor
+  (`scad_typing.rs`, pure functions of text, selection and key): Enter
+  keeps the indentation and goes a level deeper after an opener or a
+  statement going on (`translate(…)`), between a pair the closer goes on
+  a line of its own; a closer typed on an empty line goes to its opener's
+  indentation; brackets and quotes are closed (not in strings and
+  comments), typed over, deleted as a pair, and wrap a selection; Tab and
+  Shift+Tab indent lines, Cmd+/ comments them; the indentation (tabs or
+  how many spaces) is read off the file. A file changed on the disk and not
   in the editor is read again. On saving it reads the links of that file
   again at once and gives the watcher of linked files (ADR 0011) the new
   times, so that a save rebuilds once.
