@@ -88,7 +88,7 @@ impl<T> Names<T> {
 
 /// The hash of rustc's own tables (FxHash): quick for short names.
 #[derive(Clone, Copy, Debug, Default)]
-struct Fx;
+pub(crate) struct Fx;
 
 impl std::hash::BuildHasher for Fx {
     type Hasher = FxHasher;
@@ -98,7 +98,7 @@ impl std::hash::BuildHasher for Fx {
 }
 
 #[derive(Debug)]
-struct FxHasher(u64);
+pub(crate) struct FxHasher(u64);
 
 impl std::hash::Hasher for FxHasher {
     fn write(&mut self, bytes: &[u8]) {
@@ -218,6 +218,10 @@ impl Frame {
 
 type R<T> = Result<T, Error>;
 
+/// What a module made, with the module and its scope: kept alive, so that
+/// what a key names (their addresses) is not used again by another.
+type Made = (Option<Geom>, Arc<Module>, Rc<Frame>);
+
 /// What the tail of a function comes to: a value, or a call of a function
 /// (with its home, its arguments and the frame it is made in).
 enum Tail {
@@ -297,6 +301,14 @@ pub struct Interp {
     /// What `rands` draws from: seeded anew by a seed, else the same
     /// numbers in each run, so that a part is built the same each time.
     rng: builtins::Mt19937,
+    /// What a module made, by what it was called with (see
+    /// [`Interp::call_key`]): a module called again alike is not run again,
+    /// as OpenSCAD keeps what it made too.
+    made: HashMap<Vec<u8>, Made>,
+    /// Whether a file asks for the modules it is called in: then they are
+    /// part of what a call depends on. BOSL2 asks only to say what is
+    /// wrong when it stops.
+    parents_matter: bool,
 }
 
 impl Interp {
@@ -304,8 +316,12 @@ impl Interp {
         sources: HashMap<PathBuf, Arc<Parsed>>,
         blobs: HashMap<PathBuf, Arc<Vec<u8>>>,
     ) -> Interp {
+        let parents_matter = sources.iter().any(|(p, f)| {
+            f.text.contains("parent_module") && !p.components().any(|c| c.as_os_str() == "BOSL2")
+        });
         Interp {
             main: 0,
+            parents_matter,
             sources,
             blobs,
             loaded: Vec::new(),
@@ -319,6 +335,7 @@ impl Interp {
             root: None,
             modules: Vec::new(),
             rng: builtins::Mt19937::new(5489),
+            made: HashMap::new(),
         }
     }
 
@@ -1003,19 +1020,93 @@ impl Interp {
         f: &Rc<Frame>,
     ) -> R<Option<Geom>> {
         let a = self.args(args, f)?;
+        let count = children.iter().filter(|s| is_instance(s)).count();
+        let key = if count == 0 {
+            self.call_key(def, home, &a, f)
+        } else {
+            None
+        };
+        if let Some(k) = &key
+            && let Some((g, ..)) = self.made.get(k)
+        {
+            return Ok(g.clone());
+        }
         let frame = Rc::new(Frame {
             parent: Some(home.clone()),
             caller: Some(f.clone()),
             children: Some((children.clone(), f.clone())),
             ..Frame::default()
         });
-        let count = children.iter().filter(|s| is_instance(s)).count();
         frame.set(&"$children".into(), Value::Num(count as f64));
         self.bind(&def.params, a, &frame)?;
         self.enter(pos)?;
         let made = self.exec(&def.body, &frame, None);
         self.depth -= 1;
-        self.union(made?, Some(pos))
+        let made = self.union(made?, Some(pos))?;
+        // A `!` inside counts once: not kept.
+        if let Some(k) = key
+            && self.root.is_none()
+        {
+            self.made
+                .insert(k, (made.clone(), def.clone(), home.clone()));
+        }
+        Ok(made)
+    }
+
+    /// What a call of a module without children depends on, as bytes: the
+    /// module and where it is defined, its arguments, every `$` name its
+    /// caller sees, and the modules it is called in (`parent_module`).
+    /// `None` when a value is a function literal, which knows its scope.
+    fn call_key(
+        &self,
+        def: &Arc<Module>,
+        home: &Rc<Frame>,
+        a: &Args,
+        f: &Rc<Frame>,
+    ) -> Option<Vec<u8>> {
+        let mut k = Vec::with_capacity(256);
+        k.extend((Arc::as_ptr(def) as usize).to_le_bytes());
+        k.extend((Rc::as_ptr(home) as usize).to_le_bytes());
+        for (v, before) in a.pos.iter().zip(&a.before) {
+            k.extend(before.to_le_bytes());
+            key_of(v, &mut k)?;
+        }
+        k.push(b';');
+        for (n, v) in &a.named {
+            k.extend(n.as_bytes());
+            k.push(b'=');
+            key_of(v, &mut k)?;
+        }
+        k.push(b';');
+        // The `$` names as the call sees them: the nearest of each name.
+        let mut seen: Vec<Arc<str>> = Vec::new();
+        let mut x: Option<&Rc<Frame>> = Some(f);
+        // Deep in a recursion the walk would cost more than it saves.
+        let mut steps = 0;
+        while let Some(fr) = x {
+            steps += 1;
+            if steps > 200 {
+                return None;
+            }
+            for (n, v) in fr.vars.borrow().list.iter() {
+                if n.starts_with('$') && &**n != "$children" && !seen.contains(n) {
+                    seen.push(n.clone());
+                    k.extend(n.as_bytes());
+                    k.push(b'=');
+                    key_of(v, &mut k)?;
+                }
+            }
+            x = fr.caller.as_ref().or(fr.parent.as_ref());
+        }
+        k.push(b';');
+        if self.parents_matter {
+            for m in &self.modules {
+                k.extend(m.as_bytes());
+                k.push(b'/');
+            }
+        }
+        k.push(u8::from(self.modules.len() > 1));
+        Some(k)
     }
 
     fn enter(&mut self, pos: Pos) -> R<()> {
@@ -1167,25 +1258,23 @@ impl Interp {
     }
 
     /// Solids joined in pairs, the pairs again, and so on: the meshes the
-    /// booleans take stay small, and those apart are only put together.
+    /// booleans take stay small, and those apart are only put together
+    /// (see [`Builder::union_many`]). Shapes that fail to join are put
+    /// together as they are, said in a note; OpenSCAD shows them so too.
     fn join(
         &mut self,
-        mut list: Vec<opensolve_kernel::Solid>,
+        list: Vec<opensolve_kernel::Solid>,
         flat: bool,
         pos: Option<Pos>,
     ) -> R<Option<opensolve_kernel::Solid>> {
-        while list.len() > 1 {
-            let mut next = Vec::with_capacity(list.len().div_ceil(2));
-            let mut it = list.into_iter();
-            while let Some(a) = it.next() {
-                next.push(match it.next() {
-                    Some(b) => self.boolean(&a, &b, Op::Add, flat, pos)?,
-                    None => a,
-                });
-            }
-            list = next;
+        let (out, errors) = self.geo.union_many(list, flat);
+        for e in errors {
+            self.note(
+                pos,
+                format!("union: the shapes are put together without joining them ({e})"),
+            );
         }
-        Ok(list.pop())
+        Ok(out)
     }
 
     fn boolean(
@@ -1985,6 +2074,39 @@ impl Interp {
         }
         Ok(())
     }
+}
+
+/// A value as bytes that tell it apart exactly; `None` for a function
+/// literal.
+fn key_of(v: &Value, out: &mut Vec<u8>) -> Option<()> {
+    match v {
+        Value::Undef => out.push(0),
+        Value::Bool(b) => out.extend([1, u8::from(*b)]),
+        Value::Num(x) => {
+            out.push(2);
+            out.extend(x.to_bits().to_le_bytes());
+        }
+        Value::Str(s) => {
+            out.push(3);
+            out.extend(s.len().to_le_bytes());
+            out.extend(s.as_bytes());
+        }
+        Value::List(l) => {
+            out.push(4);
+            out.extend(l.len().to_le_bytes());
+            for x in l.iter() {
+                key_of(x, out)?;
+            }
+        }
+        Value::Range(a, b, c) => {
+            out.push(5);
+            for x in [a, b, c] {
+                out.extend(x.to_bits().to_le_bytes());
+            }
+        }
+        Value::Func(..) => return None,
+    }
+    Some(())
 }
 
 /// The modules OpenSCAD has.

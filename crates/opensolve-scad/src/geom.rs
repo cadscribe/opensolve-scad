@@ -8,6 +8,8 @@ use std::collections::{HashMap, HashSet};
 
 use opensolve_kernel::{FaceId, Facets, Op, Solid};
 
+use crate::eval::Fx;
+
 pub type V3 = [f64; 3];
 pub type V2 = [f64; 2];
 /// An affine map: three rows of a 4×4 matrix.
@@ -360,6 +362,48 @@ impl Builder {
         }
         a.boolean(&b, op, &mut self.facets)
             .map_err(|e| e.to_string())
+    }
+
+    /// [`Builder::boolean`] of several pairs at once.
+    pub fn booleans(
+        &mut self,
+        pairs: &[(&Solid, &Solid)],
+        op: Op,
+        flat: bool,
+    ) -> Vec<Result<Solid, String>> {
+        let mut out: Vec<Option<Result<Solid, String>>> = Vec::with_capacity(pairs.len());
+        let mut todo: Vec<(Solid, Solid)> = Vec::new();
+        let mut at = Vec::new();
+        for (i, (a, b)) in pairs.iter().enumerate() {
+            let b = if flat && op != Op::Add {
+                let tall = [
+                    [1.0, 0.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0, 0.0],
+                    [0.0, 0.0, 3.0, -1.0],
+                ];
+                self.transformed(b, &tall)
+            } else {
+                (*b).clone()
+            };
+            if op == Op::Add
+                && let (Some(p), Some(q)) = (a.bounds(), b.bounds())
+                && (0..3).any(|i| p.1[i] < q.0[i] - 1e-9 || q.1[i] < p.0[i] - 1e-9)
+            {
+                out.push(Some(Ok(Solid::merged(&[(*a).clone(), b]))));
+                continue;
+            }
+            out.push(None);
+            todo.push(((*a).clone(), b));
+            at.push(i);
+        }
+        let refs: Vec<(&Solid, &Solid)> = todo.iter().map(|(a, b)| (a, b)).collect();
+        let made = Solid::booleans(&refs, op, &mut self.facets);
+        for (i, r) in at.into_iter().zip(made) {
+            out[i] = Some(r.map_err(|e| e.to_string()));
+        }
+        out.into_iter()
+            .map(|r| r.unwrap_or_else(|| Ok(Solid::default())))
+            .collect()
     }
 
     /// The solid mapped by `m`; a mirror turns its triangles round.
@@ -742,11 +786,14 @@ fn hull2(points: &[V2]) -> Vec<V2> {
     lower
 }
 
-/// The triangles of the convex hull of points, outward, by adding one
-/// point after the other; `None` if they lie in a plane.
+/// The triangles of the convex hull of points, outward; `None` if they
+/// lie in a plane. Quickhull: each face keeps the points above it, the
+/// farthest of them is added next, and the points of the faces it sees go
+/// to the new faces or, inside, away; the faces by their edges in a map
+/// kept up to date.
 fn hull3(points: &[V3]) -> Option<Vec<[V3; 3]>> {
     // One point per place.
-    let mut seen = HashSet::new();
+    let mut seen: HashSet<[i64; 3], Fx> = HashSet::default();
     let p: Vec<V3> = points
         .iter()
         .copied()
@@ -783,84 +830,212 @@ fn hull3(points: &[V3]) -> Option<Vec<[V3; 3]>> {
         let h = |k: usize| dot(normal, sub(p[k], p[a])).abs();
         h(i).total_cmp(&h(j))
     })?;
-    let plane = |f: [usize; 3]| {
-        let n = cross(sub(p[f[1]], p[f[0]]), sub(p[f[2]], p[f[0]]));
-        let l = dot(n, n).sqrt().max(1e-300);
-        (n.map(|x| x / l), f)
-    };
-    let height = |f: &(V3, [usize; 3]), q: V3| dot(f.0, sub(q, p[f.1[0]]));
     if dot(normal, sub(p[d], p[a])).abs() / dot(normal, normal).sqrt() < eps {
         return None;
     }
-    let mut faces: Vec<(V3, [usize; 3])> = Vec::new();
-    for f in [[a, b, c], [a, c, d], [a, d, b], [b, d, c]] {
-        let mut x = plane(f);
+    struct Face {
+        n: V3,
+        v: [usize; 3],
+        above: Vec<usize>,
+        alive: bool,
+    }
+    let plane = |v: [usize; 3]| {
+        let n = cross(sub(p[v[1]], p[v[0]]), sub(p[v[2]], p[v[0]]));
+        let l = dot(n, n).sqrt().max(1e-300);
+        Face {
+            n: n.map(|x| x / l),
+            v,
+            above: Vec::new(),
+            alive: true,
+        }
+    };
+    let height = |f: &Face, q: V3| dot(f.n, sub(q, p[f.v[0]]));
+    let mut faces: Vec<Face> = Vec::new();
+    for v in [[a, b, c], [a, c, d], [a, d, b], [b, d, c]] {
+        let mut f = plane(v);
         // Outward: the fourth point below.
         let other = [a, b, c, d]
             .into_iter()
-            .find(|i| !f.contains(i))
+            .find(|i| !v.contains(i))
             .unwrap_or(a);
-        if height(&x, p[other]) > 0.0 {
-            x = plane([f[0], f[2], f[1]]);
+        if height(&f, p[other]) > 0.0 {
+            f = plane([v[0], v[2], v[1]]);
         }
-        faces.push(x);
+        faces.push(f);
     }
-    // The points farthest out first: what lies near the hull's faces then
-    // seldom makes faces that a later point takes away again.
-    let mid: V3 = std::array::from_fn(|k| (p[a][k] + p[b][k] + p[c][k] + p[d][k]) / 4.0);
-    let mut order: Vec<usize> = (0..p.len()).filter(|i| ![a, b, c, d].contains(i)).collect();
-    let far = |i: usize| dot(sub(p[i], mid), sub(p[i], mid));
-    order.sort_by(|&i, &j| far(j).total_cmp(&far(i)));
-    for i in order {
-        let q = p[i];
-        let heights: Vec<f64> = faces.iter().map(|f| height(f, q)).collect();
-        let Some(top) = (0..faces.len()).max_by(|&x, &y| heights[x].total_cmp(&heights[y])) else {
-            break;
-        };
-        if heights[top] <= eps {
+    // Each point to the face it is farthest above.
+    let place = |faces: &mut Vec<Face>, among: &[usize], q: usize| {
+        let mut best = None;
+        let mut most = eps;
+        for &k in among {
+            let h = height(&faces[k], p[q]);
+            if h > most {
+                most = h;
+                best = Some(k);
+            }
+        }
+        if let Some(k) = best {
+            faces[k].above.push(q);
+        }
+    };
+    let first: Vec<usize> = (0..4).collect();
+    for q in 0..p.len() {
+        if ![a, b, c, d].contains(&q) {
+            place(&mut faces, &first, q);
+        }
+    }
+    let mut by_edge: HashMap<(usize, usize), usize, Fx> = HashMap::default();
+    for (k, f) in faces.iter().enumerate() {
+        for e in 0..3 {
+            by_edge.insert((f.v[e], f.v[(e + 1) % 3]), k);
+        }
+    }
+    let mut open: Vec<usize> = (0..4).filter(|&k| !faces[k].above.is_empty()).collect();
+    let mut visible: Vec<usize> = Vec::new();
+    let mut mark: Vec<bool> = vec![false; 4];
+    while let Some(top) = open.pop() {
+        if !faces[top].alive || faces[top].above.is_empty() {
             continue;
         }
-        // The faces the point sees, connected to the one it sees best:
-        // their border is one loop.
-        let mut by_edge: HashMap<(usize, usize), usize> = HashMap::with_capacity(faces.len() * 3);
-        for (k, f) in faces.iter().enumerate() {
-            for e in 0..3 {
-                by_edge.insert((f.1[e], f.1[(e + 1) % 3]), k);
-            }
-        }
-        let mut visible = vec![false; faces.len()];
-        visible[top] = true;
-        let mut stack = vec![top];
-        while let Some(k) = stack.pop() {
-            let f = faces[k].1;
+        // The point farthest above the face.
+        let eye = *faces[top]
+            .above
+            .iter()
+            .max_by(|&&x, &&y| height(&faces[top], p[x]).total_cmp(&height(&faces[top], p[y])))?;
+        // The faces it sees, connected to this one: their border is one
+        // loop.
+        visible.clear();
+        visible.push(top);
+        mark.resize(faces.len(), false);
+        mark[top] = true;
+        let mut i = 0;
+        while i < visible.len() {
+            let f = faces[visible[i]].v;
+            i += 1;
             for e in 0..3 {
                 if let Some(&n) = by_edge.get(&(f[(e + 1) % 3], f[e]))
-                    && !visible[n]
-                    && heights[n] > eps
+                    && !mark[n]
+                    && height(&faces[n], p[eye]) > eps
                 {
-                    visible[n] = true;
-                    stack.push(n);
+                    mark[n] = true;
+                    visible.push(n);
                 }
             }
         }
-        let mut next: Vec<(V3, [usize; 3])> = Vec::with_capacity(faces.len() + 8);
-        let mut cone = Vec::new();
-        for (k, f) in faces.iter().enumerate() {
-            if !visible[k] {
-                next.push(*f);
-                continue;
-            }
+        let mut horizon = Vec::new();
+        let mut orphans = Vec::new();
+        for &k in &visible {
+            let f = faces[k].v;
             for e in 0..3 {
-                let (x, y) = (f.1[e], f.1[(e + 1) % 3]);
-                if by_edge.get(&(y, x)).is_none_or(|&n| !visible[n]) {
-                    cone.push(plane([x, y, i]));
+                let (x, y) = (f[e], f[(e + 1) % 3]);
+                if by_edge.get(&(y, x)).is_none_or(|&n| !mark[n]) {
+                    horizon.push((x, y));
+                }
+            }
+            faces[k].alive = false;
+            orphans.append(&mut faces[k].above);
+        }
+        for &k in &visible {
+            let f = faces[k].v;
+            for e in 0..3 {
+                by_edge.remove(&(f[e], f[(e + 1) % 3]));
+            }
+            mark[k] = false;
+        }
+        let start = faces.len();
+        for (x, y) in horizon {
+            let k = faces.len();
+            faces.push(plane([x, y, eye]));
+            for (u, w) in [(x, y), (y, eye), (eye, x)] {
+                by_edge.insert((u, w), k);
+            }
+        }
+        let new: Vec<usize> = (start..faces.len()).collect();
+        for q in orphans {
+            if q != eye {
+                place(&mut faces, &new, q);
+            }
+        }
+        open.extend(new.into_iter().filter(|&k| !faces[k].above.is_empty()));
+    }
+    Some(
+        faces
+            .iter()
+            .filter(|f| f.alive)
+            .map(|f| f.v.map(|i| p[i]))
+            .collect(),
+    )
+}
+
+/// The surface of a solid in convex pieces, each its corners: triangles of
+/// one plane joined across their edges while what they make stays convex.
+/// What a Minkowski sum takes piece by piece: a hull for each.
+fn convex_patches(s: &Solid) -> Vec<Vec<V3>> {
+    let tri = |t: usize| s.tris[t].map(|i| s.points[i as usize]);
+    let planes: Vec<(V3, f64)> = (0..s.tris.len())
+        .map(|t| {
+            let [a, b, c] = tri(t);
+            let n = cross(sub(b, a), sub(c, a));
+            let l = dot(n, n).sqrt().max(1e-300);
+            let n = n.map(|x| x / l);
+            (n, dot(n, a))
+        })
+        .collect();
+    let same = |x: usize, y: usize| {
+        let ((n, d), (m, e)) = (planes[x], planes[y]);
+        dot(n, m) > 1.0 - 1e-9 && (d - e).abs() < 1e-7
+    };
+    let key = |p: V3| p.map(f64::to_bits);
+    let mut by_edge: HashMap<([u64; 3], [u64; 3]), usize, Fx> = HashMap::default();
+    for t in 0..s.tris.len() {
+        let c = tri(t);
+        for e in 0..3 {
+            by_edge.insert((key(c[e]), key(c[(e + 1) % 3])), t);
+        }
+    }
+    let mut done = vec![false; s.tris.len()];
+    let mut out = Vec::new();
+    for start in 0..s.tris.len() {
+        if done[start] {
+            continue;
+        }
+        done[start] = true;
+        let (n, _) = planes[start];
+        // In the plane: the coordinates but the one the normal is most along.
+        let k = (0..3)
+            .max_by(|&a, &b| n[a].abs().total_cmp(&n[b].abs()))
+            .unwrap_or(2);
+        let (u, v) = ((k + 1) % 3, (k + 2) % 3);
+        let flat = |p: V3| [p[u], p[v]];
+        let mut corners: Vec<V3> = tri(start).to_vec();
+        let mut area = cross2(flat(corners[0]), flat(corners[1]), flat(corners[2])).abs() / 2.0;
+        let mut stack = vec![start];
+        while let Some(t) = stack.pop() {
+            let c = tri(t);
+            for e in 0..3 {
+                let Some(&m) = by_edge.get(&(key(c[(e + 1) % 3]), key(c[e]))) else {
+                    continue;
+                };
+                if done[m] || !same(start, m) {
+                    continue;
+                }
+                let d = tri(m);
+                let more = cross2(flat(d[0]), flat(d[1]), flat(d[2])).abs() / 2.0;
+                let mut with = corners.clone();
+                with.extend(d.iter().filter(|p| !corners.contains(p)));
+                let pts: Vec<V2> = with.iter().map(|p| flat(*p)).collect();
+                let hull = area_of(&hull2(&pts)).abs();
+                if (hull - (area + more)).abs() <= 1e-9 * hull.max(1e-12) + 1e-12 {
+                    done[m] = true;
+                    corners = with;
+                    area += more;
+                    stack.push(m);
                 }
             }
         }
-        next.extend(cone);
-        faces = next;
+        out.push(corners);
     }
-    Some(faces.iter().map(|f| f.1.map(|i| p[i])).collect())
+    out
 }
 
 /// How `offset` joins the offset edges at a corner that grows.
@@ -904,26 +1079,112 @@ impl Builder {
         (hull - v).abs() <= 1e-7 * hull.abs().max(1.0)
     }
 
-    /// Several solids as one, joined in pairs and the pairs again.
-    pub fn union_all(&mut self, mut list: Vec<Solid>, flat: bool) -> Result<Option<Solid>, String> {
-        while list.len() > 1 {
-            let mut next = Vec::with_capacity(list.len().div_ceil(2));
-            let mut it = list.into_iter();
-            while let Some(a) = it.next() {
-                next.push(match it.next() {
-                    Some(b) => self.boolean(&a, &b, Op::Add, flat)?,
-                    None => a,
-                });
-            }
-            list = next;
+    /// Several solids as one, joined as [`Builder::union_many`] joins
+    /// them; what fails to join is put together as it is.
+    pub fn union_all(&mut self, list: Vec<Solid>, flat: bool) -> Result<Option<Solid>, String> {
+        Ok(self.union_many(list, flat).0)
+    }
+
+    /// Several solids as one. Those apart from all others (their surfaces
+    /// do not meet, neither holds the other) are only put together; those
+    /// that meet are joined in pairs, the pairs again and so on, the pairs
+    /// of a round at once. A pair that fails to join is put together as it
+    /// is, its error returned.
+    pub fn union_many(&mut self, list: Vec<Solid>, flat: bool) -> (Option<Solid>, Vec<String>) {
+        if list.len() <= 1 {
+            return (list.into_iter().next(), Vec::new());
         }
-        Ok(list.pop())
+        let meeting = {
+            let refs: Vec<&Solid> = list.iter().collect();
+            opensolve_kernel::meeting(&refs)
+        };
+        let mut parent: Vec<usize> = (0..list.len()).collect();
+        fn root(p: &mut [usize], mut i: usize) -> usize {
+            while p[i] != i {
+                p[i] = p[p[i]];
+                i = p[i];
+            }
+            i
+        }
+        for (a, b) in meeting {
+            let (a, b) = (root(&mut parent, a), root(&mut parent, b));
+            parent[a.max(b)] = a.min(b);
+        }
+        let mut groups: Vec<Vec<Solid>> = Vec::new();
+        let mut group_of: HashMap<usize, usize> = HashMap::new();
+        for (i, s) in list.into_iter().enumerate() {
+            let r = root(&mut parent, i);
+            let g = *group_of.entry(r).or_insert_with(|| {
+                groups.push(Vec::new());
+                groups.len() - 1
+            });
+            groups[g].push(s);
+        }
+        let mut errors = Vec::new();
+        while groups.iter().any(|g| g.len() > 1) {
+            // Each group's list of the next round: a pair's result, by the
+            // pair's number, or one left over, in their order.
+            let mut jobs: Vec<(Solid, Solid)> = Vec::new();
+            let mut slots: Vec<Vec<Result<usize, Solid>>> = Vec::with_capacity(groups.len());
+            for mut list in groups {
+                // The small ones first, as Manifold batches them: a large
+                // mesh is gone through once, at the end, not every round.
+                // Slabs keep their order: joined otherwise, the corners
+                // where two parts of a shape touch can come out pinched.
+                if !flat {
+                    list.sort_by_key(|s| s.tris.len());
+                }
+                let mut next = Vec::with_capacity(list.len().div_ceil(2));
+                let mut it = list.into_iter();
+                while let Some(a) = it.next() {
+                    match it.next() {
+                        Some(b) => {
+                            next.push(Ok(jobs.len()));
+                            jobs.push((a, b));
+                        }
+                        None => next.push(Err(a)),
+                    }
+                }
+                slots.push(next);
+            }
+            let pairs: Vec<(&Solid, &Solid)> = jobs.iter().map(|(a, b)| (a, b)).collect();
+            let mut made: Vec<Option<Solid>> = self
+                .booleans(&pairs, Op::Add, flat)
+                .into_iter()
+                .zip(&jobs)
+                .map(|(r, (a, b))| {
+                    Some(r.unwrap_or_else(|e| {
+                        errors.push(e);
+                        Solid::merged(&[a.clone(), b.clone()])
+                    }))
+                })
+                .collect();
+            groups = slots
+                .into_iter()
+                .map(|g| {
+                    g.into_iter()
+                        .map(|s| match s {
+                            Ok(k) => made[k].take().unwrap_or_default(),
+                            Err(s) => s,
+                        })
+                        .collect()
+                })
+                .collect();
+        }
+        let mut parts: Vec<Solid> = groups.into_iter().flatten().collect();
+        let out = if parts.len() == 1 {
+            parts.pop()
+        } else {
+            Some(Solid::merged(&parts))
+        };
+        (out, errors)
     }
 
     /// The Minkowski sum of two solids: the hull of the sums of their
     /// corners when both are convex; else the union of such hulls of each
-    /// triangle of one with the other (or its triangles), with the inside
-    /// of both, which takes a boolean for each.
+    /// convex piece of one's faces (see `convex_patches`) with the other
+    /// (or its pieces), with the inside of both, joined in rounds of pairs
+    /// at once.
     pub fn minkowski(&mut self, a: &Solid, b: &Solid) -> Result<Option<Solid>, String> {
         let (ca, cb) = (Self::is_convex(a), Self::is_convex(b));
         let (pa, pb) = (Self::corners(a), Self::corners(b));
@@ -938,19 +1199,13 @@ impl Builder {
         if ca && cb {
             return Ok(self.hull(&sums(&pa, &pb)));
         }
-        // The one that is not convex goes by triangles.
+        // The one that is not convex goes by convex pieces of its faces.
         let (big, small, cs) = if ca { (b, a, ca) } else { (a, b, cb) };
-        let pieces = |s: &Solid| -> Vec<Vec<V3>> {
-            s.tris
-                .iter()
-                .map(|t| t.iter().map(|&i| s.points[i as usize]).collect())
-                .collect()
-        };
-        let big_pieces = pieces(big);
+        let big_pieces = convex_patches(big);
         let small_pieces = if cs {
             vec![Self::corners(small)]
         } else {
-            pieces(small)
+            convex_patches(small)
         };
         if big_pieces.len() * small_pieces.len() > MOST_PIECES {
             return Err(format!(

@@ -12,6 +12,7 @@ use std::sync::Arc;
 
 use boolmesh::prelude::{Manifold, OpType, compute_boolean};
 
+mod apart;
 mod export;
 mod raster;
 mod revolve;
@@ -19,6 +20,7 @@ mod stl;
 mod triangulate;
 mod zip;
 
+pub use apart::meeting;
 pub use export::{
     PrintObject, encode, step, three_mf, three_mf_assembly, three_mf_objects, three_mf_print,
 };
@@ -669,46 +671,59 @@ impl Solid {
     /// tried again with the other solid a millionth larger, then smaller,
     /// then this one larger: a sliver of that width is the difference.
     pub fn boolean(&self, other: &Solid, op: Op, facets: &mut Facets) -> Result<Solid, Error> {
-        if self.is_empty() || other.is_empty() {
-            return Ok(match op {
-                Op::Add if self.is_empty() => other.clone(),
-                Op::Add | Op::Subtract => self.clone(),
-                Op::Intersect => Solid::default(),
+        Solid::booleans(&[(self, other)], op, facets)
+            .pop()
+            .unwrap_or_else(|| Ok(Solid::default()))
+    }
+
+    /// The booleans of several pairs, as [`Solid::boolean`]: the library's
+    /// work for each on a thread of its own where the machine has threads,
+    /// what joins many shapes in a tree of pairs.
+    pub fn booleans(
+        pairs: &[(&Solid, &Solid)],
+        op: Op,
+        facets: &mut Facets,
+    ) -> Vec<Result<Solid, Error>> {
+        let mut out: Vec<Option<Result<Solid, Error>>> = pairs
+            .iter()
+            .map(|(a, b)| {
+                (a.is_empty() || b.is_empty()).then(|| {
+                    Ok(match op {
+                        Op::Add if a.is_empty() => (*b).clone(),
+                        Op::Add | Op::Subtract => (*a).clone(),
+                        Op::Intersect => Solid::default(),
+                    })
+                })
+            })
+            .collect();
+        let todo: Vec<usize> = (0..pairs.len()).filter(|&i| out[i].is_none()).collect();
+        let first = parallel(todo.len(), |k| {
+            let (a, b) = pairs[todo[k]];
+            run_boolean(a, b, op)
+        });
+        for (&i, mut result) in todo.iter().zip(first) {
+            let (a, b) = pairs[i];
+            for (which, k) in [(1, 1e-6), (1, -1e-6), (0, 1e-6)] {
+                if result.is_ok() {
+                    break;
+                }
+                result = if which == 1 {
+                    run_boolean(a, &b.nudged(k, facets), op)
+                } else {
+                    run_boolean(&a.nudged(k, facets), b, op)
+                };
+            }
+            out[i] = Some(match result {
+                Err(e) | Ok(Err(e)) => Err(e),
+                Ok(Ok(Ok(m))) => Ok(Solid::from_manifold(m, facets)),
+                // Nothing is left: the library has no empty mesh.
+                Ok(Ok(Err(e))) if e.contains("empty") => Ok(Solid::default()),
+                Ok(Ok(Err(e))) => Err(Error::Boolean(e)),
             });
         }
-        let kind = || match op {
-            Op::Add => OpType::Add,
-            Op::Subtract => OpType::Subtract,
-            Op::Intersect => OpType::Intersect,
-        };
-        // The library can panic on an index; a failed feature must not take
-        // the app with it.
-        let run = |a: &Solid, b: &Solid| {
-            catch_unwind(AssertUnwindSafe(
-                || -> Result<Result<Manifold<Tag>, String>, Error> {
-                    let (a, b) = (a.manifold()?, b.manifold()?);
-                    Ok(compute_boolean(&a, &b, kind()))
-                },
-            ))
-            .map_err(|_| Error::Boolean("the mesh library panicked".to_string()))
-        };
-        let mut result = run(self, other);
-        for (which, k) in [(1, 1e-6), (1, -1e-6), (0, 1e-6)] {
-            if result.is_ok() {
-                break;
-            }
-            result = if which == 1 {
-                run(self, &other.nudged(k, facets))
-            } else {
-                run(&self.nudged(k, facets), other)
-            };
-        }
-        match result?? {
-            Ok(m) => Ok(Solid::from_manifold(m, facets)),
-            // Nothing is left: the library has no empty mesh.
-            Err(e) if e.contains("empty") => Ok(Solid::default()),
-            Err(e) => Err(Error::Boolean(e)),
-        }
+        out.into_iter()
+            .map(|r| r.unwrap_or_else(|| Ok(Solid::default())))
+            .collect()
     }
 
     fn from_manifold(mut m: Manifold<Tag>, facets: &mut Facets) -> Solid {
@@ -744,8 +759,10 @@ impl Solid {
                 edges.insert((t[k], t[(k + 1) % 3]), i);
             }
         }
-        for _ in 0..tris.len() {
-            let mut open = false;
+        // Pass after pass while one finds more: a triangle none fits stops
+        // nothing.
+        loop {
+            let mut found_any = false;
             for i in 0..tris.len() {
                 if out[i].is_some() {
                     continue;
@@ -755,18 +772,49 @@ impl Solid {
                     .filter_map(|k| edges.get(&(t[(k + 1) % 3], t[k])).and_then(|&n| out[n]))
                     .find(|&f| facets.fits(f, at(t)));
                 out[i] = found;
-                open |= found.is_none();
+                found_any |= found.is_some();
             }
-            if !open {
+            if !found_any {
                 break;
             }
         }
+        // The rest: the nearest of the facets its corners and neighbours
+        // name, else of all.
+        let near: Vec<Option<u32>> = (0..tris.len())
+            .map(|i| {
+                if out[i].is_some() {
+                    return None;
+                }
+                let t = tris[i];
+                let mut names: Vec<u32> = m.vals[3 * i..3 * i + 3]
+                    .iter()
+                    .filter(|v| whole(v))
+                    .map(|v| v.0.round() as u32)
+                    .filter(|&f| (f as usize) < facets.all.len())
+                    .collect();
+                names.extend(
+                    (0..3).filter_map(|k| edges.get(&(t[(k + 1) % 3], t[k])).and_then(|&n| out[n])),
+                );
+                let off = |f: u32| {
+                    let x = facets.get(f);
+                    at(t)
+                        .iter()
+                        .map(|p| (dot(x.normal, *p) - x.offset).abs())
+                        .sum::<f64>()
+                };
+                names
+                    .into_iter()
+                    .min_by(|&a, &b| off(a).total_cmp(&off(b)))
+                    .or_else(|| Some(nearest_facet(facets, at(t))))
+            })
+            .collect();
         let mut turned: HashMap<u32, u32> = HashMap::new();
         let facets_of: Vec<u32> = out
             .iter()
             .zip(&tris)
-            .map(|(f, t)| {
-                let f = f.unwrap_or_else(|| nearest_facet(facets, at(*t)));
+            .zip(&near)
+            .map(|((f, t), n)| {
+                let f = f.or(*n).unwrap_or(0);
                 let [p, q, r] = at(*t);
                 let n = cross(sub(q, p), sub(r, p));
                 let old = facets.get(f);
@@ -1035,6 +1083,70 @@ impl Solid {
 
 /// Is `p`, in the triangle's plane, inside it? `normal` is the plane's, seen from
 /// the side the triangle's winding runs against.
+/// The library's boolean of two solids, its panic caught: the library can
+/// panic on an index, and a failed feature must not take the app with it.
+type Raw = Result<Result<Result<Manifold<Tag>, String>, Error>, Error>;
+
+fn run_boolean(a: &Solid, b: &Solid, op: Op) -> Raw {
+    let kind = match op {
+        Op::Add => OpType::Add,
+        Op::Subtract => OpType::Subtract,
+        Op::Intersect => OpType::Intersect,
+    };
+    catch_unwind(AssertUnwindSafe(
+        || -> Result<Result<Manifold<Tag>, String>, Error> {
+            let (a, b) = (a.manifold()?, b.manifold()?);
+            Ok(compute_boolean(&a, &b, kind))
+        },
+    ))
+    .map_err(|_| Error::Boolean("the mesh library panicked".to_string()))
+}
+
+/// `f` of `0..n`, on as many threads as the machine has.
+#[cfg(not(target_arch = "wasm32"))]
+fn parallel<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let threads = std::thread::available_parallelism()
+        .map_or(1, std::num::NonZero::get)
+        .min(n);
+    if threads <= 1 {
+        return (0..n).map(f).collect();
+    }
+    let next = AtomicUsize::new(0);
+    let done: Vec<Mutex<Option<T>>> = (0..n).map(|_| Mutex::new(None)).collect();
+    let work = || {
+        loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            if i >= n {
+                break;
+            }
+            let r = f(i);
+            if let Ok(mut d) = done[i].lock() {
+                *d = Some(r);
+            }
+        }
+    };
+    std::thread::scope(|s| {
+        for _ in 1..threads {
+            // The library recurses: room as on the evaluation's thread.
+            let _ = std::thread::Builder::new()
+                .stack_size(64 << 20)
+                .spawn_scoped(s, work);
+        }
+        work();
+    });
+    done.into_iter()
+        .enumerate()
+        .map(|(i, d)| d.into_inner().ok().flatten().unwrap_or_else(|| f(i)))
+        .collect()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn parallel<T>(n: usize, f: impl Fn(usize) -> T) -> Vec<T> {
+    (0..n).map(f).collect()
+}
+
 fn covers(t: [[f64; 3]; 3], p: [f64; 3], normal: [f64; 3]) -> bool {
     (0..3).all(|k| {
         let (a, b) = (t[k], t[(k + 1) % 3]);

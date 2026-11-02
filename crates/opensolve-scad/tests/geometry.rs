@@ -163,6 +163,11 @@ fn hulls() {
     let ball = volume("sphere(1, $fn = 8);");
     let v = volume("hull() { sphere(1, $fn = 8); translate([5, 0, 0]) sphere(1, $fn = 8); }");
     assert!(v > 2.0 * ball && v < 7.0 * 2.0 * 2.0, "{v}");
+    // Many points: the hull of a fine sphere's is the sphere.
+    near(
+        volume("hull() sphere(5, $fn = 120);"),
+        volume("sphere(5, $fn = 120);"),
+    );
     // 2D: a stadium.
     let a = ngon(1.0, 12);
     near(
@@ -471,4 +476,24 @@ fn too_many_pieces_are_capped_and_said() {
         out.notes
     );
     near(out.solid.volume(), ngon(5.0, 1000));
+}
+
+#[test]
+fn many_parts_apart_and_a_module_called_again() {
+    // Rings of twisted ribs: apart from each other, though their boxes
+    // overlap, they are put together without booleans and still closed.
+    let ribs = "for (r = [10, 14]) for (i = [0:5]) rotate([0, 0, i * 60]) \
+                linear_extrude(height = 10, twist = 45) translate([r, 0]) circle(1, $fn = 12);";
+    let one =
+        volume("linear_extrude(height = 10, twist = 45) translate([10, 0]) circle(1, $fn = 12);");
+    near(volume(ribs), 12.0 * one);
+    // A module called again alike is made once; with another `$fn` it
+    // is made anew.
+    near(
+        volume(
+            "module m() cylinder(r = 5, h = 1); m(); translate([20, 0, 0]) m();\n\
+             translate([40, 0, 0]) m($fn = 6); translate([60, 0, 0]) { $fn = 6; m(); }",
+        ),
+        2.0 * ngon(5.0, 16) + 2.0 * ngon(5.0, 6),
+    );
 }
