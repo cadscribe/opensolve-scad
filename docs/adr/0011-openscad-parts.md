@@ -77,7 +77,7 @@ OpenSCAD does is the part that matters for parts that fit.
   override that named one of the file's own variables (`depth = width / 2`)
   is now an unknown name: the Customizer only ever writes plain values.
 - A link may pass the model's parameters (`Feature::Link::model_params`,
-  "Modellparameter übergeben" in its properties): each number parameter and
+  "Parameter übergeben" in its properties): each number parameter and
   each text parameter, as far as it has a value, is a top-level variable of
   the file, as OpenSCAD's `-D` makes one, in the model's order, then the
   link's own values; the later of one name wins at the place of the first.
@@ -101,7 +101,7 @@ OpenSCAD does is the part that matters for parts that fit.
 - The editor's language server is told the variables a file is given
   (`Workspace::set_external`): the app gives each open file the parameters
   of the links that pass them. They are not unknown when the file is
-  checked, completion offers them as variables ("Modellparameter = 73"),
+  checked, completion offers them as variables ("Parameter = 73"),
   and hover shows their value and expression, before the file's own
   top-level value of the name, which they replace. The stdio server has
   none.
