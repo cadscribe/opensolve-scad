@@ -3,6 +3,7 @@
 
 use std::fmt::Write as _;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::ast::Func;
 use crate::eval::Frame;
@@ -13,12 +14,12 @@ pub enum Value {
     Undef,
     Bool(bool),
     Num(f64),
-    Str(Rc<str>),
+    Str(Arc<str>),
     List(Rc<Vec<Value>>),
     /// begin, step, end.
     Range(f64, f64, f64),
     /// A function literal and where it was made.
-    Func(Rc<Func>, Rc<Frame>),
+    Func(Arc<Func>, Rc<Frame>),
 }
 
 impl PartialEq for Value {
@@ -34,7 +35,7 @@ impl PartialEq for Value {
                 .iter()
                 .zip([d, e, f])
                 .all(|(x, y)| x == &y || (x.is_nan() && y.is_nan())),
-            (Value::Func(a, _), Value::Func(b, _)) => Rc::ptr_eq(a, b),
+            (Value::Func(a, _), Value::Func(b, _)) => Arc::ptr_eq(a, b),
             _ => false,
         }
     }

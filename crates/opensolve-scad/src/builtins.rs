@@ -1,14 +1,14 @@
 //! OpenSCAD's built-in functions. Angles are degrees; what a function gets
 //! that it cannot take makes `undef`, as in OpenSCAD.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::geom::{cos_deg, sin_deg};
 use crate::trig;
 use crate::value::Value;
 
 /// Arguments as given: by position, or named.
-pub type Args = [(Option<Rc<str>>, Value)];
+pub type Args = [(Option<Arc<str>>, Value)];
 
 fn arg<'a>(args: &'a Args, name: &str, at: usize) -> Option<&'a Value> {
     args.iter()
@@ -425,11 +425,11 @@ pub fn rands(args: &Args, rng: &mut Mt19937) -> Value {
 mod tests {
     use super::*;
 
-    fn n(x: f64) -> (Option<Rc<str>>, Value) {
+    fn n(x: f64) -> (Option<Arc<str>>, Value) {
         (None, Value::Num(x))
     }
 
-    fn v(x: &[f64]) -> (Option<Rc<str>>, Value) {
+    fn v(x: &[f64]) -> (Option<Arc<str>>, Value) {
         (
             None,
             Value::list(x.iter().map(|x| Value::Num(*x)).collect()),

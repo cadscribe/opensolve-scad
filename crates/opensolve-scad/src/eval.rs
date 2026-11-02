@@ -7,17 +7,23 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use opensolve_kernel::Op;
 
 use crate::Error;
 use crate::ast::{Arg, Elem, Expr, Func, Modifier, Module, Pos, Stmt};
 use crate::builtins;
+use crate::cache::Parsed;
 use crate::geom::{self, Builder, Geom, IDENTITY, Matrix, V2, V3, cos_deg, fragments, sin_deg};
-use crate::parser::parse;
 use crate::value::{self, MOST, Value, item, repr};
 
-/// Deeper calls than this end the evaluation: a recursion without end.
+/// Deeper calls than this end the evaluation: a recursion without end. A
+/// call in a function's tail does not count (see `run_func`); a deep one
+/// ends earlier if the stack runs short.
+#[cfg(not(target_arch = "wasm32"))]
+const DEPTH: usize = 100_000;
+#[cfg(target_arch = "wasm32")]
 const DEPTH: usize = 3000;
 /// The most pieces a circle is cut into.
 const PIECES: usize = 1000;
@@ -26,17 +32,104 @@ const NOTES: usize = 40;
 /// More marks than this are dropped.
 const MARKS: usize = 500;
 
+/// Names and what they stand for in a scope: a list, and an index once
+/// there are many, as in a file that includes BOSL2 (thousands).
+#[derive(Debug)]
+struct Names<T> {
+    list: Vec<(Arc<str>, T)>,
+    index: Option<HashMap<Arc<str>, usize, Fx>>,
+}
+
+impl<T> Default for Names<T> {
+    fn default() -> Self {
+        Names {
+            list: Vec::new(),
+            index: None,
+        }
+    }
+}
+
+/// More names than this, and they are found by an index.
+const INDEXED: usize = 12;
+
+impl<T> Names<T> {
+    fn find(&self, name: &str) -> Option<&T> {
+        match &self.index {
+            Some(ix) => ix.get(name).map(|&i| &self.list[i].1),
+            None => self.list.iter().find(|(n, _)| &**n == name).map(|(_, v)| v),
+        }
+    }
+
+    /// Sets a name; one set again keeps its place and takes the new value.
+    fn set(&mut self, name: &Arc<str>, v: T) {
+        let at = match &self.index {
+            Some(ix) => ix.get(&**name).copied(),
+            None => self.list.iter().position(|(n, _)| n == name),
+        };
+        match at {
+            Some(i) => self.list[i].1 = v,
+            None => {
+                self.list.push((name.clone(), v));
+                if let Some(ix) = &mut self.index {
+                    ix.insert(name.clone(), self.list.len() - 1);
+                } else if self.list.len() > INDEXED {
+                    self.index = Some(
+                        self.list
+                            .iter()
+                            .enumerate()
+                            .map(|(i, (n, _))| (n.clone(), i))
+                            .collect(),
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// The hash of rustc's own tables (FxHash): quick for short names.
+#[derive(Clone, Copy, Debug, Default)]
+struct Fx;
+
+impl std::hash::BuildHasher for Fx {
+    type Hasher = FxHasher;
+    fn build_hasher(&self) -> FxHasher {
+        FxHasher(0)
+    }
+}
+
+#[derive(Debug)]
+struct FxHasher(u64);
+
+impl std::hash::Hasher for FxHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut b = [0u8; 8];
+            b[..chunk.len()].copy_from_slice(chunk);
+            self.0 = (self.0.rotate_left(5) ^ u64::from_le_bytes(b))
+                .wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+        }
+    }
+
+    fn write_u8(&mut self, i: u8) {
+        self.0 = (self.0.rotate_left(5) ^ u64::from(i)).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
 /// A scope: its names, the scope it is written in (`parent`), and for a
 /// call the scope it was called from (`caller`), where `$` names are found.
 #[derive(Default)]
 pub struct Frame {
-    vars: RefCell<Vec<(Rc<str>, Value)>>,
-    funcs: RefCell<Vec<(Rc<str>, Rc<Func>)>>,
-    mods: RefCell<Vec<(Rc<str>, Rc<Module>)>>,
+    vars: RefCell<Names<Value>>,
+    funcs: RefCell<Names<Arc<Func>>>,
+    mods: RefCell<Names<Arc<Module>>>,
     parent: Option<Rc<Frame>>,
     caller: Option<Rc<Frame>>,
     /// A module's children and the scope they were written in.
-    children: Option<(Rc<[Stmt]>, Rc<Frame>)>,
+    children: Option<(Arc<[Stmt]>, Rc<Frame>)>,
 }
 
 impl std::fmt::Debug for Frame {
@@ -53,80 +146,94 @@ impl Frame {
         })
     }
 
-    fn set(&self, name: &Rc<str>, v: Value) {
-        let mut vars = self.vars.borrow_mut();
-        match vars.iter_mut().find(|(n, _)| n == name) {
-            Some(slot) => slot.1 = v,
-            None => vars.push((name.clone(), v)),
-        }
+    fn set(&self, name: &Arc<str>, v: Value) {
+        self.vars.borrow_mut().set(name, v);
     }
 
     fn own(&self, name: &str) -> Option<Value> {
-        self.vars
-            .borrow()
-            .iter()
-            .find(|(n, _)| &**n == name)
-            .map(|(_, v)| v.clone())
+        self.vars.borrow().find(name).cloned()
     }
 
     /// A name's value: `$` names by who called, others by where written.
     fn get(self: &Rc<Frame>, name: &str) -> Option<Value> {
         let dynamic = name.starts_with('$');
-        let mut f = Some(self.clone());
-        while let Some(x) = f {
-            if let Some(v) = x.own(name) {
+        let mut f: &Rc<Frame> = self;
+        loop {
+            if let Some(v) = f.own(name) {
                 return Some(v);
             }
-            f = if dynamic {
-                x.caller.clone().or_else(|| x.parent.clone())
+            let next = if dynamic {
+                f.caller.as_ref().or(f.parent.as_ref())
             } else {
-                x.parent.clone()
+                f.parent.as_ref()
             };
+            f = next?;
         }
-        None
     }
 
-    fn func(self: &Rc<Frame>, name: &str) -> Option<(Rc<Func>, Rc<Frame>)> {
-        let mut f = Some(self.clone());
-        while let Some(x) = f {
-            if let Some((_, d)) = x.funcs.borrow().iter().find(|(n, _)| &**n == name) {
-                return Some((d.clone(), x.clone()));
+    fn func(self: &Rc<Frame>, name: &str) -> Option<(Arc<Func>, Rc<Frame>)> {
+        let mut f: &Rc<Frame> = self;
+        loop {
+            if let Some(d) = f.funcs.borrow().find(name) {
+                return Some((d.clone(), f.clone()));
             }
-            f = x.parent.clone();
+            f = f.parent.as_ref()?;
         }
-        None
     }
 
-    fn module(self: &Rc<Frame>, name: &str) -> Option<(Rc<Module>, Rc<Frame>)> {
-        let mut f = Some(self.clone());
-        while let Some(x) = f {
-            if let Some((_, d)) = x.mods.borrow().iter().find(|(n, _)| &**n == name) {
-                return Some((d.clone(), x.clone()));
+    fn module(self: &Rc<Frame>, name: &str) -> Option<(Arc<Module>, Rc<Frame>)> {
+        let mut f: &Rc<Frame> = self;
+        loop {
+            if let Some(d) = f.mods.borrow().find(name) {
+                return Some((d.clone(), f.clone()));
             }
-            f = x.parent.clone();
+            f = f.parent.as_ref()?;
         }
-        None
     }
 
     /// The children of the module being run here.
-    fn children(self: &Rc<Frame>) -> Option<(Rc<[Stmt]>, Rc<Frame>)> {
-        let mut f = Some(self.clone());
-        while let Some(x) = f {
-            if let Some(c) = &x.children {
+    fn children(self: &Rc<Frame>) -> Option<(Arc<[Stmt]>, Rc<Frame>)> {
+        let mut f: &Rc<Frame> = self;
+        loop {
+            if let Some(c) = &f.children {
                 return Some(c.clone());
             }
-            f = x.parent.clone();
+            f = f.parent.as_ref()?;
         }
-        None
     }
 }
 
 type R<T> = Result<T, Error>;
 
+/// What the tail of a function comes to: a value, or a call of a function
+/// (with its home, its arguments and the frame it is made in).
+enum Tail {
+    Value(Value),
+    Call(Arc<Func>, Rc<Frame>, Args, Rc<Frame>),
+}
+
+/// Whether `f`, or a scope between it and the function frame `upto`, sets
+/// a `$` name.
+fn sets_specials(f: &Rc<Frame>, upto: &Rc<Frame>) -> bool {
+    let mut x = f;
+    loop {
+        if x.vars.borrow().list.iter().any(|(n, _)| n.starts_with('$')) {
+            return true;
+        }
+        if Rc::ptr_eq(x, upto) {
+            return false;
+        }
+        match &x.parent {
+            Some(p) => x = p,
+            None => return false,
+        }
+    }
+}
+
 /// Evaluated arguments of a call.
 struct Args {
     pos: Vec<Value>,
-    named: Vec<(Rc<str>, Value)>,
+    named: Vec<(Arc<str>, Value)>,
 }
 
 impl Args {
@@ -149,9 +256,14 @@ impl Args {
 }
 
 pub struct Interp {
-    /// The files read: their paths and texts; file 0 is the main one.
-    pub files: Vec<(PathBuf, String)>,
-    sources: HashMap<PathBuf, String>,
+    /// The number of the main file (see [`crate::cache`]).
+    main: u32,
+    /// The files read, parsed once they are needed.
+    sources: HashMap<PathBuf, Arc<Parsed>>,
+    /// The files whose statements were taken: a file is used only once.
+    loaded: Vec<PathBuf>,
+    /// The folders an include is looked for in after the file's own.
+    search: Vec<PathBuf>,
     used: Vec<Rc<Frame>>,
     pub notes: Vec<String>,
     /// The notes again with where they are, for an editor: no place in
@@ -163,17 +275,19 @@ pub struct Interp {
     /// What a `!` made: the whole result.
     root: Option<Option<Geom>>,
     /// The modules being run, the innermost last: `parent_module`.
-    modules: Vec<Rc<str>>,
+    modules: Vec<Arc<str>>,
     /// What `rands` draws from: seeded anew by a seed, else the same
     /// numbers in each run, so that a part is built the same each time.
     rng: builtins::Mt19937,
 }
 
 impl Interp {
-    pub fn new(sources: HashMap<PathBuf, String>) -> Interp {
+    pub fn new(sources: HashMap<PathBuf, Arc<Parsed>>) -> Interp {
         Interp {
-            files: Vec::new(),
+            main: 0,
             sources,
+            loaded: Vec::new(),
+            search: crate::library::search(),
             used: Vec::new(),
             notes: Vec::new(),
             marks: Vec::new(),
@@ -203,16 +317,21 @@ impl Interp {
         self.keep(text);
     }
 
+    /// The path of the file a place is in, `None` in the main file.
+    fn file_of(&self, p: Pos) -> Option<PathBuf> {
+        if p.file == 0 || p.file == self.main {
+            return None;
+        }
+        crate::cache::path(p.file)
+    }
+
     fn mark(&mut self, pos: Option<Pos>, text: &str, echo: bool) {
         if self.marks.len() >= MARKS {
             return;
         }
         let p = pos.unwrap_or_default();
-        let file = (p.file != 0)
-            .then(|| self.files.get(p.file as usize).map(|f| f.0.clone()))
-            .flatten();
         let mark = crate::Note {
-            file,
+            file: self.file_of(p),
             line: p.line,
             col: p.col,
             message: text.to_string(),
@@ -245,41 +364,37 @@ impl Interp {
 
     /// `line 3` in the main file, `lib.scad, line 3` in another.
     fn place(&self, p: Pos) -> String {
-        if p.file == 0 {
+        let Some(file) = self.file_of(p) else {
             return format!("line {}", p.line);
-        }
-        let name = self.files.get(p.file as usize).map_or(String::new(), |f| {
-            f.0.file_name()
-                .map_or(String::new(), |n| n.to_string_lossy().into_owned())
-        });
+        };
+        let name = file
+            .file_name()
+            .map_or(String::new(), |n| n.to_string_lossy().into_owned());
         format!("{name}, line {}", p.line)
     }
 
     fn error(&self, p: Pos, message: impl Into<String>) -> Error {
         let mut e = Error::at(p.line, p.col, message);
-        if p.file != 0 {
-            e.file = self
-                .files
-                .get(p.file as usize)
-                .map(|f| f.0.display().to_string());
-        }
+        e.file = self.file_of(p).map(|f| f.display().to_string());
         e
     }
 
-    /// Parses a file read before; errors carry its name.
-    fn parse_file(&mut self, path: PathBuf) -> R<Vec<Stmt>> {
-        let Some(text) = self.sources.get(&path).cloned() else {
+    /// The statements of a file read before; errors carry its name.
+    fn parse_file(&mut self, path: PathBuf) -> R<Arc<Vec<Stmt>>> {
+        let Some(parsed) = self.sources.get(&path).cloned() else {
             return Err(Error::at(
                 0,
                 0,
                 format!("{} cannot be read", path.display()),
             ));
         };
-        let index = self.files.len() as u32;
-        self.files.push((path.clone(), text));
-        let text = &self.files[index as usize].1;
-        parse(text, index).map_err(|mut e| {
-            if index != 0 {
+        if self.loaded.is_empty() {
+            self.main = parsed.id;
+        }
+        self.loaded.push(path.clone());
+        let main = parsed.id == self.main;
+        parsed.stmts().map_err(|mut e| {
+            if !main {
                 e.file = Some(path.display().to_string());
             }
             e
@@ -289,17 +404,15 @@ impl Interp {
     /// A path in `include` or `use`, from the folder of the file it is in,
     /// else from the library folders: the first that was read.
     fn path_of(&self, from: Pos, path: &str) -> PathBuf {
-        let dir = self
-            .files
-            .get(from.file as usize)
-            .and_then(|f| f.0.parent())
-            .map(PathBuf::from)
+        let file = if from.file == 0 { self.main } else { from.file };
+        let dir = crate::cache::path(file)
+            .and_then(|f| f.parent().map(PathBuf::from))
             .unwrap_or_default();
         let local = crate::plain(&dir.join(path));
         if self.sources.contains_key(&local) {
             return local;
         }
-        crate::library::search()
+        self.search
             .iter()
             .map(|lib| crate::plain(&lib.join(path)))
             .find(|p| self.sources.contains_key(p))
@@ -314,18 +427,18 @@ impl Interp {
         seen.push(path.clone());
         let stmts = self.parse_file(path)?;
         let mut out = Vec::with_capacity(stmts.len());
-        for s in stmts {
+        for s in stmts.iter() {
             match s {
                 Stmt::Include(p, pos) => {
-                    let file = self.path_of(pos, &p);
+                    let file = self.path_of(*pos, p);
                     if !self.sources.contains_key(&file) {
                         return Err(
-                            self.error(pos, format!("include <{p}>: the file cannot be read"))
+                            self.error(*pos, format!("include <{p}>: the file cannot be read"))
                         );
                     }
                     out.extend(self.load(file, seen)?);
                 }
-                s => out.push(s),
+                s => out.push(s.clone()),
             }
         }
         seen.pop();
@@ -365,7 +478,7 @@ impl Interp {
         if !self.sources.contains_key(&file) {
             return Err(self.error(pos, format!("use <{path}>: the file cannot be read")));
         }
-        if self.files.iter().any(|f| f.0 == file) {
+        if self.loaded.contains(&file) {
             return Ok(());
         }
         let stmts = self.load(file, &mut Vec::new())?;
@@ -384,12 +497,12 @@ impl Interp {
         Ok(())
     }
 
-    fn find_func(&self, f: &Rc<Frame>, name: &str) -> Option<(Rc<Func>, Rc<Frame>)> {
+    fn find_func(&self, f: &Rc<Frame>, name: &str) -> Option<(Arc<Func>, Rc<Frame>)> {
         f.func(name)
             .or_else(|| self.used.iter().find_map(|u| u.func(name)))
     }
 
-    fn find_module(&self, f: &Rc<Frame>, name: &str) -> Option<(Rc<Module>, Rc<Frame>)> {
+    fn find_module(&self, f: &Rc<Frame>, name: &str) -> Option<(Arc<Module>, Rc<Frame>)> {
         f.module(name)
             .or_else(|| self.used.iter().find_map(|u| u.module(name)))
     }
@@ -400,13 +513,14 @@ impl Interp {
     fn exec(&mut self, stmts: &[Stmt], f: &Rc<Frame>, only: Option<&[usize]>) -> R<Vec<Geom>> {
         for s in stmts {
             match s {
-                Stmt::Module(n, m) => f.mods.borrow_mut().push((n.clone(), m.clone())),
-                Stmt::Function(n, d) => f.funcs.borrow_mut().push((n.clone(), d.clone())),
+                // The last definition of a name wins, as in OpenSCAD.
+                Stmt::Module(n, m) => f.mods.borrow_mut().set(n, m.clone()),
+                Stmt::Function(n, d) => f.funcs.borrow_mut().set(n, d.clone()),
                 Stmt::Use(p, pos) => self.use_file(p, *pos)?,
                 _ => {}
             }
         }
-        let mut order: Vec<(&Rc<str>, &Expr)> = Vec::new();
+        let mut order: Vec<(&Arc<str>, &Expr)> = Vec::new();
         for s in stmts {
             if let Stmt::Assign { name, value, .. } = s {
                 match order.iter_mut().find(|o| o.0 == name) {
@@ -537,9 +651,9 @@ impl Interp {
 
     fn call_module(
         &mut self,
-        name: &Rc<str>,
+        name: &Arc<str>,
         args: &[Arg],
-        children: &Rc<[Stmt]>,
+        children: &Arc<[Stmt]>,
         pos: Pos,
         f: &Rc<Frame>,
     ) -> R<Option<Geom>> {
@@ -551,9 +665,9 @@ impl Interp {
 
     fn module_call(
         &mut self,
-        name: &Rc<str>,
+        name: &Arc<str>,
         args: &[Arg],
-        children: &Rc<[Stmt]>,
+        children: &Arc<[Stmt]>,
         pos: Pos,
         f: &Rc<Frame>,
     ) -> R<Option<Geom>> {
@@ -767,10 +881,10 @@ impl Interp {
 
     fn user_module(
         &mut self,
-        def: &Rc<Module>,
+        def: &Arc<Module>,
         home: &Rc<Frame>,
         args: &[Arg],
-        children: &Rc<[Stmt]>,
+        children: &Arc<[Stmt]>,
         pos: Pos,
         f: &Rc<Frame>,
     ) -> R<Option<Geom>> {
@@ -792,7 +906,7 @@ impl Interp {
 
     fn enter(&mut self, pos: Pos) -> R<()> {
         self.depth += 1;
-        if self.depth > DEPTH {
+        if self.depth > DEPTH || crate::stack_low() {
             self.depth -= 1;
             return Err(self.error(pos, "calls go too deep: a recursion without end?"));
         }
@@ -1313,7 +1427,7 @@ impl Interp {
                 Value::Undef
             };
         }
-        let list: Vec<(Option<Rc<str>>, Value)> = a
+        let list: Vec<(Option<Arc<str>>, Value)> = a
             .pos
             .into_iter()
             .map(|v| (None, v))
@@ -1327,23 +1441,105 @@ impl Interp {
 
     fn call_func(
         &mut self,
-        def: &Rc<Func>,
+        def: &Arc<Func>,
         home: &Rc<Frame>,
         args: &[Arg],
         pos: Pos,
         f: &Rc<Frame>,
     ) -> R<Value> {
         let a = self.args(args, f)?;
-        let frame = Rc::new(Frame {
-            parent: Some(home.clone()),
-            caller: Some(f.clone()),
-            ..Frame::default()
-        });
-        self.bind(&def.params, a, &frame)?;
         self.enter(pos)?;
-        let v = self.eval(&def.body, &frame);
+        let v = self.run_func(def.clone(), home.clone(), a, f.clone());
         self.depth -= 1;
         v
+    }
+
+    /// A function's body with the arguments bound; a call in its tail
+    /// (`n == 0 ? acc : f(n - 1, acc + n)`) is run in this loop, not deeper,
+    /// as OpenSCAD runs it: a loop by recursion may take many steps.
+    fn run_func(
+        &mut self,
+        mut def: Arc<Func>,
+        mut home: Rc<Frame>,
+        mut a: Args,
+        mut caller: Rc<Frame>,
+    ) -> R<Value> {
+        let mut steps = 0usize;
+        loop {
+            let frame = Rc::new(Frame {
+                parent: Some(home),
+                caller: Some(caller),
+                ..Frame::default()
+            });
+            self.bind(&def.params, a, &frame)?;
+            match self.eval_tail(&def.body, &frame)? {
+                Tail::Value(v) => return Ok(v),
+                Tail::Call(d, h, args, at) => {
+                    steps += 1;
+                    if steps > MOST {
+                        return Err(Error::at(0, 0, "a recursion of more than a million steps"));
+                    }
+                    // Who called is where `$` names are found: the frame
+                    // of the call, unless it sets none, then who called
+                    // this function, so that a long loop is no long chain.
+                    caller = if sets_specials(&at, &frame) {
+                        at
+                    } else {
+                        frame.caller.clone().unwrap_or(at)
+                    };
+                    (def, home, a) = (d, h, args);
+                }
+            }
+        }
+    }
+
+    /// An expression in the tail of a function: its value, or the call it
+    /// ends in, with its arguments and the frame it is made in.
+    fn eval_tail(&mut self, e: &Expr, f: &Rc<Frame>) -> R<Tail> {
+        match e {
+            Expr::Ternary(c, y, n) => {
+                if self.eval(c, f)?.truthy() {
+                    self.eval_tail(y, f)
+                } else {
+                    self.eval_tail(n, f)
+                }
+            }
+            Expr::Let(args, body) => {
+                let inner = self.lets(args, f)?;
+                self.eval_tail(body, &inner)
+            }
+            Expr::Echo(args, body, pos) => {
+                let a = self.args(args, f)?;
+                self.echo(*pos, echo_text(&a));
+                self.eval_tail(body, f)
+            }
+            Expr::Assert(args, body, pos) => {
+                let a = self.args(args, f)?;
+                self.check(&a, *pos, args)?;
+                self.eval_tail(body, f)
+            }
+            Expr::Call(callee, args, _) => {
+                let def = match &**callee {
+                    Expr::Var(name, _) => match self.find_func(f, name) {
+                        Some(d) => Some(d),
+                        None if builtins::is_builtin(name) => None,
+                        None => match f.get(name) {
+                            Some(Value::Func(d, h)) => Some((d, h)),
+                            _ => None,
+                        },
+                    },
+                    _ => None,
+                };
+                match def {
+                    Some((d, h)) => {
+                        let a = self.args(args, f)?;
+                        Ok(Tail::Call(d, h, a, f.clone()))
+                    }
+                    None => self.eval(e, f).map(Tail::Value),
+                }
+            }
+            e => self.eval(e, f).map(Tail::Value),
+        }
     }
 
     /// The values an element of a list adds.
@@ -1364,7 +1560,7 @@ impl Interp {
                     // The next values one after the other, each seeing
                     // those before it; what `next` does not set stays.
                     let step = Frame::inner(f);
-                    for (name, v) in frame.vars.borrow().iter() {
+                    for (name, v) in frame.vars.borrow().list.iter() {
                         step.set(name, v.clone());
                     }
                     for a in next {

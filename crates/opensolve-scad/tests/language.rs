@@ -239,12 +239,62 @@ fn errors_and_notes_say_where() {
 
 #[test]
 fn endless_recursion_is_an_error() {
+    // In the tail, a loop: it ends after a million steps.
     let e = run_with(
         &[("main.scad", "function f(x) = f(x + 1);\ncube(f(0));")],
         &[],
     )
     .unwrap_err();
+    assert!(e.contains("more than a million"), "{e}");
+    // Not in the tail: as deep as the stack lets it go.
+    let e = run_with(
+        &[("main.scad", "function f(x) = 1 + f(x + 1);\ncube(f(0));")],
+        &[],
+    )
+    .unwrap_err();
     assert!(e.contains("too deep"), "{e}");
+    let e = run_with(&[("main.scad", "module m() m();\nm();")], &[]).unwrap_err();
+    assert!(e.contains("too deep"), "{e}");
+}
+
+#[test]
+fn recursion_as_deep_as_openscad_goes() {
+    assert_eq!(
+        echo(
+            "function f(i, acc = 0) = i == 0 ? acc : f(i - 1, acc + i);\n\
+             function g(i) = i == 0 ? 0 : 1 + g(i - 1);\n\
+             function h(i) = let (j = i - 1) i <= 0 ? \"done\" : assert(true) h(j);\n\
+             echo(f(100000), g(5000), h(20000));"
+        ),
+        "5.00005e+09, 5000, \"done\""
+    );
+}
+
+#[test]
+fn the_last_definition_wins() {
+    assert_eq!(
+        echo("function f() = 1;\nfunction f() = 2;\necho(f());"),
+        "2"
+    );
+}
+
+#[test]
+fn a_changed_included_file_is_read_again() {
+    // Files are parsed once and kept by their text: a new text counts.
+    let size = |lib: &str| {
+        let out = run_with(
+            &[
+                ("main.scad", "include <changing.scad>\ncube(size);"),
+                ("changing.scad", lib),
+            ],
+            &[],
+        )
+        .unwrap();
+        out.solid.volume()
+    };
+    assert!((size("size = 2;") - 8.0).abs() < 1e-6);
+    assert!((size("size = 3;") - 27.0).abs() < 1e-6);
+    assert!((size("size = 2;") - 8.0).abs() < 1e-6);
 }
 
 #[test]

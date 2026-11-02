@@ -1,6 +1,6 @@
 //! A parsed OpenSCAD file.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 /// Where something is: the file (an index into the files read) and line.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -13,10 +13,10 @@ pub struct Pos {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Expr {
     Num(f64),
-    Str(Rc<str>),
+    Str(Arc<str>),
     Bool(bool),
     Undef,
-    Var(Rc<str>, Pos),
+    Var(Arc<str>, Pos),
     /// `[…]`, its elements maybe comprehensions.
     List(Vec<Elem>),
     /// `[begin : step : end]`.
@@ -27,13 +27,13 @@ pub enum Expr {
     Call(Box<Expr>, Vec<Arg>, Pos),
     Index(Box<Expr>, Box<Expr>),
     /// `.x`, `.y`, `.z`.
-    Member(Box<Expr>, Rc<str>),
+    Member(Box<Expr>, Arc<str>),
     Let(Vec<Arg>, Box<Expr>),
     /// `echo(…) expr` and `assert(…) expr`.
     Echo(Vec<Arg>, Box<Expr>, Pos),
     Assert(Vec<Arg>, Box<Expr>, Pos),
     /// `function (params) body`.
-    Lambda(Rc<Func>),
+    Lambda(Arc<Func>),
 }
 
 /// An element of a list.
@@ -51,7 +51,7 @@ pub enum Elem {
 /// An argument, named or not; also a parameter with its default.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Arg {
-    pub name: Option<Rc<str>>,
+    pub name: Option<Arc<str>>,
     pub value: Option<Expr>,
 }
 
@@ -70,7 +70,7 @@ pub struct Module {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Stmt {
     Assign {
-        name: Rc<str>,
+        name: Arc<str>,
         value: Expr,
         pos: Pos,
         /// The value's text in its file, in bytes, and the end of the line
@@ -78,24 +78,24 @@ pub enum Stmt {
         span: (usize, usize),
         end_line: u32,
     },
-    Module(Rc<str>, Rc<Module>),
-    Function(Rc<str>, Rc<Func>),
+    Module(Arc<str>, Arc<Module>),
+    Function(Arc<str>, Arc<Func>),
     /// A module called, with its children.
     Call {
-        name: Rc<str>,
+        name: Arc<str>,
         args: Vec<Arg>,
-        children: Rc<[Stmt]>,
+        children: Arc<[Stmt]>,
         modifier: Modifier,
         pos: Pos,
     },
     If {
         cond: Expr,
-        then: Rc<[Stmt]>,
-        or: Rc<[Stmt]>,
+        then: Arc<[Stmt]>,
+        or: Arc<[Stmt]>,
         modifier: Modifier,
     },
     /// `{ … }` on its own.
-    Block(Rc<[Stmt]>),
+    Block(Arc<[Stmt]>),
     /// `include <…>`, until the loader puts the file's statements here.
     Include(String, Pos),
     Use(String, Pos),
