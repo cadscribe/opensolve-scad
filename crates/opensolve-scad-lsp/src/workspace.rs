@@ -63,6 +63,8 @@ pub struct Completion {
     pub doc: String,
     /// What it replaces: the word typed so far.
     pub replace: Range<usize>,
+    /// What takes its place: the label, or `d = ` for a parameter's name.
+    pub insert: String,
 }
 
 /// What hover shows: Markdown.
@@ -436,11 +438,27 @@ impl Workspace {
         let fits = |name: &str| name.to_lowercase().starts_with(&typed.to_lowercase());
         let mut out: Vec<Completion> = Vec::new();
         let mut names = HashSet::new();
+        // In a call's arguments: its parameters' names where an argument
+        // starts, and no modules, which are no values.
+        let call = call_at(text, start);
         let mut add = |c: Completion| {
-            if fits(&c.label) && names.insert((c.label.clone(), c.kind)) {
+            let module = c.kind == CompletionKind::Module && call.is_some();
+            if !module && fits(&c.label) && names.insert((c.label.clone(), c.kind)) {
                 out.push(c);
             }
         };
+        if let Some(call) = call.as_ref().filter(|c| c.at_name) {
+            for (name, detail) in self.call_parameters(path, text, call) {
+                add(Completion {
+                    insert: format!("{name} = "),
+                    label: name,
+                    kind: CompletionKind::Parameter,
+                    detail,
+                    doc: String::new(),
+                    replace: replace.clone(),
+                });
+            }
+        }
         let defs = locals(&p.tree, text, offset)
             .into_iter()
             .map(|d| (d, plain(path)))
@@ -458,6 +476,7 @@ impl Workspace {
                     DefKind::Variable => CompletionKind::Variable,
                     DefKind::Parameter => CompletionKind::Parameter,
                 },
+                insert: d.name.clone(),
                 detail: d.signature,
                 doc: d.doc,
                 replace: replace.clone(),
@@ -493,8 +512,10 @@ impl Workspace {
             if name.starts_with('.') || !(is_dir || scad) || !name.starts_with(name_part) {
                 continue;
             }
+            let label = if is_dir { format!("{name}/") } else { name };
             out.push(Completion {
-                label: if is_dir { format!("{name}/") } else { name },
+                insert: label.clone(),
+                label,
                 kind: CompletionKind::File,
                 detail: String::new(),
                 doc: String::new(),
@@ -557,9 +578,92 @@ impl Workspace {
     }
 }
 
+/// The call whose arguments a place is in, found in the text: the tree of
+/// a call still being typed is broken.
+#[derive(Debug)]
+struct Call {
+    /// Its name.
+    name: Range<usize>,
+    /// Its arguments before the place.
+    args: Range<usize>,
+    /// The place starts an argument: a parameter's name may go there.
+    at_name: bool,
+}
+
+/// The call whose open parenthesis is before `offset`, if any.
+fn call_at(text: &str, offset: usize) -> Option<Call> {
+    let mut depth = 0usize;
+    let mut arg_start = None;
+    for (i, c) in text[..offset].char_indices().rev() {
+        match c {
+            ')' | ']' | '}' => depth += 1,
+            '[' | '{' if depth > 0 => depth -= 1,
+            '(' if depth > 0 => depth -= 1,
+            ',' if depth == 0 => {
+                arg_start.get_or_insert(i + 1);
+            }
+            '(' => {
+                let before = text[..i].trim_end();
+                let name_start = before
+                    .char_indices()
+                    .rev()
+                    .take_while(|(_, c)| is_word(*c))
+                    .last()
+                    .map_or(before.len(), |(j, _)| j);
+                let name = name_start..before.len();
+                let word = &text[name.clone()];
+                let keyword = matches!(word, "if" | "for" | "let" | "each" | "assert" | "echo");
+                if word.is_empty() || keyword || word.starts_with(|c: char| c.is_ascii_digit()) {
+                    return None;
+                }
+                let from = arg_start.unwrap_or(i + 1);
+                return Some(Call {
+                    name,
+                    args: i + 1..offset,
+                    at_name: text[from..offset].trim().is_empty(),
+                });
+            }
+            ';' | '[' | '{' => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+impl Workspace {
+    /// The parameters of `call` not given by name yet: their names and how
+    /// the signature writes them (`h = 1`).
+    fn call_parameters(&self, path: &Path, text: &str, call: &Call) -> Vec<(String, String)> {
+        let name = &text[call.name.clone()];
+        let signature = match self.resolve(path, call.name.end) {
+            Some((Resolved::User(d, _), _)) => Some(d.signature),
+            Some((Resolved::Builtin(b), _)) => Some(b.signature.to_string()),
+            None => builtin(name).map(|b| b.signature.to_string()).or_else(|| {
+                self.visible(path)
+                    .into_iter()
+                    .map(|(d, _)| d)
+                    .find(|d| d.name == name && d.kind != DefKind::Variable)
+                    .map(|d| d.signature)
+            }),
+        };
+        let given = &text[call.args.clone()];
+        parameters(&signature.unwrap_or_default())
+            .into_iter()
+            .filter_map(|p| {
+                let n = p.split('=').next().unwrap_or("").trim().to_string();
+                let named = given
+                    .split(',')
+                    .any(|a| a.split('=').next().is_some_and(|x| x.trim() == n) && a.contains('='));
+                (!n.is_empty() && !named).then_some((n, p))
+            })
+            .collect()
+    }
+}
+
 fn builtin_completion(b: &Builtin, replace: Range<usize>) -> Completion {
     Completion {
         label: b.name.to_string(),
+        insert: b.name.to_string(),
         kind: match b.kind {
             BuiltinKind::Module => CompletionKind::Module,
             BuiltinKind::Function => CompletionKind::Function,

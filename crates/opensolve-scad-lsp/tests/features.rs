@@ -182,3 +182,35 @@ fn symbols_and_signatures() {
     assert_eq!(sig.active, 0);
     assert!(sig.label.starts_with("cube("));
 }
+
+#[test]
+fn in_a_call_the_parameters_are_offered_and_no_modules() {
+    let text = "module peg(h = 2, d) {}\ncube(4);\ncylinder(d\npeg(h = 3, \n";
+    let mut w = workspace(&[]);
+    w.set(main_path(), text.to_string());
+    let at = after(text, "cylinder(d");
+    let items = w.completion(main_path(), at);
+    assert_eq!(items[0].label, "d", "{items:?}");
+    assert_eq!(items[0].kind, CompletionKind::Parameter);
+    assert_eq!(items[0].insert, "d = ");
+    assert_eq!(items[0].replace, at - 1..at);
+    assert!(items.iter().any(|c| c.label == "d1"));
+    assert!(
+        !items.iter().any(|c| c.label == "difference"),
+        "a module is no value: {items:?}"
+    );
+    // A user module's, without the one given by name already.
+    let at = after(text, "peg(h = 3, ");
+    let items = w.completion(main_path(), at);
+    let params: Vec<&str> = items
+        .iter()
+        .filter(|c| c.kind == CompletionKind::Parameter)
+        .map(|c| c.label.as_str())
+        .collect();
+    assert_eq!(params, ["d"], "{items:?}");
+    // After `=` a value goes: no names.
+    let text = "cylinder(h = ";
+    w.set(main_path(), text.to_string());
+    let items = w.completion(main_path(), text.len());
+    assert!(!items.iter().any(|c| c.kind == CompletionKind::Parameter));
+}

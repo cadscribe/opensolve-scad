@@ -229,7 +229,7 @@ impl Server {
                     "documentation": { "kind": "markdown", "value": c.doc },
                     "textEdit": {
                         "range": self.range_json(&path, &c.replace),
-                        "newText": c.label,
+                        "newText": c.insert,
                     },
                 })
             })
