@@ -502,6 +502,15 @@ impl Solid {
         s
     }
 
+    /// The solid ready for booleans: the library's mesh of it made now and
+    /// kept, so that many booleans with it make it once.
+    pub fn prepared(&self) -> Result<Solid, Error> {
+        Ok(Solid {
+            mesh: Some(self.manifold()?),
+            ..self.clone()
+        })
+    }
+
     fn manifold(&self) -> Result<Arc<Manifold<Tag>>, Error> {
         if let Some(m) = &self.mesh {
             return Ok(m.clone());
