@@ -61,13 +61,17 @@ newest from 2026-10-08).
 - tree-sitter is C, so it stays out of the crates built for wasm32
   (`make wasm`): `opensolve-scad` stays pure Rust; the language server and
   the app's editor are native only.
-- The editor in the app (`scad_editor.rs`): a window of its own over the
-  part, with OpenCAD's tokens for its colours in light and dark, line
-  numbers, the diagnostics as squiggles, gutter marks and a list of
-  problems, completion, hover, go to definition (also into included files,
-  as tabs), find, undo and redo, and Cmd/Ctrl+S to save. On saving it reads
-  the links of that file again at once and tells the watcher of linked
-  files (ADR 0011) the new time, so that a save rebuilds once.
+- The editor in the app (`scad_editor.rs`): a panel beside the part (egui's
+  text field with a layouter), with OpenCAD's tokens for its colours in
+  light and dark, line numbers, the diagnostics as squiggles, gutter marks
+  and a list of problems, completion (Ctrl+Space, or while typing a name),
+  hover, go to definition (Cmd+click or F12, also into included and used
+  files, as tabs), find (Cmd+F), undo and redo of its own (quick edits as
+  one step; the menu's Undo, Redo and Save go to the editor while it is
+  typed in), and Cmd/Ctrl+S to save. A file changed on the disk and not
+  in the editor is read again. On saving it reads the links of that file
+  again at once and gives the watcher of linked files (ADR 0011) the new
+  times, so that a save rebuilds once.
 - The choice at the part: a link to a `.scad` file has a setting how to edit
   it: the editor in the app (the default), OpenSCAD (when installed), the
   system's app for the file, or a command (`code {file}`; `{file}` is the
