@@ -506,9 +506,20 @@ impl Solid {
         if let Some(m) = &self.mesh {
             return Ok(m.clone());
         }
-        let pos: Vec<f64> = self.points.iter().flatten().copied().collect();
-        let idx: Vec<usize> = self.tris.iter().flatten().map(|&i| i as usize).collect();
-        let vals: Vec<Tag> = self
+        // The library welds corners by their place: parts that touch
+        // along an edge would make an edge of four triangles, which it
+        // cannot take (it panics). Such parts are moved apart a hair.
+        let parted;
+        let me = match self.parted() {
+            Some(p) => {
+                parted = p;
+                &parted
+            }
+            None => self,
+        };
+        let pos: Vec<f64> = me.points.iter().flatten().copied().collect();
+        let idx: Vec<usize> = me.tris.iter().flatten().map(|&i| i as usize).collect();
+        let vals: Vec<Tag> = me
             .facets
             .iter()
             .flat_map(|&f| std::iter::repeat_n(Tag(f64::from(f)), 3))
@@ -518,8 +529,145 @@ impl Solid {
             .map_err(Error::Boolean)
     }
 
+    /// The solid with the parts that meet along an edge moved apart, each
+    /// shrunk towards its middle by a hair (a ten-millionth of a micrometre
+    /// for a part of 10 mm); `None` if no edge has more than two
+    /// triangles once corners at one place are one.
+    fn parted(&self) -> Option<Solid> {
+        let n = self.points.len();
+        let mut weld: HashMap<[u64; 3], u32> = HashMap::with_capacity(n);
+        let at: Vec<u32> = self
+            .points
+            .iter()
+            .map(|p| {
+                let k = weld.len() as u32;
+                *weld.entry(p.map(f64::to_bits)).or_insert(k)
+            })
+            .collect();
+        let key = |a: u32, b: u32| if a < b { (a, b) } else { (b, a) };
+        let mut uses: HashMap<(u32, u32), u32> = HashMap::with_capacity(self.tris.len() * 3 / 2);
+        for t in &self.tris {
+            for k in 0..3 {
+                *uses
+                    .entry(key(at[t[k] as usize], at[t[(k + 1) % 3] as usize]))
+                    .or_default() += 1;
+            }
+        }
+        if uses.values().all(|&u| u <= 2) {
+            return None;
+        }
+        // The parts: triangles joined across an edge of exactly two, by
+        // the solid's own corners.
+        let mut own: HashMap<(u32, u32), u32> = HashMap::with_capacity(self.tris.len() * 3 / 2);
+        for t in &self.tris {
+            for k in 0..3 {
+                *own.entry(key(t[k], t[(k + 1) % 3])).or_default() += 1;
+            }
+        }
+        let mut parent: Vec<usize> = (0..self.tris.len()).collect();
+        fn root(p: &mut [usize], mut i: usize) -> usize {
+            while p[i] != i {
+                p[i] = p[p[i]];
+                i = p[i];
+            }
+            i
+        }
+        let mut first: HashMap<(u32, u32), usize> = HashMap::new();
+        for (i, t) in self.tris.iter().enumerate() {
+            for k in 0..3 {
+                let e = key(t[k], t[(k + 1) % 3]);
+                let welded = key(at[t[k] as usize], at[t[(k + 1) % 3] as usize]);
+                if own[&e] != 2 || uses[&welded] != 2 {
+                    continue;
+                }
+                match first.get(&e) {
+                    Some(&j) => {
+                        let (a, b) = (root(&mut parent, i), root(&mut parent, j));
+                        parent[a] = b;
+                    }
+                    None => {
+                        first.insert(e, i);
+                    }
+                }
+            }
+        }
+        // A corner goes with the part of its first triangle; one shared by
+        // parts is copied.
+        let mut out = Solid {
+            points: Vec::with_capacity(n),
+            tris: Vec::with_capacity(self.tris.len()),
+            facets: self.facets.clone(),
+            mesh: None,
+        };
+        let mut copy: HashMap<(u32, usize), u32> = HashMap::with_capacity(n);
+        let mut part_of_point: Vec<usize> = Vec::with_capacity(n);
+        for i in 0..self.tris.len() {
+            let part = root(&mut parent, i);
+            let t = self.tris[i].map(|v| {
+                *copy.entry((v, part)).or_insert_with(|| {
+                    out.points.push(self.points[v as usize]);
+                    part_of_point.push(part);
+                    out.points.len() as u32 - 1
+                })
+            });
+            out.tris.push(t);
+        }
+        let mut boxes: HashMap<usize, ([f64; 3], [f64; 3])> = HashMap::new();
+        for (p, &part) in out.points.iter().zip(&part_of_point) {
+            let b = boxes.entry(part).or_insert((*p, *p));
+            for (k, x) in p.iter().enumerate() {
+                b.0[k] = b.0[k].min(*x);
+                b.1[k] = b.1[k].max(*x);
+            }
+        }
+        for (p, part) in out.points.iter_mut().zip(&part_of_point) {
+            let (lo, hi) = boxes[part];
+            for k in 0..3 {
+                let mid = (lo[k] + hi[k]) / 2.0;
+                p[k] = mid + (p[k] - mid) * (1.0 - 1e-10);
+            }
+        }
+        Some(out)
+    }
+
+    /// A copy scaled by `1 + k` about the middle of its box, on facets
+    /// moved as well: what a boolean the library panics on is tried with
+    /// again.
+    fn nudged(&self, k: f64, facets: &mut Facets) -> Solid {
+        let Some((lo, hi)) = self.bounds() else {
+            return self.clone();
+        };
+        let mid: [f64; 3] = std::array::from_fn(|i| (lo[i] + hi[i]) / 2.0);
+        let at = |p: [f64; 3]| -> [f64; 3] {
+            std::array::from_fn(|i| mid[i] + (p[i] - mid[i]) * (1.0 + k))
+        };
+        let mut moved: HashMap<u32, u32> = HashMap::new();
+        let facets_of = self
+            .facets
+            .iter()
+            .map(|&f| {
+                *moved.entry(f).or_insert_with(|| {
+                    let x = facets.get(f);
+                    let on = at(x.normal.map(|n| n * x.offset));
+                    facets.add(x.face, x.normal, on)
+                })
+            })
+            .collect();
+        Solid {
+            points: self.points.iter().map(|p| at(*p)).collect(),
+            tris: self.tris.clone(),
+            facets: facets_of,
+            mesh: None,
+        }
+    }
+
     /// The boolean of two solids. What a cut leaves of the cutter faces the
     /// other way: such triangles get a facet turned round, of the same face.
+    ///
+    /// Where the library panics (on a result with an edge of more than two
+    /// triangles, as where two cutters meet along an edge), the boolean is
+    /// tried again with the other solid a millionth larger, then smaller,
+    /// then this one larger: a sliver of that width is the difference.
     pub fn boolean(&self, other: &Solid, op: Op, facets: &mut Facets) -> Result<Solid, Error> {
         if self.is_empty() || other.is_empty() {
             return Ok(match op {
@@ -528,21 +676,34 @@ impl Solid {
                 Op::Intersect => Solid::default(),
             });
         }
-        let kind = match op {
+        let kind = || match op {
             Op::Add => OpType::Add,
             Op::Subtract => OpType::Subtract,
             Op::Intersect => OpType::Intersect,
         };
         // The library can panic on an index; a failed feature must not take
         // the app with it.
-        let result = catch_unwind(AssertUnwindSafe(
-            || -> Result<Result<Manifold<Tag>, String>, Error> {
-                let (a, b) = (self.manifold()?, other.manifold()?);
-                Ok(compute_boolean(&a, &b, kind))
-            },
-        ))
-        .map_err(|_| Error::Boolean("the mesh library panicked".to_string()))??;
-        match result {
+        let run = |a: &Solid, b: &Solid| {
+            catch_unwind(AssertUnwindSafe(
+                || -> Result<Result<Manifold<Tag>, String>, Error> {
+                    let (a, b) = (a.manifold()?, b.manifold()?);
+                    Ok(compute_boolean(&a, &b, kind()))
+                },
+            ))
+            .map_err(|_| Error::Boolean("the mesh library panicked".to_string()))
+        };
+        let mut result = run(self, other);
+        for (which, k) in [(1, 1e-6), (1, -1e-6), (0, 1e-6)] {
+            if result.is_ok() {
+                break;
+            }
+            result = if which == 1 {
+                run(self, &other.nudged(k, facets))
+            } else {
+                run(&self.nudged(k, facets), other)
+            };
+        }
+        match result?? {
             Ok(m) => Ok(Solid::from_manifold(m, facets)),
             // Nothing is left: the library has no empty mesh.
             Err(e) if e.contains("empty") => Ok(Solid::default()),
@@ -1121,6 +1282,46 @@ mod tests {
             s.volume() > 0.95 * exact && s.volume() < exact,
             "{}",
             s.volume()
+        );
+    }
+
+    #[test]
+    fn parts_that_meet_along_an_edge_are_cut_and_cut_from() {
+        // Two blocks that share only an edge: welded, an edge of four
+        // triangles, on which the library panics as input and as result.
+        let mut f = Facets::default();
+        let a = block(&mut f, rect(0.0, 0.0, 10.0, 10.0), 0.0, 10.0, 0);
+        let b = block(&mut f, rect(10.0, 0.0, 20.0, 10.0), 10.0, 20.0, 2000);
+        let both = Solid::merged(&[a.clone(), b.clone()]);
+        let big = block(&mut f, rect(-5.0, -5.0, 25.0, 15.0), -5.0, 25.0, 4000);
+        let r = big.boolean(&both, Op::Subtract, &mut f).unwrap();
+        assert!(r.is_closed());
+        assert!(
+            (r.volume() - (30.0 * 20.0 * 30.0 - 2000.0)).abs() < 1e-2,
+            "{}",
+            r.volume()
+        );
+        // As a cut away, one after the other.
+        let r = big
+            .boolean(&a, Op::Subtract, &mut f)
+            .unwrap()
+            .boolean(&b, Op::Subtract, &mut f)
+            .unwrap();
+        assert!(
+            (r.volume() - (30.0 * 20.0 * 30.0 - 2000.0)).abs() < 1e-2,
+            "{}",
+            r.volume()
+        );
+        // Their union, read again (as after a move), cut from.
+        let u = a.boolean(&b, Op::Add, &mut f).unwrap();
+        let mut g = Facets::default();
+        let u = u.rehome(&f, &mut g);
+        let big = big.rehome(&f, &mut g);
+        let r = big.boolean(&u, Op::Subtract, &mut g).unwrap();
+        assert!(
+            (r.volume() - (30.0 * 20.0 * 30.0 - 2000.0)).abs() < 1e-2,
+            "{}",
+            r.volume()
         );
     }
 

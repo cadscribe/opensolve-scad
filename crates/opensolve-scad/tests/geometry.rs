@@ -112,6 +112,28 @@ fn booleans() {
 }
 
 #[test]
+fn cutters_that_meet_along_an_edge() {
+    // Two cutters meet along an edge of the result: an edge of four
+    // triangles, on which the mesh library panicked. OpenSCAD: 250000.
+    near(
+        volume(
+            "difference() { translate([-50, 0, -50]) cube([100, 50, 100]);\n\
+             translate([0, -10, 0]) { rotate([0, -30, 0]) translate([-300, 0, 0]) cube([300, 70, 300]);\n\
+             rotate([0, 40, 0]) cube([300, 70, 300]); } }",
+        ),
+        250_000.0,
+    );
+    // Parts joined along an edge, moved, and cut from.
+    near(
+        volume(
+            "difference() { translate([-5, -5, -5]) cube([30, 20, 30]);\n\
+             translate([1, 0, 0]) union() { cube(10); translate([10, 0, 10]) cube(10); } }",
+        ),
+        18_000.0 - 2000.0,
+    );
+}
+
+#[test]
 fn transformations_keep_or_scale_volumes() {
     near(volume("rotate([30, 45, 60]) cube(2);"), 8.0);
     near(volume("rotate(45, [1, 1, 0]) cube(2);"), 8.0);

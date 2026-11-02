@@ -1208,7 +1208,16 @@ impl Interp {
                 );
                 Ok(opensolve_kernel::Solid::merged(&[a.clone(), b.clone()]))
             }
-            Err(e) => Err(self.error(pos.unwrap_or_default(), e)),
+            // One that fails is left out, not the whole file.
+            Err(e) => {
+                let what = if op == Op::Subtract {
+                    "difference: a cut is left out"
+                } else {
+                    "intersection: a shape is left out"
+                };
+                self.note(pos, format!("{what} ({e})"));
+                Ok(a.clone())
+            }
         }
     }
 
@@ -1232,9 +1241,17 @@ impl Interp {
             }
         }
         if op == Op::Subtract {
-            // All that is cut away at once: much faster than one by one.
-            if let Some(cut) = self.join(others, flat, Some(pos))? {
-                acc = self.boolean(&acc, &cut, op, flat, Some(pos))?;
+            // All that is cut away at once: much faster than one by one;
+            // where that fails, one by one.
+            if let Some(cut) = self.join(others.clone(), flat, Some(pos))? {
+                match self.geo.boolean(&acc, &cut, op, flat) {
+                    Ok(s) => acc = s,
+                    Err(_) => {
+                        for s in &others {
+                            acc = self.boolean(&acc, s, op, flat, Some(pos))?;
+                        }
+                    }
+                }
             }
         } else {
             for s in &others {
