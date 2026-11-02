@@ -6,11 +6,15 @@
 
 mod ast;
 mod builtins;
+mod cache;
 mod customizer;
 mod eval;
 mod geom;
 mod lexer;
+pub mod library;
 mod parser;
+mod region;
+mod trig;
 mod value;
 
 use std::collections::HashMap;
@@ -163,29 +167,57 @@ pub fn includes(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Reads a file and, as far as they can be read, those it names.
-fn gather(
+/// The files read, each parsed once (see [`cache`]).
+type Sources = HashMap<PathBuf, std::sync::Arc<cache::Parsed>>;
+
+/// Reads a file and, as far as they can be read, those it names: from
+/// the folder of the file that names them, else from the library folders.
+fn gather(path: &Path, read: Reader<'_>, sources: &mut Sources) -> Result<(), String> {
+    gather_in(path, read, sources, &library::search())
+}
+
+fn gather_in(
     path: &Path,
     read: Reader<'_>,
-    sources: &mut HashMap<PathBuf, String>,
+    sources: &mut Sources,
+    search: &[PathBuf],
 ) -> Result<(), String> {
     if sources.contains_key(path) {
         return Ok(());
     }
-    let bytes = read(path)?;
-    let text = String::from_utf8_lossy(&bytes).into_owned();
+    let bytes = match read(path) {
+        Ok(b) => b,
+        Err(e) if search.iter().any(|d| path.starts_with(d)) => {
+            library::read(path).map_err(|_| e)?
+        }
+        Err(e) => return Err(e),
+    };
+    let text = String::from_utf8(bytes)
+        .unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned());
+    let parsed = cache::file(path, text);
     let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
-    let named = includes(&text);
-    sources.insert(path.to_path_buf(), text);
-    for p in named {
-        let _ = gather(&plain(&dir.join(p)), read, sources);
+    sources.insert(path.to_path_buf(), parsed.clone());
+    for p in &parsed.includes {
+        let local = plain(&dir.join(p));
+        if gather_in(&local, read, sources, search).is_ok() || Path::new(p).is_absolute() {
+            continue;
+        }
+        let found = search
+            .iter()
+            .any(|lib| gather_in(&plain(&lib.join(p)), read, sources, search).is_ok());
+        if !found && Path::new(p).starts_with(library::BUNDLED) {
+            library::ensure_bundled();
+            if let Some(own) = library::own_dir() {
+                let _ = gather_in(&plain(&own.join(p)), read, sources, search);
+            }
+        }
     }
     Ok(())
 }
 
 fn evaluate(
     path: PathBuf,
-    sources: HashMap<PathBuf, String>,
+    sources: Sources,
     overrides: &[(String, String)],
 ) -> Result<Output, String> {
     let mut it = eval::Interp::new(sources);
@@ -239,6 +271,30 @@ fn override_values(
 #[cfg(not(target_arch = "wasm32"))]
 const STACK: usize = 256 << 20;
 
+/// So much of the stack is kept free: deeper calls end the evaluation
+/// with an error rather than the program.
+#[cfg(not(target_arch = "wasm32"))]
+const RESERVE: usize = 48 << 20;
+
+thread_local! {
+    /// Where the stack of the evaluation's thread began, about.
+    static BASE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether the stack is used up but its reserve: calls must go no deeper.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn stack_low() -> bool {
+    let here = 0u8;
+    let at = std::ptr::addr_of!(here) as usize;
+    let base = BASE.with(std::cell::Cell::get);
+    base != 0 && base.saturating_sub(at) > STACK - RESERVE
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn stack_low() -> bool {
+    false
+}
+
 /// Runs `f` on a thread of its own with a large stack.
 #[cfg(not(target_arch = "wasm32"))]
 fn deep<T: Send>(f: impl FnOnce() -> T + Send) -> Result<T, String> {
@@ -246,7 +302,11 @@ fn deep<T: Send>(f: impl FnOnce() -> T + Send) -> Result<T, String> {
         let h = std::thread::Builder::new()
             .name("openscad".into())
             .stack_size(STACK)
-            .spawn_scoped(s, f)
+            .spawn_scoped(s, || {
+                let here = 0u8;
+                BASE.with(|b| b.set(std::ptr::addr_of!(here) as usize));
+                f()
+            })
             .map_err(|e| e.to_string())?;
         h.join().map_err(|_| "the evaluation failed".to_string())
     })

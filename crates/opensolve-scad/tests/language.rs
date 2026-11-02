@@ -102,7 +102,7 @@ fn list_comprehensions() {
     );
     assert_eq!(
         echo("echo([for (i = 0, s = 0; i < 4; i = i + 1, s = s + i) s]);"),
-        "[0, 0, 1, 3]"
+        "[0, 1, 3, 6]"
     );
     assert_eq!(
         echo("echo([each [1, 2], each [5:7], for (x = [1, 2]) let (y = x * 10) y]);"),
@@ -214,10 +214,7 @@ fn errors_and_notes_say_where() {
     let e = run_with(&[("main.scad", "cube(1);\nsphere(2\n")], &[]).unwrap_err();
     assert!(e.starts_with("line 3, column 1:"), "{e}");
     let out = run_with(
-        &[(
-            "main.scad",
-            "cube(size);\nminkowski() { cube(1); sphere(1); }\nfoo();",
-        )],
+        &[("main.scad", "cube(size);\nsurface(\"a.png\");\nfoo();")],
         &[],
     )
     .unwrap();
@@ -229,7 +226,7 @@ fn errors_and_notes_say_where() {
     );
     assert!(
         out.notes
-            .contains(&"line 2: not supported: minkowski".to_string())
+            .contains(&"line 2: not supported: surface".to_string())
     );
     assert!(
         out.notes
@@ -239,12 +236,89 @@ fn errors_and_notes_say_where() {
 
 #[test]
 fn endless_recursion_is_an_error() {
+    // In the tail, a loop: it ends after a million steps.
     let e = run_with(
         &[("main.scad", "function f(x) = f(x + 1);\ncube(f(0));")],
         &[],
     )
     .unwrap_err();
+    assert!(e.contains("more than a million"), "{e}");
+    // Not in the tail: as deep as the stack lets it go.
+    let e = run_with(
+        &[("main.scad", "function f(x) = 1 + f(x + 1);\ncube(f(0));")],
+        &[],
+    )
+    .unwrap_err();
     assert!(e.contains("too deep"), "{e}");
+    let e = run_with(&[("main.scad", "module m() m();\nm();")], &[]).unwrap_err();
+    assert!(e.contains("too deep"), "{e}");
+}
+
+#[test]
+fn recursion_as_deep_as_openscad_goes() {
+    assert_eq!(
+        echo(
+            "function f(i, acc = 0) = i == 0 ? acc : f(i - 1, acc + i);\n\
+             function g(i) = i == 0 ? 0 : 1 + g(i - 1);\n\
+             function h(i) = let (j = i - 1) i <= 0 ? \"done\" : assert(true) h(j);\n\
+             echo(f(100000), g(5000), h(20000));"
+        ),
+        "5.00005e+09, 5000, \"done\""
+    );
+}
+
+#[test]
+fn children_counts_where_it_is_written() {
+    // `$children` is the module's whose body it is in; other `$` names
+    // come from who called.
+    assert_eq!(
+        echoes(
+            "module wrap() { $x = \"wrap\"; children(); }\n\
+             module outer() { $x = \"outer\"; wrap() echo($children, $x); }\n\
+             outer() { cube(1); cube(2); cube(3); }"
+        ),
+        ["3, \"wrap\""]
+    );
+}
+
+#[test]
+fn random_numbers_as_openscad_draws_them() {
+    // With a seed, OpenSCAD's numbers; a seed that is no whole number and
+    // a seed given by name count too.
+    assert_eq!(
+        echo(
+            "echo(rands(0, 1, 3, 42), rands(0, 10, 2, seed = 7), rands(10, 20, 2, 915.474), rands(0, 1, 2, -3.5));"
+        ),
+        "[0.796543, 0.183435, 0.779691], [2.27339, 3.18972], [15.7865, 19.0684], \
+         [0.0238099, 0.0774603]"
+    );
+}
+
+#[test]
+fn the_last_definition_wins() {
+    assert_eq!(
+        echo("function f() = 1;\nfunction f() = 2;\necho(f());"),
+        "2"
+    );
+}
+
+#[test]
+fn a_changed_included_file_is_read_again() {
+    // Files are parsed once and kept by their text: a new text counts.
+    let size = |lib: &str| {
+        let out = run_with(
+            &[
+                ("main.scad", "include <changing.scad>\ncube(size);"),
+                ("changing.scad", lib),
+            ],
+            &[],
+        )
+        .unwrap();
+        out.solid.volume()
+    };
+    assert!((size("size = 2;") - 8.0).abs() < 1e-6);
+    assert!((size("size = 3;") - 27.0).abs() < 1e-6);
+    assert!((size("size = 2;") - 8.0).abs() < 1e-6);
 }
 
 #[test]
@@ -271,6 +345,40 @@ fn include_and_use_from_the_files_folder() {
     assert!((out.solid.volume() - 729.0).abs() < 1e-6);
     let e = run_with(&[("main.scad", "include <gone.scad>\ncube(1);")], &[]).unwrap_err();
     assert!(e.contains("gone.scad"), "{e}");
+}
+
+#[test]
+fn includes_are_found_in_the_library_folders() {
+    // Beside the file first, then in the library folders in their order.
+    let root = std::env::temp_dir().join(format!("opensolve-libs-{}", std::process::id()));
+    let (first, second) = (root.join("first"), root.join("second"));
+    for (dir, size) in [(&first, 2), (&second, 3)] {
+        std::fs::create_dir_all(dir.join("mylib")).unwrap();
+        std::fs::write(dir.join("mylib/sizes.scad"), format!("size = {size};")).unwrap();
+        std::fs::write(dir.join("mylib/only.scad"), format!("other = {size};")).unwrap();
+    }
+    std::fs::remove_file(first.join("mylib/only.scad")).unwrap();
+    opensolve_scad::library::set_dirs(Some(vec![first, second]));
+    let main =
+        "include <mylib/sizes.scad>\ninclude <mylib/only.scad>\necho(size, other);\ncube(1);";
+    let out = run_with(&[("main.scad", main)], &[]).unwrap();
+    assert!(
+        out.notes.contains(&"ECHO: 2, 3".to_string()),
+        "{:?}",
+        out.notes
+    );
+    let out = run_with(
+        &[("main.scad", main), ("mylib/sizes.scad", "size = 7;")],
+        &[],
+    )
+    .unwrap();
+    assert!(
+        out.notes.contains(&"ECHO: 7, 3".to_string()),
+        "{:?}",
+        out.notes
+    );
+    opensolve_scad::library::set_dirs(None);
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[test]

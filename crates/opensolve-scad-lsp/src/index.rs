@@ -67,7 +67,167 @@ pub fn index(tree: &Tree, text: &str) -> FileIndex {
             _ => out.defs.extend(item_defs(node, text)),
         }
     }
+    // A library's documentation blocks, as BOSL2 writes them, say more than
+    // the comment just above a definition.
+    if text.contains("// Module: ") || text.contains("// Function") {
+        let docs = library_docs(text);
+        for d in &mut out.defs {
+            if let Some(doc) = docs.get(&d.name) {
+                d.doc.clone_from(doc);
+            }
+        }
+    }
     out
+}
+
+/// The heads of BOSL2's documentation blocks, and what the names after
+/// them are.
+const HEADS: [&str; 5] = [
+    "// Function&Module: ",
+    "// Module: ",
+    "// Function: ",
+    "// Constant: ",
+    "// Constants: ",
+];
+
+/// The documentation blocks of a library in BOSL2's way, as Markdown by
+/// the names they document:
+///
+/// ```text
+/// // Module: cuboid()
+/// // Synopsis: Creates a cube with chamfering and roundovers.
+/// // Usage: Standard Cubes
+/// //   cuboid(size, [anchor=], [spin=], [orient=]);
+/// // Description:
+/// //   Creates a cube or cuboid object, …
+/// // Arguments:
+/// //   size = The size of the cube, a number or length 3 vector.
+/// ```
+///
+/// The synopsis, the usages as code, the description and the arguments
+/// as a list; not the examples, topics and the like.
+pub fn library_docs(text: &str) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    let lines: Vec<&str> = text.lines().collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let Some(head) = HEADS.iter().find(|h| lines[i].starts_with(**h)) else {
+            i += 1;
+            continue;
+        };
+        let names: Vec<String> = lines[i][head.len()..]
+            .split(',')
+            .map(|n| n.split('(').next().unwrap_or("").trim().to_string())
+            .filter(|n| !n.is_empty() && !n.contains(' '))
+            .collect();
+        i += 1;
+        // Sections: a key at the start (`// Usage: Title`) and the lines
+        // indented under it.
+        let mut sections: Vec<(String, String, Vec<String>)> = Vec::new();
+        while i < lines.len() && lines[i].starts_with("//") {
+            let body = &lines[i][2..];
+            let indented = body.starts_with("  ") || body.trim().is_empty();
+            if !indented && let Some((key, rest)) = body.trim().split_once(':') {
+                sections.push((key.trim().to_string(), rest.trim().to_string(), Vec::new()));
+            } else if let Some(s) = sections.last_mut() {
+                s.2.push(
+                    body.strip_prefix("   ")
+                        .unwrap_or(body.trim_start())
+                        .to_string(),
+                );
+            }
+            i += 1;
+        }
+        let md = render_doc(&sections);
+        for n in names {
+            out.entry(n).or_insert_with(|| md.clone());
+        }
+    }
+    out
+}
+
+/// BOSL2's `{{name()}}` links as code.
+fn unlink(s: &str) -> String {
+    s.replace("{{", "`").replace("}}", "`")
+}
+
+fn render_doc(sections: &[(String, String, Vec<String>)]) -> String {
+    let mut md = String::new();
+    let push = |md: &mut String, part: &str| {
+        if !part.trim().is_empty() {
+            if !md.is_empty() {
+                md.push_str("\n\n");
+            }
+            md.push_str(part.trim_end());
+        }
+    };
+    for (key, title, _) in sections {
+        if key == "Synopsis" {
+            push(&mut md, &unlink(title));
+        }
+    }
+    let usages: Vec<&(String, String, Vec<String>)> =
+        sections.iter().filter(|s| s.0 == "Usage").collect();
+    if !usages.is_empty() {
+        let mut code = String::from("```openscad\n");
+        for (_, title, lines) in &usages {
+            if !title.is_empty() && usages.len() > 1 {
+                code.push_str(&format!("// {title}\n"));
+            }
+            for l in lines.iter().filter(|l| !l.trim().is_empty()) {
+                code.push_str(l.trim_end());
+                code.push('\n');
+            }
+        }
+        code.push_str("```");
+        push(&mut md, &code);
+    }
+    for (key, title, lines) in sections {
+        match key.as_str() {
+            "Description" => {
+                // `.` alone parts paragraphs.
+                let mut text = unlink(title);
+                for l in lines {
+                    let t = l.trim();
+                    if t == "." || t.is_empty() {
+                        text.push_str("\n\n");
+                    } else {
+                        if !text.is_empty() && !text.ends_with('\n') {
+                            text.push(' ');
+                        }
+                        text.push_str(&unlink(t));
+                    }
+                }
+                push(&mut md, &text);
+            }
+            "Arguments" => {
+                let mut list = String::new();
+                for l in lines {
+                    let t = l.trim();
+                    if t.is_empty() || t.starts_with("---") {
+                        continue;
+                    }
+                    match t.split_once(" = ") {
+                        Some((name, what)) if !name.contains(' ') => {
+                            if !list.is_empty() {
+                                list.push('\n');
+                            }
+                            list.push_str(&format!("- `{name}`: {}", unlink(what)));
+                        }
+                        _ => {
+                            list.push(' ');
+                            list.push_str(&unlink(t));
+                        }
+                    }
+                }
+                if !list.is_empty() {
+                    push(&mut md, &format!("**Arguments**\n\n{list}"));
+                }
+            }
+            _ => {}
+        }
+    }
+    md
 }
 
 /// The definitions of an item of a block: a module, a function or a

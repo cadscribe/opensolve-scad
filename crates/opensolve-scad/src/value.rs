@@ -3,6 +3,7 @@
 
 use std::fmt::Write as _;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::ast::Func;
 use crate::eval::Frame;
@@ -13,12 +14,12 @@ pub enum Value {
     Undef,
     Bool(bool),
     Num(f64),
-    Str(Rc<str>),
+    Str(Arc<str>),
     List(Rc<Vec<Value>>),
     /// begin, step, end.
     Range(f64, f64, f64),
     /// A function literal and where it was made.
-    Func(Rc<Func>, Rc<Frame>),
+    Func(Arc<Func>, Rc<Frame>),
 }
 
 impl PartialEq for Value {
@@ -29,8 +30,12 @@ impl PartialEq for Value {
             (Value::Num(a), Value::Num(b)) => a == b,
             (Value::Str(a), Value::Str(b)) => a == b,
             (Value::List(a), Value::List(b)) => a == b,
-            (Value::Range(a, b, c), Value::Range(d, e, f)) => (a, b, c) == (d, e, f),
-            (Value::Func(a, _), Value::Func(b, _)) => Rc::ptr_eq(a, b),
+            // As OpenSCAD compares ranges: a NaN in one is the same.
+            (Value::Range(a, b, c), Value::Range(d, e, f)) => [a, b, c]
+                .iter()
+                .zip([d, e, f])
+                .all(|(x, y)| x == &y || (x.is_nan() && y.is_nan())),
+            (Value::Func(a, _), Value::Func(b, _)) => Arc::ptr_eq(a, b),
             _ => false,
         }
     }
@@ -213,7 +218,7 @@ pub fn repr(v: &Value) -> String {
             let _ = write!(o, "[{} : {} : {}]", number(*b), number(*s), number(*e));
             o
         }
-        Value::Func(..) => "function".into(),
+        Value::Func(func, _) => func.to_string(),
     }
 }
 
@@ -226,21 +231,38 @@ fn is_matrix(v: &[Value]) -> bool {
     !v.is_empty() && v.iter().all(|r| matches!(r, Value::List(_)))
 }
 
+/// How `a` and `b` are ordered: numbers, strings, booleans, and vectors
+/// element by element, as C++'s lexicographical compare does it, where
+/// elements that cannot be ordered count as the same.
+fn compare(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering::Equal;
+    match (a, b) {
+        (Value::Num(x), Value::Num(y)) => x.partial_cmp(y),
+        (Value::Str(x), Value::Str(y)) => Some(x.cmp(y)),
+        (Value::Bool(x), Value::Bool(y)) => Some(x.cmp(y)),
+        (Value::List(x), Value::List(y)) => {
+            for (p, q) in x.iter().zip(y.iter()) {
+                match compare(p, q) {
+                    Some(Equal) | None => {}
+                    o => return o,
+                }
+            }
+            Some(x.len().cmp(&y.len()))
+        }
+        _ => None,
+    }
+}
+
 /// `a op b`.
 pub fn binary(op: &str, a: &Value, b: &Value) -> Value {
-    use Value::{Bool, List, Num, Str};
+    use Value::{Bool, List, Num};
     match op {
         "==" => return Bool(a == b),
         "!=" => return Bool(a != b),
         "&&" => return Bool(a.truthy() && b.truthy()),
         "||" => return Bool(a.truthy() || b.truthy()),
         "<" | "<=" | ">" | ">=" => {
-            let order = match (a, b) {
-                (Num(x), Num(y)) => x.partial_cmp(y),
-                (Str(x), Str(y)) => Some(x.cmp(y)),
-                (Bool(x), Bool(y)) => Some(x.cmp(y)),
-                _ => None,
-            };
+            let order = compare(a, b);
             let Some(o) = order else {
                 return Value::Undef;
             };
@@ -324,6 +346,13 @@ pub fn item(v: &Value, i: usize) -> Value {
             .chars()
             .nth(i)
             .map_or(Value::Undef, |c| Value::str(&c.to_string())),
+        // A range's begin, step and end.
+        Value::Range(b, s, e) => match i {
+            0 => Value::Num(*b),
+            1 => Value::Num(*s),
+            2 => Value::Num(*e),
+            _ => Value::Undef,
+        },
         _ => Value::Undef,
     }
 }

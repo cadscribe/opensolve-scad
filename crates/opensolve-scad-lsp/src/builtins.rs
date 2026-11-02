@@ -111,11 +111,11 @@ pub const BUILTINS: &[Builtin] = &[
         "polygon(points, paths, convexity = 1)",
         "A 2D shape of `points`; `paths` lists the outline and holes as point indices.",
     ),
-    no(m(
+    m(
         "text",
         "text(text, size = 10, font, halign, valign, spacing, direction, language, script, $fn)",
-        "Text as a 2D shape. Not supported by OpenSolve yet.",
-    )),
+        "Text as a 2D shape: the letters of a TrueType font of the machine, else of Bitstream Vera Sans standing in for OpenSCAD's Liberation Sans.",
+    ),
     no(m(
         "import",
         "import(file, convexity, layer)",
@@ -126,11 +126,11 @@ pub const BUILTINS: &[Builtin] = &[
         "surface(file, center = false, invert = false, convexity)",
         "A height map read from a file. Not supported by OpenSolve yet.",
     )),
-    no(m(
+    m(
         "projection",
         "projection(cut = false)",
-        "The 2D shadow of its 3D children on the xy plane. Not supported by OpenSolve yet.",
-    )),
+        "The 2D shadow of its 3D children on the xy plane. With `cut = true`, its section at z = 0.",
+    ),
     no(m(
         "roof",
         "roof(method = \"voronoi\")",
@@ -177,17 +177,17 @@ pub const BUILTINS: &[Builtin] = &[
         "color(c, alpha = 1.0)",
         "Colours its children. OpenSolve keeps the shape and drops the colour: colours are per part.",
     ),
-    no(m(
+    m(
         "offset",
         "offset(r, delta, chamfer = false)",
-        "Grows or shrinks a 2D shape by `r` (rounded) or `delta` (sharp). Not supported by OpenSolve yet.",
-    )),
+        "Grows or shrinks a 2D shape by `r` (rounded) or `delta` (sharp, or cut off with `chamfer`).",
+    ),
     m("hull", "hull()", "The convex hull of its children."),
-    no(m(
+    m(
         "minkowski",
         "minkowski(convexity)",
-        "The Minkowski sum of its children. Not supported by OpenSolve yet.",
-    )),
+        "The Minkowski sum of its children: the first grown by the shape of the others.",
+    ),
     // Booleans
     m("union", "union()", "Its children joined into one."),
     m(

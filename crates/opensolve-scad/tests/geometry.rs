@@ -281,13 +281,161 @@ fn polyhedrons_either_way_round() {
 
 #[test]
 fn not_supported_is_said() {
-    let out = solid("cube(1); offset(1) square(1); text(\"a\");");
+    let out = solid("cube(1); surface(\"a.png\"); import(\"a.stl\");");
     assert!(
         out.notes
             .iter()
-            .any(|n| n.contains("not supported: offset"))
+            .any(|n| n.contains("not supported: surface"))
     );
-    assert!(out.notes.iter().any(|n| n.contains("not supported: text")));
+    assert!(
+        out.notes
+            .iter()
+            .any(|n| n.contains("not supported: import"))
+    );
+}
+
+#[test]
+fn text_has_letters_about_openscads_size() {
+    // OpenSCAD's H of size 10 (Liberation Sans) is 9.55 high; the font
+    // that stands in has capitals as high.
+    let s = solid("linear_extrude(1) text(\"H\", size = 10);").solid;
+    let (lo, hi) = s.bounds().unwrap();
+    assert!((hi[1] - lo[1] - 9.555).abs() < 0.05, "{lo:?} {hi:?}");
+    assert!(lo[1].abs() < 1e-6);
+    // Centred both ways; an "o" has its hole.
+    let s =
+        solid("linear_extrude(1) text(\"Hello\", halign = \"center\", valign = \"center\");").solid;
+    let (lo, hi) = s.bounds().unwrap();
+    assert!(
+        (lo[0] + hi[0]).abs() < 1.5 && (lo[1] + hi[1]).abs() < 0.1,
+        "{lo:?} {hi:?}"
+    );
+    let o = volume("linear_extrude(1) text(\"o\");");
+    let filled = volume("linear_extrude(1) hull() text(\"o\");");
+    assert!(o < 0.7 * filled, "{o} {filled}");
+}
+
+/// Minkowski sums and offsets, their volumes as OpenSCAD makes them.
+#[test]
+fn minkowski_sums() {
+    // Convex: the hull of the sums.
+    near(
+        volume("minkowski() { cube([20, 30, 10], center = true); sphere(2, $fn = 16); }"),
+        volume(
+            "hull() for (x = [-10, 10], y = [-15, 15], z = [-5, 5]) translate([x, y, z]) sphere(2, $fn = 16);",
+        ),
+    );
+    // Not convex: an L and a sphere, a frame and a cube, in 2D an L and a
+    // circle.
+    near(
+        volume(
+            "minkowski() { union() { cube([20, 5, 5]); cube([5, 20, 5]); } sphere(1, $fn = 8); }",
+        ),
+        1694.762,
+    );
+    near(
+        volume(
+            "minkowski() { difference() { cube(20, center = true); \
+             cube([10, 10, 30], center = true); } cube(2, center = true); }",
+        ),
+        9240.0,
+    );
+    near(
+        volume(
+            "linear_extrude(2) minkowski() { polygon([[0, 0], [20, 0], [20, 5], [5, 5], \
+             [5, 20], [0, 20]]); circle(1, $fn = 8); }",
+        ),
+        515.071,
+    );
+}
+
+#[test]
+fn projections() {
+    let parts = "union() { cube([20, 10, 5]); translate([5, 5, 0]) rotate([30, 20, 10]) \
+                 cube([10, 10, 10]); translate([30, 0, 0]) difference() { \
+                 cylinder(r = 8, h = 4, $fn = 24); cylinder(r = 3, h = 10, center = true, \
+                 $fn = 12); } }";
+    // As OpenSCAD makes them: the shadow, and the section.
+    near(
+        volume(&format!("linear_extrude(1) projection() {parts}")),
+        427.176,
+    );
+    near(
+        volume(&format!(
+            "linear_extrude(1) projection(cut = true) translate([0, 0, -2]) {{ {parts} \
+             sphere(4, $fn = 12); }}"
+        )),
+        425.515,
+    );
+}
+
+#[test]
+fn polygons_that_cross_themselves_are_filled_even_odd() {
+    // As OpenSCAD fills them: a pentagram without its middle, a bow tie,
+    // a bar across a frame; closed, the points where parts touch apart.
+    for (text, v) in [
+        (
+            "polygon([for (i = [0:4]) 50 * [cos(90 + 144 * i), sin(90 + 144 * i)]]);",
+            1939.192,
+        ),
+        (
+            "polygon([[0, 0], [10, 0], [10, 10], [5, -5], [0, 10]]);",
+            41.667,
+        ),
+        (
+            "polygon(points = [[0, 0], [20, 0], [20, 20], [0, 20], [5, 5], [15, 5], [15, 15], \
+             [5, 15], [8, -3], [12, -3], [12, 25], [8, 25]], paths = [[0, 1, 2, 3], \
+             [4, 5, 6, 7], [8, 9, 10, 11]]);",
+            332.0,
+        ),
+        // Holes of different sizes, each joined to the outline.
+        (
+            "polygon(points = concat([[0, 0], [20, 0], [20, 20], [0, 20], [2, 2], [2, 5], [5, 2]], \
+             [for (i = [0:7]) [14, 14] + 3 * [cos(45 * i), sin(45 * i)]]), \
+             paths = [[0, 1, 2, 3], [4, 5, 6], [for (i = [7:14]) i]]);",
+            400.0 - 4.5 - 18.0 * 2f64.sqrt(),
+        ),
+    ] {
+        let v2 = volume(&format!("linear_extrude(1) {text}"));
+        assert!((v2 - v).abs() < 2e-3, "{v2} is not {v}: {text}");
+    }
+}
+
+#[test]
+fn nothing_made_is_a_child_too() {
+    // From nothing nothing is cut; an `if` that makes nothing is no child.
+    near(
+        volume(
+            "difference() { if (false) cube(1); cube(2); sphere(1); }\n\
+             translate([5, 0, 0]) intersection() { if (false) cube(1); cube(2); \
+             translate([1, 0, 0]) cube(2); }\n\
+             translate([10, 0, 0]) difference() { group() {} cube(3); }",
+        ),
+        11.693,
+    );
+}
+
+#[test]
+fn offsets() {
+    let l = "polygon([[0, 0], [20, 0], [20, 20], [11, 20], [11, 5], [9, 5], [9, 20], [0, 20]])";
+    let ring = "difference() { square(20); translate([5, 5]) square(10); }";
+    for (text, v) in [
+        ("offset(r = 2, $fn = 16) square(10);".to_string(), 192.246),
+        (
+            "offset(delta = 2, chamfer = true) square(10);".into(),
+            193.255,
+        ),
+        ("offset(r = -2, $fn = 16) square(10);".into(), 36.0),
+        ("offset(delta = -3) circle(10, $fn = 30);".into(), 152.094),
+        ("offset(delta = 3) circle(10, $fn = 30);".into(), 528.397),
+        (format!("offset(delta = 1.5) {ring}"), 480.0),
+        (format!("offset(r = -1.5, $fn = 20) {ring}"), 122.047),
+        // The slot closes: the outlines moved out cross.
+        (format!("offset(delta = 2) {l};"), 576.0),
+        (format!("offset(r = 2, $fn = 16) {l};"), 572.021),
+    ] {
+        near(volume(&format!("linear_extrude(1) {text}")), v);
+    }
 }
 
 #[test]

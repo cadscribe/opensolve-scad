@@ -38,7 +38,7 @@ fn a_syntax_error_is_found_where_it_is() {
 
 #[test]
 fn an_unknown_module_is_marked_at_its_name() {
-    let text = "cube(1);\n  frobnicate(2);\necho(\"hi\");\nminkowski() cube(1);\n";
+    let text = "cube(1);\n  frobnicate(2);\necho(\"hi\");\nsurface(\"a.png\");\n";
     let mut w = workspace(&[]);
     w.set(main_path(), text.to_string());
     let d = w.diagnostics(main_path());
@@ -52,7 +52,7 @@ fn an_unknown_module_is_marked_at_its_name() {
     assert_eq!(echo.severity, Severity::Info);
     assert!(
         d.iter()
-            .any(|d| d.message.contains("not supported: minkowski"))
+            .any(|d| d.message.contains("not supported: surface"))
     );
     // A missing include is said at once.
     w.set(main_path(), "include <gone.scad>\ncube(1);".to_string());

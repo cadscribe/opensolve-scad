@@ -2,7 +2,7 @@
 //! statements, expressions with OpenSCAD's precedence, list comprehensions
 //! and function literals.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::Error;
 use crate::ast::{Arg, Elem, Expr, Func, Modifier, Module, Pos, Stmt};
@@ -98,7 +98,7 @@ impl Parser<'_> {
         }
     }
 
-    fn name(&mut self) -> Result<Rc<str>, Error> {
+    fn name(&mut self) -> Result<Arc<str>, Error> {
         match self.tok().clone() {
             Tok::Name(n) => {
                 self.at += 1;
@@ -133,7 +133,7 @@ impl Parser<'_> {
                 let name = self.name()?;
                 let params = self.params()?;
                 let body = self.child()?;
-                Ok(Some(Stmt::Module(name, Rc::new(Module { params, body }))))
+                Ok(Some(Stmt::Module(name, Arc::new(Module { params, body }))))
             }
             Tok::Name(n) if n == "function" && matches!(self.peek(1), Tok::Name(_)) => {
                 self.at += 1;
@@ -142,7 +142,7 @@ impl Parser<'_> {
                 self.expect("=")?;
                 let body = self.expr()?;
                 self.expect(";")?;
-                Ok(Some(Stmt::Function(name, Rc::new(Func { params, body }))))
+                Ok(Some(Stmt::Function(name, Arc::new(Func { params, body }))))
             }
             Tok::Name(n) if *self.peek(1) == Tok::Sym("=") => {
                 self.at += 2;
@@ -303,7 +303,7 @@ impl Parser<'_> {
             self.at += 1;
             let params = self.params()?;
             let body = self.expr()?;
-            return Ok(Expr::Lambda(Rc::new(Func { params, body })));
+            return Ok(Expr::Lambda(Arc::new(Func { params, body })));
         }
         if self.is_name("let") && *self.peek(1) == Tok::Sym("(") {
             self.at += 1;

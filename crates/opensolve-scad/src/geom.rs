@@ -45,34 +45,13 @@ pub fn fragments(r: f64, fn_: f64, fs: f64, fa: f64) -> usize {
 }
 
 /// The sine of `x` degrees, exact at multiples of 30° as in OpenSCAD.
-#[allow(clippy::float_cmp)]
 pub fn sin_deg(x: f64) -> f64 {
-    if !x.is_finite() {
-        return f64::NAN;
-    }
-    let mut x = x.rem_euclid(360.0);
-    let oppose = x >= 180.0;
-    if oppose {
-        x -= 180.0;
-    }
-    if x > 90.0 {
-        x = 180.0 - x;
-    }
-    let s = if x < 45.0 {
-        if x == 30.0 { 0.5 } else { x.to_radians().sin() }
-    } else if x == 45.0 {
-        std::f64::consts::FRAC_1_SQRT_2
-    } else if x == 60.0 {
-        3f64.sqrt() / 2.0
-    } else {
-        (90.0 - x).to_radians().cos()
-    };
-    if oppose { -s } else { s }
+    crate::trig::sin(x)
 }
 
-/// The cosine of `x` degrees, exact at multiples of 30°.
+/// The cosine of `x` degrees, exact at multiples of 30° as in OpenSCAD.
 pub fn cos_deg(x: f64) -> f64 {
-    sin_deg(x + 90.0)
+    crate::trig::cos(x)
 }
 
 fn sub(a: V3, b: V3) -> V3 {
@@ -239,23 +218,59 @@ impl Builder {
     }
 
     /// A slab of polygons, the even-odd rule deciding what is inside, as in
-    /// OpenSCAD's `polygon` with several paths.
+    /// OpenSCAD's `polygon` with several paths or a path that crosses
+    /// itself.
     pub fn polygon(&mut self, paths: &[Vec<V2>]) -> Result<Option<Solid>, String> {
-        let mut out: Option<Solid> = None;
-        for path in paths {
-            let Some(s) = self.simple_polygon(path)? else {
-                continue;
-            };
-            out = Some(match out {
-                None => s,
-                Some(o) => {
-                    let a = self.boolean(&o, &s, Op::Subtract, true)?;
-                    let b = self.boolean(&s, &o, Op::Subtract, true)?;
-                    self.boolean(&a, &b, Op::Add, true)?
-                }
-            });
+        let paths: Vec<Vec<V2>> = paths
+            .iter()
+            .map(|p| clean(p))
+            .filter(|p| p.len() >= 3)
+            .collect();
+        let loops = crate::region::even_odd_loops(&paths);
+        self.loops_slab(&loops)
+    }
+
+    /// The slab of loops that do not cross, each with the inside on its
+    /// left: each outline triangulated with the holes it holds.
+    fn loops_slab(&mut self, loops: &[Vec<V2>]) -> Result<Option<Solid>, String> {
+        let loops: Vec<Vec<V2>> = loops
+            .iter()
+            .map(|l| clean(l))
+            .filter(|l| l.len() >= 3 && area(l).abs() > 1e-18)
+            .collect();
+        let (outers, holes): (Vec<&Vec<V2>>, Vec<&Vec<V2>>) =
+            loops.iter().partition(|l| area(l) > 0.0);
+        let mut held: Vec<Vec<Vec<V2>>> = vec![Vec::new(); outers.len()];
+        for h in holes {
+            // A point just inside the hole: right of its first edge.
+            let (a, b) = (h[0], h[1]);
+            let len = (b[0] - a[0]).hypot(b[1] - a[1]).max(1e-300);
+            let off = len * 1e-4;
+            let q = [
+                (a[0] + b[0]) / 2.0 + (b[1] - a[1]) / len * off,
+                (a[1] + b[1]) / 2.0 - (b[0] - a[0]) / len * off,
+            ];
+            let around = (0..outers.len())
+                .filter(|&o| crate::region::contains(outers[o], q))
+                .min_by(|&x, &y| area(outers[x]).total_cmp(&area(outers[y])));
+            if let Some(o) = around {
+                held[o].push(h.clone());
+            }
         }
-        Ok(out.filter(|s| !s.is_empty()))
+        let mut tris = Vec::new();
+        for (o, outer) in outers.iter().enumerate() {
+            let poly = crate::region::bridge(outer, &held[o]);
+            let ears = ear_clip(&poly).ok_or("polygon: it cannot be cut into triangles")?;
+            tris.extend(ears.iter().map(|t| t.map(|i| poly[i])));
+        }
+        if tris.is_empty() {
+            return Ok(None);
+        }
+        let edges: Vec<[V2; 2]> = loops
+            .iter()
+            .flat_map(|l| (0..l.len()).map(move |i| [l[i], l[(i + 1) % l.len()]]))
+            .collect();
+        Ok(Some(self.slab(&tris, &edges)))
     }
 
     /// The slab of one simple polygon, either way round.
@@ -782,39 +797,683 @@ fn hull3(points: &[V3]) -> Option<Vec<[V3; 3]>> {
         }
         faces.push(x);
     }
-    for (i, q) in p.iter().enumerate() {
-        if [a, b, c, d].contains(&i) {
+    // The points farthest out first: what lies near the hull's faces then
+    // seldom makes faces that a later point takes away again.
+    let mid: V3 = std::array::from_fn(|k| (p[a][k] + p[b][k] + p[c][k] + p[d][k]) / 4.0);
+    let mut order: Vec<usize> = (0..p.len()).filter(|i| ![a, b, c, d].contains(i)).collect();
+    let far = |i: usize| dot(sub(p[i], mid), sub(p[i], mid));
+    order.sort_by(|&i, &j| far(j).total_cmp(&far(i)));
+    for i in order {
+        let q = p[i];
+        let heights: Vec<f64> = faces.iter().map(|f| height(f, q)).collect();
+        let Some(top) = (0..faces.len()).max_by(|&x, &y| heights[x].total_cmp(&heights[y])) else {
+            break;
+        };
+        if heights[top] <= eps {
             continue;
         }
-        let visible: Vec<bool> = faces.iter().map(|f| height(f, *q) > eps).collect();
-        if !visible.contains(&true) {
-            continue;
+        // The faces the point sees, connected to the one it sees best:
+        // their border is one loop.
+        let mut by_edge: HashMap<(usize, usize), usize> = HashMap::with_capacity(faces.len() * 3);
+        for (k, f) in faces.iter().enumerate() {
+            for e in 0..3 {
+                by_edge.insert((f.1[e], f.1[(e + 1) % 3]), k);
+            }
         }
-        let mut seen_edges: HashMap<(usize, usize), usize> = HashMap::new();
-        for (f, v) in faces.iter().zip(&visible) {
-            if *v {
-                for k in 0..3 {
-                    *seen_edges.entry((f.1[k], f.1[(k + 1) % 3])).or_default() += 1;
+        let mut visible = vec![false; faces.len()];
+        visible[top] = true;
+        let mut stack = vec![top];
+        while let Some(k) = stack.pop() {
+            let f = faces[k].1;
+            for e in 0..3 {
+                if let Some(&n) = by_edge.get(&(f[(e + 1) % 3], f[e]))
+                    && !visible[n]
+                    && heights[n] > eps
+                {
+                    visible[n] = true;
+                    stack.push(n);
                 }
             }
         }
-        let horizon: Vec<(usize, usize)> = seen_edges
-            .keys()
-            .filter(|(x, y)| !seen_edges.contains_key(&(*y, *x)))
-            .copied()
-            .collect();
-        let mut kept: Vec<(V3, [usize; 3])> = faces
-            .iter()
-            .zip(&visible)
-            .filter(|(_, v)| !**v)
-            .map(|(f, _)| *f)
-            .collect();
-        for (x, y) in horizon {
-            kept.push(plane([x, y, i]));
+        let mut next: Vec<(V3, [usize; 3])> = Vec::with_capacity(faces.len() + 8);
+        let mut cone = Vec::new();
+        for (k, f) in faces.iter().enumerate() {
+            if !visible[k] {
+                next.push(*f);
+                continue;
+            }
+            for e in 0..3 {
+                let (x, y) = (f.1[e], f.1[(e + 1) % 3]);
+                if by_edge.get(&(y, x)).is_none_or(|&n| !visible[n]) {
+                    cone.push(plane([x, y, i]));
+                }
+            }
         }
-        faces = kept;
+        next.extend(cone);
+        faces = next;
     }
     Some(faces.iter().map(|f| f.1.map(|i| p[i])).collect())
+}
+
+/// How `offset` joins the offset edges at a corner that grows.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Join {
+    /// An arc of so many pieces a whole turn (`r`).
+    Round(usize),
+    /// The edges lengthened until they meet (`delta`).
+    Miter,
+    /// The corner cut off (`delta`, `chamfer = true`).
+    Chamfer,
+}
+
+/// The most convex pieces a `minkowski` of shapes that are not convex is
+/// put together from: each is one boolean more.
+const MOST_PIECES: usize = 20_000;
+
+impl Builder {
+    /// The solid's corners, each once.
+    fn corners(s: &Solid) -> Vec<V3> {
+        let mut seen = HashSet::new();
+        s.points
+            .iter()
+            .copied()
+            .filter(|p| seen.insert(p.map(f64::to_bits)))
+            .collect()
+    }
+
+    /// Whether a solid is convex: its hull is no larger.
+    fn is_convex(s: &Solid) -> bool {
+        let Some(tris) = hull3(&s.points) else {
+            return false;
+        };
+        let hull: f64 = tris
+            .iter()
+            .map(|[a, b, c]| dot(*a, cross(*b, *c)))
+            .sum::<f64>()
+            / 6.0;
+        let v = s.volume();
+        // Corners lie on the kernel's grid: a little more is still convex.
+        (hull - v).abs() <= 1e-7 * hull.abs().max(1.0)
+    }
+
+    /// Several solids as one, joined in pairs and the pairs again.
+    pub fn union_all(&mut self, mut list: Vec<Solid>, flat: bool) -> Result<Option<Solid>, String> {
+        while list.len() > 1 {
+            let mut next = Vec::with_capacity(list.len().div_ceil(2));
+            let mut it = list.into_iter();
+            while let Some(a) = it.next() {
+                next.push(match it.next() {
+                    Some(b) => self.boolean(&a, &b, Op::Add, flat)?,
+                    None => a,
+                });
+            }
+            list = next;
+        }
+        Ok(list.pop())
+    }
+
+    /// The Minkowski sum of two solids: the hull of the sums of their
+    /// corners when both are convex; else the union of such hulls of each
+    /// triangle of one with the other (or its triangles), with the inside
+    /// of both, which takes a boolean for each.
+    pub fn minkowski(&mut self, a: &Solid, b: &Solid) -> Result<Option<Solid>, String> {
+        let (ca, cb) = (Self::is_convex(a), Self::is_convex(b));
+        let (pa, pb) = (Self::corners(a), Self::corners(b));
+        let sums = |p: &[V3], q: &[V3]| -> Vec<V3> {
+            p.iter()
+                .flat_map(|x| {
+                    q.iter()
+                        .map(move |y| [x[0] + y[0], x[1] + y[1], x[2] + y[2]])
+                })
+                .collect()
+        };
+        if ca && cb {
+            return Ok(self.hull(&sums(&pa, &pb)));
+        }
+        // The one that is not convex goes by triangles.
+        let (big, small, cs) = if ca { (b, a, ca) } else { (a, b, cb) };
+        let pieces = |s: &Solid| -> Vec<Vec<V3>> {
+            s.tris
+                .iter()
+                .map(|t| t.iter().map(|&i| s.points[i as usize]).collect())
+                .collect()
+        };
+        let big_pieces = pieces(big);
+        let small_pieces = if cs {
+            vec![Self::corners(small)]
+        } else {
+            pieces(small)
+        };
+        if big_pieces.len() * small_pieces.len() > MOST_PIECES {
+            return Err(format!(
+                "minkowski: {} triangles with {} pieces are too many",
+                big_pieces.len(),
+                small_pieces.len()
+            ));
+        }
+        let mut parts = Vec::new();
+        for p in &big_pieces {
+            for q in &small_pieces {
+                if let Some(h) = self.hull(&sums(p, q)) {
+                    parts.push(h);
+                }
+            }
+        }
+        // The insides: each moved by a corner of the other.
+        let shift = |m: &mut Self, s: &Solid, by: V3| {
+            m.transformed(
+                s,
+                &[
+                    [1.0, 0.0, 0.0, by[0]],
+                    [0.0, 1.0, 0.0, by[1]],
+                    [0.0, 0.0, 1.0, by[2]],
+                ],
+            )
+        };
+        if let (Some(&x), Some(&y)) = (pb.first(), pa.first()) {
+            parts.push(shift(self, big, x));
+            parts.push(shift(self, small, y));
+        }
+        self.union_all(parts, false)
+    }
+
+    /// The Minkowski sum of two slabs, as [`Builder::minkowski`] in the
+    /// plane: of their tops' triangles where they are not convex.
+    pub fn minkowski_2d(&mut self, a: &Solid, b: &Solid) -> Result<Option<Solid>, String> {
+        let flat = |s: &Solid| -> (Vec<[V2; 3]>, Vec<V2>, bool) {
+            let (tris, _) = region(s);
+            let mut seen = HashSet::new();
+            let pts: Vec<V2> = tris
+                .iter()
+                .flatten()
+                .copied()
+                .filter(|p| seen.insert(p.map(f64::to_bits)))
+                .collect();
+            let area: f64 = tris.iter().map(|t| cross2(t[0], t[1], t[2]) / 2.0).sum();
+            let hull = area_of(&hull2(&pts));
+            let convex = (hull - area).abs() <= 1e-9 * hull.max(1.0);
+            (tris, pts, convex)
+        };
+        let (ta, pa, ca) = flat(a);
+        let (tb, pb, cb) = flat(b);
+        let sums = |p: &[V2], q: &[V2]| -> Vec<V2> {
+            p.iter()
+                .flat_map(|x| q.iter().map(move |y| [x[0] + y[0], x[1] + y[1]]))
+                .collect()
+        };
+        if ca && cb {
+            return Ok(self.hull_2d(&sums(&pa, &pb)));
+        }
+        let pieces = |t: &[[V2; 3]], p: &[V2], convex: bool| -> Vec<Vec<V2>> {
+            if convex {
+                vec![p.to_vec()]
+            } else {
+                t.iter().map(|t| t.to_vec()).collect()
+            }
+        };
+        let (pa_pieces, pb_pieces) = (pieces(&ta, &pa, ca), pieces(&tb, &pb, cb));
+        if pa_pieces.len() * pb_pieces.len() > MOST_PIECES {
+            return Err(format!(
+                "minkowski: {} with {} pieces are too many",
+                pa_pieces.len(),
+                pb_pieces.len()
+            ));
+        }
+        let mut parts = Vec::new();
+        for p in &pa_pieces {
+            for q in &pb_pieces {
+                parts.extend(self.hull_2d(&sums(p, q)));
+            }
+        }
+        let shift = |m: &mut Self, s: &Solid, by: V2| {
+            m.transformed_2d(
+                s,
+                &[
+                    [1.0, 0.0, 0.0, by[0]],
+                    [0.0, 1.0, 0.0, by[1]],
+                    [0.0, 0.0, 1.0, 0.0],
+                ],
+            )
+        };
+        if let (Some(&x), Some(&y)) = (pb.first(), pa.first()) {
+            parts.push(shift(self, a, x));
+            parts.push(shift(self, b, y));
+        }
+        self.union_all(parts, true)
+    }
+
+    /// OpenSCAD's `offset`: the outlines of a slab moved out by `d` (in
+    /// for a negative one), the corners that grow joined by `join`. Out,
+    /// the shape with a strip along each edge and a piece at each corner
+    /// that grows; in, what is left of a box round it so grown, cut away.
+    pub fn offset(&mut self, slab: &Solid, d: f64, join: Join) -> Result<Option<Solid>, String> {
+        if d == 0.0 || !d.is_finite() {
+            return Ok(Some(slab.clone()));
+        }
+        if d > 0.0 {
+            return self.grow(slab, d, join);
+        }
+        let Some((lo, hi)) = slab.bounds() else {
+            return Ok(None);
+        };
+        let m = 2.0 * d.abs() + 1.0;
+        let Some(boxed) = self.square([hi[0] - lo[0] + 2.0 * m, hi[1] - lo[1] + 2.0 * m], false)
+        else {
+            return Ok(None);
+        };
+        let boxed = self.transformed_2d(
+            &boxed,
+            &[
+                [1.0, 0.0, 0.0, lo[0] - m],
+                [0.0, 1.0, 0.0, lo[1] - m],
+                [0.0, 0.0, 1.0, 0.0],
+            ],
+        );
+        let outside = self.boolean(&boxed, slab, Op::Subtract, true)?;
+        let Some(grown) = self.grow(&outside, -d, join)? else {
+            return Ok(Some(slab.clone()));
+        };
+        let left = self.boolean(&boxed, &grown, Op::Subtract, true)?;
+        Ok(Some(left).filter(|s| !s.is_empty()))
+    }
+
+    fn grow(&mut self, slab: &Solid, d: f64, join: Join) -> Result<Option<Solid>, String> {
+        let (_, loops) = region(slab);
+        // Mostly each outline moved out is a simple loop again: the shape
+        // is these loops, without a boolean of many small pieces.
+        let rings: Option<Vec<Option<Vec<V2>>>> = loops
+            .iter()
+            .filter(|l| l.len() >= 3)
+            .map(|l| offset_ring(l, d, join))
+            .collect();
+        if let Some(rings) = rings {
+            let kept: Vec<Vec<V2>> = rings.into_iter().flatten().collect();
+            if !rings_cross(&kept) {
+                return self.polygon(&kept);
+            }
+        }
+        self.grow_by_pieces(&loops, slab, d, join)
+    }
+
+    /// [`Builder::grow`] as the shape with a strip along each edge and a
+    /// piece at each corner that grows, joined: when the outlines moved
+    /// out cross themselves or each other.
+    fn grow_by_pieces(
+        &mut self,
+        loops: &[Vec<V2>],
+        slab: &Solid,
+        d: f64,
+        join: Join,
+    ) -> Result<Option<Solid>, String> {
+        let mut pieces: Vec<Vec<V2>> = Vec::new();
+        let add = |p: V2, n: V2, k: f64| [p[0] + n[0] * k, p[1] + n[1] * k];
+        for l in loops {
+            let n = l.len();
+            if n < 3 {
+                continue;
+            }
+            let normal = |i: usize| edge_normal(l[i], l[(i + 1) % n]);
+            // Each strip reaches a little into the shape and past its
+            // ends: pieces that overlap join well, pieces that only touch
+            // do not always.
+            let eps = 1e-3 * d;
+            for i in 0..n {
+                let (a, b) = (l[i], l[(i + 1) % n]);
+                let nm = normal(i);
+                let e = [-nm[1], nm[0]];
+                let (a, b) = (add(a, e, -eps), add(b, e, eps));
+                pieces.push(vec![
+                    add(a, nm, -eps),
+                    add(b, nm, -eps),
+                    add(b, nm, d),
+                    add(a, nm, d),
+                ]);
+                let b = l[(i + 1) % n];
+                let n2 = normal((i + 1) % n);
+                if let Some(mut corner) = join_points(b, nm, n2, d, join) {
+                    corner.insert(0, b);
+                    pieces.push(corner);
+                }
+            }
+        }
+        let mut parts = vec![slab.clone()];
+        for p in pieces {
+            if let Ok(Some(s)) = self.simple_polygon(&p) {
+                parts.push(s);
+            }
+        }
+        self.union_all(parts, true)
+    }
+}
+
+/// The outward normal of an edge from `a` to `b` of an outline with the
+/// shape on its left.
+fn edge_normal(a: V2, b: V2) -> V2 {
+    let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
+    let len = dx.hypot(dy).max(1e-300);
+    [dy / len, -dx / len]
+}
+
+/// The points that join, at corner `b`, the edge before (normal `n1`) and
+/// the edge after (normal `n2`) moved out by `d`, from the end of the one
+/// to the start of the other; `None` where the corner does not grow.
+fn join_points(b: V2, n1: V2, n2: V2, d: f64, join: Join) -> Option<Vec<V2>> {
+    let add = |p: V2, n: V2, k: f64| [p[0] + n[0] * k, p[1] + n[1] * k];
+    let turn = n1[0] * n2[1] - n1[1] * n2[0];
+    if turn <= 1e-12 {
+        return None;
+    }
+    let (p1, p2) = (add(b, n1, d), add(b, n2, d));
+    Some(match join {
+        // Squared off at `d` from the corner, as Clipper's square join
+        // does it.
+        Join::Chamfer => {
+            let u = [n1[0] + n2[0], n1[1] + n2[1]];
+            let ul = u[0].hypot(u[1]).max(1e-300);
+            let u = [u[0] / ul, u[1] / ul];
+            let e1 = [-n1[1], n1[0]];
+            let along = e1[0] * u[0] + e1[1] * u[1];
+            let s = if along.abs() < 1e-12 {
+                0.0
+            } else {
+                d * (1.0 - (n1[0] * u[0] + n1[1] * u[1])) / along
+            };
+            let e2 = [-n2[1], n2[0]];
+            vec![p1, add(p1, e1, s), add(p2, e2, -s), p2]
+        }
+        Join::Miter => {
+            let k = d / (1.0 + n1[0] * n2[0] + n1[1] * n2[1]);
+            vec![
+                p1,
+                [b[0] + (n1[0] + n2[0]) * k, b[1] + (n1[1] + n2[1]) * k],
+                p2,
+            ]
+        }
+        Join::Round(steps) => {
+            let a1 = n1[1].atan2(n1[0]);
+            let mut a2 = n2[1].atan2(n2[0]);
+            while a2 < a1 {
+                a2 += std::f64::consts::TAU;
+            }
+            let k = ((a2 - a1) / std::f64::consts::TAU * steps.max(3) as f64)
+                .ceil()
+                .max(1.0) as usize;
+            (0..=k)
+                .map(|j| {
+                    let t = a1 + (a2 - a1) * j as f64 / k as f64;
+                    [b[0] + d * t.cos(), b[1] + d * t.sin()]
+                })
+                .collect()
+        }
+    })
+}
+
+/// Where the lines through `p` along `u` and through `q` along `v` meet,
+/// as the parameters along each.
+fn meet(p: V2, u: V2, q: V2, v: V2) -> Option<(f64, f64)> {
+    let den = u[0] * v[1] - u[1] * v[0];
+    if den.abs() < 1e-14 {
+        return None;
+    }
+    let w = [q[0] - p[0], q[1] - p[1]];
+    Some((
+        (w[0] * v[1] - w[1] * v[0]) / den,
+        (w[0] * u[1] - w[1] * u[0]) / den,
+    ))
+}
+
+/// An outline (shape on its left) moved out by `d`, its corners that grow
+/// joined by `join`, those that shrink cut where the moved edges meet:
+/// `Some(None)` if it closes up to nothing, `None` if it is no simple loop
+/// (an edge shorter than what a corner takes of it).
+fn offset_ring(l: &[V2], d: f64, join: Join) -> Option<Option<Vec<V2>>> {
+    let n = l.len();
+    let normals: Vec<V2> = (0..n).map(|i| edge_normal(l[i], l[(i + 1) % n])).collect();
+    let add = |p: V2, nm: V2, k: f64| [p[0] + nm[0] * k, p[1] + nm[1] * k];
+    // Each moved edge as a part of its line, 0 at its start corner and 1
+    // at its end corner, and the points of each corner.
+    let mut part = vec![(0.0f64, 1.0f64); n];
+    let mut corners: Vec<Vec<V2>> = Vec::with_capacity(n);
+    for i in 0..n {
+        let j = (i + 1) % n;
+        let b = l[j];
+        if let Some(pts) = join_points(b, normals[i], normals[j], d, join) {
+            corners.push(pts);
+            continue;
+        }
+        let pi = add(l[i], normals[i], d);
+        let ui = [b[0] - l[i][0], b[1] - l[i][1]];
+        let turn = normals[i][0] * normals[j][1] - normals[i][1] * normals[j][0];
+        if turn.abs() <= 1e-12 {
+            corners.push(vec![add(b, normals[i], d)]);
+            continue;
+        }
+        // A corner that shrinks: the moved edges meet inside.
+        let pj = add(b, normals[j], d);
+        let next = l[(j + 1) % n];
+        let uj = [next[0] - b[0], next[1] - b[1]];
+        let (s, t) = meet(pi, ui, pj, uj)?;
+        part[i].1 = s;
+        part[j].0 = t;
+        corners.push(vec![[pi[0] + ui[0] * s, pi[1] + ui[1] * s]]);
+    }
+    // An edge shorter than its corners take: no simple loop.
+    if part.iter().any(|(s, e)| s > e) {
+        return None;
+    }
+    let ring = clean(&corners.concat());
+    if ring.len() < 3 || ring_crosses(&ring) {
+        return None;
+    }
+    // Turned round: a hole that closed up, or nothing left.
+    if (area(&ring) > 0.0) != (area(l) > 0.0) {
+        return Some(None);
+    }
+    Some(Some(ring))
+}
+
+/// Whether two segments cross or touch, but not at a shared end.
+fn segments_cross(a: V2, b: V2, c: V2, e: V2) -> bool {
+    let d1 = cross2(a, b, c);
+    let d2 = cross2(a, b, e);
+    let d3 = cross2(c, e, a);
+    let d4 = cross2(c, e, b);
+    ((d1 > 0.0 && d2 < 0.0) || (d1 < 0.0 && d2 > 0.0))
+        && ((d3 > 0.0 && d4 < 0.0) || (d3 < 0.0 && d4 > 0.0))
+}
+
+/// Whether a loop crosses itself.
+fn ring_crosses(r: &[V2]) -> bool {
+    let n = r.len();
+    (0..n).any(|i| {
+        let (a, b) = (r[i], r[(i + 1) % n]);
+        (i + 2..n).any(|j| {
+            let k = (j + 1) % n;
+            k != i && segments_cross(a, b, r[j], r[k])
+        })
+    })
+}
+
+/// Whether loops cross each other.
+fn rings_cross(rings: &[Vec<V2>]) -> bool {
+    rings.iter().enumerate().any(|(x, p)| {
+        rings[x + 1..].iter().any(|q| {
+            (0..p.len()).any(|i| {
+                (0..q.len())
+                    .any(|j| segments_cross(p[i], p[(i + 1) % p.len()], q[j], q[(j + 1) % q.len()]))
+            })
+        })
+    })
+}
+
+/// The area of a polygon, either way round.
+fn area_of(p: &[V2]) -> f64 {
+    area(p).abs()
+}
+
+impl Builder {
+    /// OpenSCAD's `projection()`: the shadow of a solid on the xy plane,
+    /// the union of what its faces that look up cover, a patch of them
+    /// that hang together at a time; with `cut`, its section at z = 0.
+    pub fn projection(&mut self, s: &Solid, cut: bool) -> Result<Option<Solid>, String> {
+        if cut {
+            return self.section(s);
+        }
+        let up: Vec<usize> = (0..s.tris.len())
+            .filter(|&k| {
+                let [a, b, c] = s.tris[k].map(|i| s.points[i as usize]);
+                cross(sub(b, a), sub(c, a))[2] > 1e-12
+            })
+            .collect();
+        // Patches of faces that share edges.
+        let mut by_edge: HashMap<(u32, u32), usize> = HashMap::new();
+        for (j, &k) in up.iter().enumerate() {
+            let t = s.tris[k];
+            for e in 0..3 {
+                by_edge.insert((t[e], t[(e + 1) % 3]), j);
+            }
+        }
+        let mut patch = vec![usize::MAX; up.len()];
+        let mut patches = 0;
+        for start in 0..up.len() {
+            if patch[start] != usize::MAX {
+                continue;
+            }
+            patch[start] = patches;
+            let mut stack = vec![start];
+            while let Some(j) = stack.pop() {
+                let t = s.tris[up[j]];
+                for e in 0..3 {
+                    if let Some(&n) = by_edge.get(&(t[(e + 1) % 3], t[e]))
+                        && patch[n] == usize::MAX
+                    {
+                        patch[n] = patches;
+                        stack.push(n);
+                    }
+                }
+            }
+            patches += 1;
+        }
+        let flat = |i: u32| {
+            let p = s.points[i as usize];
+            [p[0], p[1]]
+        };
+        let mut parts = Vec::new();
+        for p in 0..patches {
+            // The outline of a patch: its edges not shared within it.
+            let edges: Vec<(u32, u32)> = (0..up.len())
+                .filter(|&j| patch[j] == p)
+                .flat_map(|j| {
+                    let t = s.tris[up[j]];
+                    (0..3).map(move |e| (t[e], t[(e + 1) % 3]))
+                })
+                .filter(|&(a, b)| by_edge.get(&(b, a)).is_none_or(|&n| patch[n] != p))
+                .collect();
+            let loops = chain(&edges);
+            let paths: Vec<Vec<V2>> = loops
+                .iter()
+                .map(|l| l.iter().map(|&i| flat(i)).collect())
+                .collect();
+            // A patch that lies over itself (as a face that folds over)
+            // has an outline that covers less: its triangles one by one.
+            let tris: Vec<[V2; 3]> = (0..up.len())
+                .filter(|&j| patch[j] == p)
+                .map(|j| s.tris[up[j]].map(flat))
+                .collect();
+            let covered: f64 = tris.iter().map(|t| cross2(t[0], t[1], t[2]) / 2.0).sum();
+            let slab = self.polygon(&paths).ok().flatten();
+            let filled = slab.as_ref().map_or(0.0, Solid::volume);
+            if let Some(slab) = slab
+                && (covered - filled).abs() <= 1e-6 * covered.max(1.0)
+            {
+                parts.push(slab);
+            } else {
+                for t in tris {
+                    if let Ok(Some(slab)) = self.simple_polygon(&t) {
+                        parts.push(slab);
+                    }
+                }
+            }
+        }
+        self.union_all(parts, true)
+    }
+
+    /// The section of a solid at z = 0, as a slab.
+    fn section(&mut self, s: &Solid) -> Result<Option<Solid>, String> {
+        // Where an edge crosses the plane, the same point from either
+        // triangle: from its lower end.
+        let at = |a: V3, b: V3| -> V2 {
+            let (a, b) = if (a[2], a[0], a[1]) < (b[2], b[0], b[1]) {
+                (a, b)
+            } else {
+                (b, a)
+            };
+            let t = -a[2] / (b[2] - a[2]);
+            [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]
+        };
+        let key = |p: V2| p.map(|x| (x * 1e7).round() as i64);
+        let mut ids: HashMap<[i64; 2], u32> = HashMap::new();
+        let mut points: Vec<V2> = Vec::new();
+        let mut id = |p: V2| -> u32 {
+            *ids.entry(key(p)).or_insert_with(|| {
+                points.push(p);
+                points.len() as u32 - 1
+            })
+        };
+        let mut edges = Vec::new();
+        for t in &s.tris {
+            let v = t.map(|i| s.points[i as usize]);
+            let above: Vec<bool> = v.iter().map(|p| p[2] >= 0.0).collect();
+            let crossing: Vec<V2> = (0..3)
+                .filter(|&e| above[e] != above[(e + 1) % 3])
+                .map(|e| at(v[e], v[(e + 1) % 3]))
+                .collect();
+            if crossing.len() != 2 {
+                continue;
+            }
+            // The shape on the left: the outward normal on the right.
+            let n = cross(sub(v[1], v[0]), sub(v[2], v[0]));
+            let d = [-n[1], n[0]];
+            let (p, q) = (crossing[0], crossing[1]);
+            let along = (q[0] - p[0]) * d[0] + (q[1] - p[1]) * d[1];
+            let (p, q) = if along >= 0.0 { (p, q) } else { (q, p) };
+            let (i, j) = (id(p), id(q));
+            if i != j {
+                edges.push((i, j));
+            }
+        }
+        let paths: Vec<Vec<V2>> = chain(&edges)
+            .iter()
+            .map(|l| l.iter().map(|&i| points[i as usize]).collect())
+            .collect();
+        self.polygon(&paths)
+    }
+}
+
+/// Directed edges chained into loops, each edge once.
+fn chain(edges: &[(u32, u32)]) -> Vec<Vec<u32>> {
+    let mut from: HashMap<u32, Vec<u32>> = HashMap::new();
+    for &(a, b) in edges.iter().rev() {
+        from.entry(a).or_default().push(b);
+    }
+    let mut loops = Vec::new();
+    for &(start, _) in edges {
+        while from.get(&start).is_some_and(|v| !v.is_empty()) {
+            let mut ring = vec![start];
+            let mut at = start;
+            while let Some(next) = from.get_mut(&at).and_then(Vec::pop) {
+                if next == start {
+                    break;
+                }
+                ring.push(next);
+                at = next;
+            }
+            if ring.len() >= 3 {
+                loops.push(ring);
+            }
+        }
+    }
+    loops
 }
 
 #[cfg(test)]
