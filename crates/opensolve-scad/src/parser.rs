@@ -516,14 +516,21 @@ impl Parser<'_> {
         Ok(Elem::Expr(self.expr()?))
     }
 
-    /// `a = 1, b = 2` up to one of `ends`.
+    /// `a = 1, b = 2` up to one of `ends`; a value without a name, as
+    /// OpenSCAD takes it (`for ([0:2]) …` runs three times).
     fn assignments(&mut self, ends: &[&str]) -> Result<Vec<Arg>, Error> {
         let mut out = Vec::new();
         while !ends.iter().any(|e| self.is(e)) {
-            let name = self.name()?;
-            self.expect("=")?;
+            let named = matches!(self.tok(), Tok::Name(_)) && *self.peek(1) == Tok::Sym("=");
+            let name = if named {
+                let n = self.name()?;
+                self.at += 1;
+                Some(n)
+            } else {
+                None
+            };
             out.push(Arg {
-                name: Some(name),
+                name,
                 value: Some(self.expr()?),
             });
             if !self.eat(",") {
@@ -574,6 +581,9 @@ mod tests {
             one("[for (i = 0; i < 3; i = i + 1) i]"),
             Expr::List(_)
         ));
+        assert!(
+            matches!(one("[for ([0:2]) 5]"), Expr::List(e) if matches!(&e[0], Elem::For(a, _) if a[0].name.is_none()))
+        );
     }
 
     #[test]

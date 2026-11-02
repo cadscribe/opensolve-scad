@@ -130,6 +130,9 @@ pub struct Frame {
     caller: Option<Rc<Frame>>,
     /// A module's children and the scope they were written in.
     children: Option<(Arc<[Stmt]>, Rc<Frame>)>,
+    /// In the scope of a file: the files it uses, each a scope of its own
+    /// definitions. What these use in turn is theirs alone.
+    used: RefCell<Vec<Rc<Frame>>>,
 }
 
 impl std::fmt::Debug for Frame {
@@ -192,6 +195,15 @@ impl Frame {
         }
     }
 
+    /// The scope of the file this one is in.
+    fn file(self: &Rc<Frame>) -> &Rc<Frame> {
+        let mut f: &Rc<Frame> = self;
+        while let Some(p) = &f.parent {
+            f = p;
+        }
+        f
+    }
+
     /// The children of the module being run here.
     fn children(self: &Rc<Frame>) -> Option<(Arc<[Stmt]>, Rc<Frame>)> {
         let mut f: &Rc<Frame> = self;
@@ -235,6 +247,8 @@ fn sets_specials(f: &Rc<Frame>, upto: &Rc<Frame>) -> bool {
 struct Args {
     pos: Vec<Value>,
     named: Vec<(Arc<str>, Value)>,
+    /// For each value by position, how many named ones come before it.
+    before: Vec<usize>,
 }
 
 impl Args {
@@ -265,7 +279,8 @@ pub struct Interp {
     loaded: Vec<PathBuf>,
     /// The folders an include is looked for in after the file's own.
     search: Vec<PathBuf>,
-    used: Vec<Rc<Frame>>,
+    /// The scope of each file used, made once.
+    used: HashMap<PathBuf, Rc<Frame>>,
     pub notes: Vec<String>,
     /// The notes again with where they are, for an editor: no place in
     /// their text, echoes too, all of them up to [`MARKS`].
@@ -289,7 +304,7 @@ impl Interp {
             sources,
             loaded: Vec::new(),
             search: crate::library::search(),
-            used: Vec::new(),
+            used: HashMap::new(),
             notes: Vec::new(),
             marks: Vec::new(),
             dropped: 0,
@@ -481,39 +496,59 @@ impl Interp {
     }
 
     /// `use <…>`: the file's modules and functions, its assignments in a
-    /// scope of its own, nothing it makes.
-    fn use_file(&mut self, path: &str, pos: Pos) -> R<()> {
+    /// scope of its own, nothing it makes; known in the file that uses it
+    /// (`into`), not in those that use or include that one.
+    fn use_file(&mut self, path: &str, pos: Pos, into: &Rc<Frame>) -> R<()> {
         let file = self.path_of(pos, path);
         if !self.sources.contains_key(&file) {
             return Err(self.error(pos, format!("use <{path}>: the file cannot be read")));
         }
-        if self.loaded.contains(&file) {
-            return Ok(());
+        let home = into.file();
+        let frame = match self.used.get(&file) {
+            Some(f) => f.clone(),
+            None => {
+                let frame = Interp::root();
+                // Before its statements run: a file that uses this one
+                // back finds it.
+                self.used.insert(file.clone(), frame.clone());
+                let stmts = self.load(file, &mut Vec::new())?;
+                let defs: Vec<Stmt> = stmts
+                    .into_iter()
+                    .filter(|s| {
+                        matches!(
+                            s,
+                            Stmt::Assign { .. }
+                                | Stmt::Module(..)
+                                | Stmt::Function(..)
+                                | Stmt::Use(..)
+                        )
+                    })
+                    .collect();
+                self.exec(&defs, &frame, None)?;
+                frame
+            }
+        };
+        let mut used = home.used.borrow_mut();
+        if !Rc::ptr_eq(&frame, home) && !used.iter().any(|u| Rc::ptr_eq(u, &frame)) {
+            used.push(frame);
         }
-        let stmts = self.load(file, &mut Vec::new())?;
-        let frame = Interp::root();
-        let defs: Vec<Stmt> = stmts
-            .into_iter()
-            .filter(|s| {
-                matches!(
-                    s,
-                    Stmt::Assign { .. } | Stmt::Module(..) | Stmt::Function(..) | Stmt::Use(..)
-                )
-            })
-            .collect();
-        self.exec(&defs, &frame, None)?;
-        self.used.push(frame);
         Ok(())
     }
 
     fn find_func(&self, f: &Rc<Frame>, name: &str) -> Option<(Arc<Func>, Rc<Frame>)> {
-        f.func(name)
-            .or_else(|| self.used.iter().find_map(|u| u.func(name)))
+        f.func(name).or_else(|| {
+            let used = f.file().used.borrow();
+            used.iter()
+                .find_map(|u| u.funcs.borrow().find(name).map(|d| (d.clone(), u.clone())))
+        })
     }
 
     fn find_module(&self, f: &Rc<Frame>, name: &str) -> Option<(Arc<Module>, Rc<Frame>)> {
-        f.module(name)
-            .or_else(|| self.used.iter().find_map(|u| u.module(name)))
+        f.module(name).or_else(|| {
+            let used = f.file().used.borrow();
+            used.iter()
+                .find_map(|u| u.mods.borrow().find(name).map(|d| (d.clone(), u.clone())))
+        })
     }
 
     /// The statements of a scope; with `only`, of the instantiations just
@@ -542,7 +577,7 @@ impl Interp {
                 // The last definition of a name wins, as in OpenSCAD.
                 Stmt::Module(n, m) => f.mods.borrow_mut().set(n, m.clone()),
                 Stmt::Function(n, d) => f.funcs.borrow_mut().set(n, d.clone()),
-                Stmt::Use(p, pos) => self.use_file(p, *pos)?,
+                Stmt::Use(p, pos) => self.use_file(p, *pos, f)?,
                 _ => {}
             }
         }
@@ -587,6 +622,15 @@ impl Interp {
                 modifier: Modifier::Disable | Modifier::Background,
                 ..
             } => return Ok(None),
+            // A module that does not exist is no instantiation: OpenSCAD
+            // leaves it out with a warning, so that in `difference()` the
+            // next child is what is cut from.
+            Stmt::Call { name, pos, .. }
+                if !BUILT_IN_MODULES.contains(&&**name) && self.find_module(f, name).is_none() =>
+            {
+                self.note(Some(*pos), format!("unknown module {name}"));
+                return Ok(None);
+            }
             Stmt::Call {
                 name,
                 args,
@@ -628,6 +672,7 @@ impl Interp {
         let mut out = Args {
             pos: Vec::new(),
             named: Vec::new(),
+            before: Vec::new(),
         };
         for a in args {
             let v = match &a.value {
@@ -636,7 +681,10 @@ impl Interp {
             };
             match &a.name {
                 Some(n) => out.named.push((n.clone(), v)),
-                None => out.pos.push(v),
+                None => {
+                    out.pos.push(v);
+                    out.before.push(out.named.len());
+                }
             }
         }
         Ok(out)
@@ -972,32 +1020,49 @@ impl Interp {
         Ok(())
     }
 
-    /// Parameters bound in `frame`: by position, by name, else their
-    /// defaults; `$` names given go along.
+    /// Parameters bound in `frame` as OpenSCAD binds them: the arguments
+    /// in their order, one by name to that name (the last one wins), one
+    /// by position to the next parameter not named before it; else their
+    /// defaults. Named ones that are no parameter are set too.
     fn bind(&mut self, params: &[Arg], a: Args, frame: &Rc<Frame>) -> R<()> {
-        let mut pos = a.pos.into_iter();
-        for p in params {
+        let index = |n: &str| params.iter().position(|p| p.name.as_deref() == Some(n));
+        let mut given: Vec<Option<Value>> = vec![None; params.len()];
+        let mut extra: Vec<(Arc<str>, Value)> = Vec::new();
+        let mut named = a.named.into_iter();
+        let mut seen: Vec<Arc<str>> = Vec::new();
+        let mut at = 0;
+        let mut take = |n: Arc<str>, v: Value, given: &mut Vec<Option<Value>>| match index(&n) {
+            Some(i) => given[i] = Some(v),
+            None => extra.push((n, v)),
+        };
+        for (v, before) in a.pos.into_iter().zip(a.before) {
+            while seen.len() < before {
+                let Some((n, v)) = named.next() else { break };
+                seen.push(n.clone());
+                take(n, v, &mut given);
+            }
+            while at < params.len() && params[at].name.as_ref().is_some_and(|n| seen.contains(n)) {
+                at += 1;
+            }
+            if at < params.len() {
+                given[at] = Some(v);
+                at += 1;
+            }
+        }
+        for (n, v) in named {
+            take(n, v, &mut given);
+        }
+        for (p, v) in params.iter().zip(given) {
             let Some(name) = &p.name else { continue };
-            let given = a
-                .named
-                .iter()
-                .find(|(n, _)| n == name)
-                .map(|(_, v)| v.clone());
-            let next = pos.next();
-            let v = match (given, next) {
+            let v = match (v, &p.value) {
                 (Some(v), _) => v,
-                (None, Some(v)) => v,
-                (None, None) => match &p.value {
-                    Some(e) => self.eval(e, frame)?,
-                    None => Value::Undef,
-                },
+                (None, Some(e)) => self.eval(e, frame)?,
+                (None, None) => Value::Undef,
             };
             frame.set(name, v);
         }
-        for (n, v) in a.named {
-            if n.starts_with('$') {
-                frame.set(&n, v);
-            }
+        for (n, v) in extra {
+            frame.set(&n, v);
         }
         Ok(())
     }
@@ -1036,14 +1101,17 @@ impl Interp {
         let Some(var) = vars.get(k) else {
             return body(self, f);
         };
-        let (Some(name), Some(e)) = (&var.name, &var.value) else {
+        let Some(e) = &var.value else {
             return self.each(vars, k + 1, f, body);
         };
         let over = self.eval(e, f)?;
         let items = over.items().map_err(|m| Error::at(0, 0, m))?;
+        // Without a name it runs as often, binding nothing.
         for v in items {
             let inner = Frame::inner(f);
-            inner.set(name, v);
+            if let Some(name) = &var.name {
+                inner.set(name, v);
+            }
             self.each(vars, k + 1, &inner, body)?;
         }
         Ok(())
@@ -1063,21 +1131,23 @@ impl Interp {
         Err(self.error(pos, format!("assertion failed: {what}")))
     }
 
-    /// Several shapes as one: the 3D ones joined, or else the 2D ones.
+    /// Several shapes as one: those of the kind of the first joined, the
+    /// others left out, as OpenSCAD does.
     fn union(&mut self, made: Vec<Geom>, pos: Option<Pos>) -> R<Option<Geom>> {
         if made.len() <= 1 {
             return Ok(made.into_iter().next());
         }
-        let (flat, solid): (Vec<Geom>, Vec<Geom>) =
-            made.into_iter().partition(|g| matches!(g, Geom::D2(_)));
-        if !flat.is_empty() && !solid.is_empty() {
-            self.note(pos, "2D and 3D shapes together: the 2D ones are left out");
+        let is_flat = matches!(made[0], Geom::D2(_));
+        let (list, other): (Vec<Geom>, Vec<Geom>) = made
+            .into_iter()
+            .partition(|g| matches!(g, Geom::D2(_)) == is_flat);
+        if !other.is_empty() {
+            let left = if is_flat { "3D" } else { "2D" };
+            self.note(
+                pos,
+                format!("2D and 3D shapes together: the {left} ones are left out"),
+            );
         }
-        let (list, is_flat) = if solid.is_empty() {
-            (flat, true)
-        } else {
-            (solid, false)
-        };
         let solids = list
             .into_iter()
             .map(|g| {
@@ -1358,7 +1428,7 @@ impl Interp {
     }
 
     fn hull(&mut self, made: Vec<Geom>, pos: Pos) -> Option<Geom> {
-        let solid = made.iter().any(|g| matches!(g, Geom::D3(_)));
+        let solid = matches!(made.first(), Some(Geom::D3(_)));
         let mut points: Vec<V3> = Vec::new();
         for g in &made {
             match (g, solid) {
@@ -1759,6 +1829,46 @@ impl Interp {
         Ok(())
     }
 }
+
+/// The modules OpenSCAD has.
+const BUILT_IN_MODULES: &[&str] = &[
+    "cube",
+    "sphere",
+    "cylinder",
+    "polyhedron",
+    "square",
+    "circle",
+    "polygon",
+    "translate",
+    "rotate",
+    "scale",
+    "mirror",
+    "multmatrix",
+    "resize",
+    "union",
+    "group",
+    "render",
+    "color",
+    "difference",
+    "intersection",
+    "hull",
+    "linear_extrude",
+    "rotate_extrude",
+    "children",
+    "echo",
+    "assert",
+    "minkowski",
+    "offset",
+    "projection",
+    "text",
+    "import",
+    "surface",
+    "roof",
+    "fill",
+    "for",
+    "intersection_for",
+    "let",
+];
 
 fn is_instance(s: &Stmt) -> bool {
     matches!(s, Stmt::Call { .. } | Stmt::If { .. } | Stmt::Block(_))
