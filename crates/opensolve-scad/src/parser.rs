@@ -26,10 +26,20 @@ pub fn parse(text: &str, file: u32) -> Result<Vec<Stmt>, Error> {
     let mut out = Vec::new();
     while p.tok() != &Tok::End {
         if let Some(s) = p.statement()? {
-            out.push(s);
+            put(&mut out, s);
         }
     }
     Ok(out)
+}
+
+/// A statement added to a list; braces on their own only group, as in
+/// OpenSCAD: what they hold is of the scope around them (modules defined in
+/// a `{ // fold` block are the file's).
+fn put(out: &mut Vec<Stmt>, s: Stmt) {
+    match s {
+        Stmt::Block(b) => out.extend(b.iter().cloned()),
+        s => out.push(s),
+    }
 }
 
 /// One expression, as an override's value.
@@ -171,7 +181,7 @@ impl Parser<'_> {
                 return Err(self.error("expected “}”"));
             }
             if let Some(s) = self.statement()? {
-                out.push(s);
+                put(&mut out, s);
             }
         }
         Ok(out)
@@ -186,7 +196,11 @@ impl Parser<'_> {
         if self.eat("{") {
             return self.block();
         }
-        Ok(self.statement()?.into_iter().collect())
+        let mut out = Vec::new();
+        if let Some(s) = self.statement()? {
+            put(&mut out, s);
+        }
+        Ok(out)
     }
 
     fn instantiation(&mut self) -> Result<Stmt, Error> {
@@ -613,6 +627,17 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn braces_on_their_own_only_group() {
+        let s = parse(
+            "{ // fold\n module m() cube(); x = 1; { cube(); } }\nm();",
+            0,
+        )
+        .unwrap();
+        assert_eq!(s.len(), 4);
+        assert!(matches!(&s[0], Stmt::Module(n, _) if &**n == "m"));
     }
 
     #[test]
