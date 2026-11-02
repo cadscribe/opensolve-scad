@@ -174,6 +174,8 @@ pub fn highlight(tree: &Tree, text: &str) -> Vec<Span> {
             tokens[r].fill(t);
         }
     }
+    // What `*` disables is not built: grey like a comment.
+    disabled(tree.root_node(), text, &mut tokens);
     let mut out: Vec<Span> = Vec::new();
     let mut start = 0;
     for i in 1..=tokens.len() {
@@ -186,6 +188,21 @@ pub fn highlight(tree: &Tree, text: &str) -> Vec<Span> {
         }
     }
     out
+}
+
+/// Marks as comment the statements behind a `*` modifier below `node`.
+fn disabled(node: Node<'_>, text: &str, tokens: &mut [Token]) {
+    if node.kind() == "modifier" && text.get(node.byte_range()) == Some("*") {
+        let end = node.parent().map_or(node.end_byte(), |p| p.end_byte());
+        if let Some(t) = tokens.get_mut(node.start_byte()..end.min(text.len())) {
+            t.fill(Token::Comment);
+        }
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        disabled(child, text, tokens);
+    }
 }
 
 #[cfg(test)]
@@ -220,6 +237,19 @@ mod tests {
         assert_eq!(spans.first().unwrap().range.start, 0);
         assert_eq!(spans.last().unwrap().range.end, text.len());
         assert!(spans.windows(2).all(|w| w[0].range.end == w[1].range.start));
+    }
+
+    #[test]
+    fn what_a_star_disables_is_grey() {
+        let text = "*translate([0, 0, -1])\n    cylinder(d = 5, h = 60);\ncube(1);\ntranslate([1, 0, 0]) *sphere(2);\n";
+        let t = tokens(text);
+        let class = |s: &str| t.iter().find(|(x, _)| x.contains(s)).map(|(_, c)| *c);
+        assert_eq!(class("cylinder"), Some(Token::Comment), "{t:?}");
+        assert_eq!(class("translate([0"), Some(Token::Comment), "{t:?}");
+        assert_eq!(class("cube"), Some(Token::Builtin), "{t:?}");
+        assert_eq!(class("sphere"), Some(Token::Comment), "{t:?}");
+        // Only what follows it.
+        assert!(t.contains(&("translate", Token::Builtin)), "{t:?}");
     }
 
     #[test]
