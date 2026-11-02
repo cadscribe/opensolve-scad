@@ -193,6 +193,7 @@ fn in_a_call_the_parameters_are_offered_and_no_modules() {
     assert_eq!(items[0].label, "d", "{items:?}");
     assert_eq!(items[0].kind, CompletionKind::Parameter);
     assert_eq!(items[0].insert, "d = ");
+    assert!(items[0].doc.contains("diameter"), "{items:?}");
     assert_eq!(items[0].replace, at - 1..at);
     assert!(items.iter().any(|c| c.label == "d1"));
     assert!(

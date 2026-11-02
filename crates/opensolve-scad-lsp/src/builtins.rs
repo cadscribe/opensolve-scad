@@ -460,3 +460,79 @@ pub fn parameters(signature: &str) -> Vec<String> {
         .filter(|p| !p.is_empty())
         .collect()
 }
+
+/// What parameter `param` of the built-in `call` means, as completion and
+/// hover explain it.
+pub fn parameter_doc(call: &str, param: &str) -> Option<&'static str> {
+    Some(match (call, param) {
+        (_, "$fn") => {
+            "The number of pieces a full circle is cut into; 0 leaves it to `$fa` and `$fs`."
+        }
+        (_, "$fa") => "The smallest angle of a piece of a circle, in degrees (default 12).",
+        (_, "$fs") => "The smallest length of a piece of a circle, in mm (default 2).",
+        (_, "convexity") => {
+            "How many faces a ray may cross at most: only for the preview, ignored here."
+        }
+        ("cube" | "square", "size") => {
+            "The edge lengths: one number for all, or a vector `[x, y, z]` (`[x, y]` for a square)."
+        }
+        (_, "center") => {
+            "`true` centres it on the origin; `false` (default) puts its corner there (a cylinder's or extrusion's base on z = 0)."
+        }
+        ("sphere" | "circle", "r") => "The radius (default 1).",
+        ("sphere" | "circle", "d") => "The diameter, instead of `r`.",
+        ("cylinder", "h") => "The height along z (default 1).",
+        ("cylinder", "r") => "The radius at both ends.",
+        ("cylinder", "r1") => {
+            "The radius at the bottom (default 1): a cone when it differs from `r2`."
+        }
+        ("cylinder", "r2") => "The radius at the top (default 1); 0 makes a pointed cone.",
+        ("cylinder", "d") => "The diameter at both ends, instead of `r`.",
+        ("cylinder", "d1") => "The diameter at the bottom, instead of `r1`.",
+        ("cylinder", "d2") => "The diameter at the top, instead of `r2`.",
+        ("polyhedron", "points") => "The corners: a list of `[x, y, z]`.",
+        ("polyhedron", "faces") => {
+            "The faces: lists of indices into `points`, clockwise seen from outside."
+        }
+        ("polygon", "points") => "The corners: a list of `[x, y]`.",
+        ("polygon", "paths") => {
+            "Lists of indices into `points`: the first is the outline, the others holes. Without it, all points in order."
+        }
+        ("translate", "v") => "How far to move: `[x, y, z]`.",
+        ("mirror", "v") => {
+            "The normal of the mirror plane through the origin, e.g. `[1, 0, 0]` mirrors x."
+        }
+        ("scale", "v") => "The factors: one number for all axes, or `[x, y, z]`.",
+        ("rotate", "a") => {
+            "The angle in degrees about `v`, or `[x, y, z]`: about x, then y, then z."
+        }
+        ("rotate", "v") => "The axis to turn `a` degrees about, e.g. `[0, 0, 1]`.",
+        ("resize", "newsize") => "The size to stretch to: `[x, y, z]`; 0 keeps an axis as it is.",
+        ("resize", "auto") => {
+            "`true` (or per axis `[true, false, true]`) scales the axes given as 0 in proportion."
+        }
+        ("multmatrix", "m") => "A 4×4 (or 3×4) matrix that moves, turns and scales.",
+        ("color", "c") => "A name (`\"red\"`), `\"#rrggbb\"` or `[r, g, b]` from 0 to 1.",
+        ("color", "alpha") => "The opacity, from 0 to 1 (default 1).",
+        ("linear_extrude", "height") => "How high the 2D shape is extruded along z (default 100).",
+        ("linear_extrude", "twist") => "How far it turns over its height, in degrees (default 0).",
+        ("linear_extrude", "slices") => "How many layers a twist is cut into.",
+        ("linear_extrude", "scale") => {
+            "The size of the top relative to the bottom: one number or `[x, y]` (default 1)."
+        }
+        ("rotate_extrude", "angle") => {
+            "How far the 2D shape turns about z, in degrees (default 360)."
+        }
+        ("offset", "r") => "Grows (or shrinks, negative) the outline by a radius: rounded corners.",
+        ("offset", "delta") => {
+            "Grows (or shrinks, negative) the outline by a distance: sharp corners."
+        }
+        ("offset", "chamfer") => "With `delta`: cut the corners off instead of keeping them sharp.",
+        ("text", "text") => "The text.",
+        ("text", "size") => "The height of its letters, in mm (default 10).",
+        ("children", "index") => "Which children: an index, a list or a range; all without it.",
+        ("assert", "condition") => "Stops with an error when this is false.",
+        ("assert", "message") => "What the error says.",
+        _ => return None,
+    })
+}

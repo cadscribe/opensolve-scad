@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use tree_sitter::{Node, Tree};
 
-use crate::builtins::{BUILTINS, Builtin, BuiltinKind, builtin, parameters};
+use crate::builtins::{BUILTINS, Builtin, BuiltinKind, builtin, parameter_doc, parameters};
 use crate::index::{Def, DefKind, FileIndex, index, locals};
 use crate::syntax::{self, Span};
 use crate::text::{Lines, is_word, word_at};
@@ -448,13 +448,13 @@ impl Workspace {
             }
         };
         if let Some(call) = call.as_ref().filter(|c| c.at_name) {
-            for (name, detail) in self.call_parameters(path, text, call) {
+            for (name, detail, doc) in self.call_parameters(path, text, call) {
                 add(Completion {
                     insert: format!("{name} = "),
                     label: name,
                     kind: CompletionKind::Parameter,
                     detail,
-                    doc: String::new(),
+                    doc,
                     replace: replace.clone(),
                 });
             }
@@ -631,9 +631,14 @@ fn call_at(text: &str, offset: usize) -> Option<Call> {
 }
 
 impl Workspace {
-    /// The parameters of `call` not given by name yet: their names and how
-    /// the signature writes them (`h = 1`).
-    fn call_parameters(&self, path: &Path, text: &str, call: &Call) -> Vec<(String, String)> {
+    /// The parameters of `call` not given by name yet: their names, how
+    /// the signature writes them (`h = 1`, its default) and what they mean.
+    fn call_parameters(
+        &self,
+        path: &Path,
+        text: &str,
+        call: &Call,
+    ) -> Vec<(String, String, String)> {
         let name = &text[call.name.clone()];
         let signature = match self.resolve(path, call.name.end) {
             Some((Resolved::User(d, _), _)) => Some(d.signature),
@@ -654,7 +659,8 @@ impl Workspace {
                 let named = given
                     .split(',')
                     .any(|a| a.split('=').next().is_some_and(|x| x.trim() == n) && a.contains('='));
-                (!n.is_empty() && !named).then_some((n, p))
+                let doc = parameter_doc(name, &n).unwrap_or_default().to_string();
+                (!n.is_empty() && !named).then_some((n, p, doc))
             })
             .collect()
     }
