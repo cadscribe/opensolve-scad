@@ -9,6 +9,7 @@ mod builtins;
 mod cache;
 mod customizer;
 mod eval;
+mod fonts;
 mod geom;
 mod import;
 mod lexer;

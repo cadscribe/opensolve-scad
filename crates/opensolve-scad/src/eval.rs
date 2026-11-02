@@ -305,6 +305,8 @@ pub struct Interp {
     /// [`Interp::call_key`]): a module called again alike is not run again,
     /// as OpenSCAD keeps what it made too.
     made: HashMap<Vec<u8>, Made>,
+    /// Font files named by `use <…>`, as OpenSCAD takes them.
+    font_files: Vec<PathBuf>,
     /// Whether a file asks for the modules it is called in: then they are
     /// part of what a call depends on. BOSL2 asks only to say what is
     /// wrong when it stops.
@@ -322,6 +324,7 @@ impl Interp {
         Interp {
             main: 0,
             parents_matter,
+            font_files: Vec::new(),
             sources,
             blobs,
             loaded: Vec::new(),
@@ -523,6 +526,17 @@ impl Interp {
     /// (`into`), not in those that use or include that one.
     fn use_file(&mut self, path: &str, pos: Pos, into: &Rc<Frame>) -> R<()> {
         let file = self.path_of(pos, path);
+        // `use <font.ttf>` makes the font known to `text()`.
+        let ext = file
+            .extension()
+            .map(|e| e.to_string_lossy().to_ascii_lowercase())
+            .unwrap_or_default();
+        if ["ttf", "otf", "ttc", "otc"].contains(&ext.as_str()) {
+            if !self.font_files.contains(&file) {
+                self.font_files.push(file);
+            }
+            return Ok(());
+        }
         if !self.sources.contains_key(&file) {
             return Err(self.error(pos, format!("use <{path}>: the file cannot be read")));
         }
@@ -1400,11 +1414,10 @@ impl Interp {
     }
 
     /// `text(text, size, font, halign, valign, spacing)`: the letters of
-    /// a TrueType font, its em `size / 0.72` as in OpenSCAD, so that a
-    /// capital H of size 10 is about 9.5 high. The font is looked for by
-    /// its file's name among the machine's fonts; else the one OpenSolve
-    /// carries (Bitstream Vera Sans) stands in for OpenSCAD's Liberation
-    /// Sans: the letters are about as large, not the same.
+    /// a TrueType or OpenType font, its em `size / 0.72` as in OpenSCAD,
+    /// so that a capital H of size 10 is about 9.5 high. The font is found
+    /// by family and style as OpenSCAD finds it (see [`crate::fonts`]):
+    /// Liberation Sans without a name or for one the machine lacks.
     fn text(&mut self, a: &Args, pos: Pos) -> Option<Geom> {
         let words = match a.get("text", 0) {
             Some(Value::Str(s)) => s.to_string(),
@@ -1416,29 +1429,24 @@ impl Interp {
             Some(Value::Str(f)) => f.to_string(),
             _ => String::new(),
         };
-        let font = font.split(':').next().unwrap_or("").trim().to_string();
-        let found = !font.is_empty() && opensolve_sketch::text::has_font(&font);
-        if !font.is_empty() && !found {
+        let found = crate::fonts::find(&font, &self.font_files);
+        if found.stand_in {
+            let family = crate::fonts::parse(&font).0;
             self.note(
                 Some(pos),
-                format!("text: the font {font} is not found: Bitstream Vera Sans stands in"),
+                format!("text: the font {family} is not found: Liberation Sans stands in"),
             );
         }
+        let (data, index) = (found.data, found.index);
         let spacing = a.num("spacing", usize::MAX).unwrap_or(1.0);
         // In cap heights; a chord within a thousandth of the letters.
-        let outlines = opensolve_sketch::text::outlines(&words, &font, 1e-3);
+        let outlines = opensolve_sketch::text::outlines_in(&words, data, index, 1e-3);
         if outlines.is_empty() {
             return None;
         }
-        // The stand-in's capitals as high as Liberation Sans' would be
-        // (1409 of 2048 to the em).
-        let cap = if found {
-            opensolve_sketch::text::cap_per_em(&font)
-        } else {
-            1409.0 / 2048.0
-        };
+        let cap = opensolve_sketch::text::cap_per_em_in(data, index);
         let k = size / 0.72 * cap;
-        let width = opensolve_sketch::text::width(&words, &font) * k;
+        let width = opensolve_sketch::text::width_in(&words, data, index) * k;
         let mut paths: Vec<Vec<V2>> = outlines
             .into_iter()
             .map(|o| {

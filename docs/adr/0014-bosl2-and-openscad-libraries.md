@@ -118,13 +118,17 @@ What it took, each checked against OpenSCAD 2026.10 where in doubt:
   chained into loops and triangulated with the holes joined in, no
   booleans; parts that touch at a point are moved apart by 10 nm, so the
   mesh stays closed (a pentagram's tips, a ring gear's undercut).
-- `text()`: the glyph outlines the sketches use, a font of the machine by
-  its file's name, else Bitstream Vera Sans standing in for Liberation
-  Sans with capitals as high; the em is `size / 0.72` as in OpenSCAD.
-  About as large as OpenSCAD's letters, not the same shapes.
-- The hull adds its points farthest first and removes only the faces a
-  point sees that hang together, so points close to its faces (sums with
-  a tiny sphere) no longer break it.
+- `text()`: the glyph outlines the sketches use, kerned by the font's
+  `kern` table; the font found as fontconfig finds it, by family and
+  style (`"Arial:style=Bold"`) in the name tables of the machine's fonts
+  (collections too) and OpenSCAD's own; without a name, or for one the
+  machine lacks (with a note), Liberation Sans, which comes with OpenSolve
+  (SIL OFL) where neither has it; `use <font.ttf>` adds a file. The em is
+  `size / 0.72` as in OpenSCAD: its letters, where both have the font.
+- The hull is a quickhull: each face keeps the points above it, the
+  farthest goes next, and only the faces a point sees that hang together
+  are removed, so points close to its faces (sums with a tiny sphere) do
+  not break it.
 - A union the mesh library cannot make (BOSL2's open surfaces, strokes of
   debug drawings, some meshes where boolmesh 0.2.1 panics) puts both shapes
   together as they are, with a note; OpenSCAD shows them so too.
