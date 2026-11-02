@@ -156,7 +156,8 @@ impl Frame {
 
     /// A name's value: `$` names by who called, others by where written.
     fn get(self: &Rc<Frame>, name: &str) -> Option<Value> {
-        let dynamic = name.starts_with('$');
+        // `$children` is the module's where it is written, as in OpenSCAD.
+        let dynamic = name.starts_with('$') && name != "$children";
         let mut f: &Rc<Frame> = self;
         loop {
             if let Some(v) = f.own(name) {
@@ -456,6 +457,14 @@ impl Interp {
             ("$t", Value::Num(0.0)),
             ("$preview", Value::Bool(false)),
             ("$children", Value::Num(0.0)),
+            // The view of OpenSCAD's window, as it starts.
+            (
+                "$vpr",
+                Value::list(vec![Value::Num(55.0), Value::Num(0.0), Value::Num(25.0)]),
+            ),
+            ("$vpt", Value::list(vec![Value::Num(0.0); 3])),
+            ("$vpd", Value::Num(140.0)),
+            ("$vpf", Value::Num(22.5)),
         ] {
             f.set(&n.into(), v);
         }
@@ -511,6 +520,23 @@ impl Interp {
     /// those (as `children(i)` picks them). One shape per instantiation
     /// that makes one.
     fn exec(&mut self, stmts: &[Stmt], f: &Rc<Frame>, only: Option<&[usize]>) -> R<Vec<Geom>> {
+        Ok(self
+            .exec_nodes(stmts, f, only)?
+            .into_iter()
+            .flatten()
+            .collect())
+    }
+
+    /// As [`Interp::exec`], with what an instantiation made even if it is
+    /// nothing: `difference() { hide() …; cube(); }` cuts from nothing, as
+    /// in OpenSCAD, rather than from the cube. An `if` that runs nothing
+    /// and what `*` and `%` leave out are no instantiations.
+    fn exec_nodes(
+        &mut self,
+        stmts: &[Stmt],
+        f: &Rc<Frame>,
+        only: Option<&[usize]>,
+    ) -> R<Vec<Option<Geom>>> {
         for s in stmts {
             match s {
                 // The last definition of a name wins, as in OpenSCAD.
@@ -521,11 +547,15 @@ impl Interp {
             }
         }
         let mut order: Vec<(&Arc<str>, &Expr)> = Vec::new();
+        let mut at: HashMap<&str, usize, Fx> = HashMap::default();
         for s in stmts {
             if let Stmt::Assign { name, value, .. } = s {
-                match order.iter_mut().find(|o| o.0 == name) {
-                    Some(o) => o.1 = value,
-                    None => order.push((name, value)),
+                match at.get(&**name) {
+                    Some(&i) => order[i].1 = value,
+                    None => {
+                        at.insert(name, order.len());
+                        order.push((name, value));
+                    }
                 }
             }
         }
@@ -546,7 +576,8 @@ impl Interp {
         Ok(out)
     }
 
-    fn instance(&mut self, s: &Stmt, f: &Rc<Frame>) -> R<Option<Geom>> {
+    /// What an instantiation makes; `None` if it is none.
+    fn instance(&mut self, s: &Stmt, f: &Rc<Frame>) -> R<Option<Option<Geom>>> {
         let (made, modifier) = match s {
             Stmt::Call {
                 modifier: Modifier::Disable | Modifier::Background,
@@ -574,6 +605,9 @@ impl Interp {
                 } else {
                     or
                 };
+                if !branch.iter().any(is_instance) {
+                    return Ok(None);
+                }
                 let made = self.exec(branch, &Frame::inner(f), None)?;
                 (self.union(made, None)?, *modifier)
             }
@@ -586,7 +620,7 @@ impl Interp {
         if modifier == Modifier::Root && self.root.is_none() {
             self.root = Some(made.clone());
         }
-        Ok(made)
+        Ok(Some(made))
     }
 
     /// Evaluates the arguments of a call; `$` names among them go to `into`.
@@ -829,13 +863,23 @@ impl Interp {
                 self.union(made, Some(pos))?
             }
             "difference" | "intersection" => {
-                let made = kids(self)?;
+                let made = self.exec_nodes(children, &inner, None)?;
                 let op = if &**name == "difference" {
                     Op::Subtract
                 } else {
                     Op::Intersect
                 };
-                self.fold(made, op, pos)?
+                // From nothing nothing is cut; with nothing nothing is
+                // common.
+                let empty = match op {
+                    Op::Subtract => made.first().is_some_and(Option::is_none),
+                    _ => made.iter().any(Option::is_none),
+                };
+                if empty {
+                    None
+                } else {
+                    self.fold(made.into_iter().flatten().collect(), op, pos)?
+                }
             }
             "hull" => {
                 let made = kids(self)?;
@@ -867,7 +911,21 @@ impl Interp {
                 let shape = self.union(made, Some(pos))?;
                 self.offset(shape, &a, f, pos)?
             }
-            "projection" | "text" | "import" | "surface" | "roof" | "fill" => {
+            "projection" => {
+                let made = kids(self)?;
+                match self.union(made, Some(pos))? {
+                    Some(Geom::D3(s)) => match self.geo.projection(&s, a.bool("cut", 0)) {
+                        Ok(p) => p.map(Geom::D2),
+                        Err(e) => return Err(self.error(pos, e)),
+                    },
+                    Some(Geom::D2(_)) => {
+                        self.note(Some(pos), "projection: needs a 3D shape");
+                        None
+                    }
+                    None => None,
+                }
+            }
+            "text" | "import" | "surface" | "roof" | "fill" => {
                 self.note(Some(pos), format!("not supported: {name}"));
                 None
             }
@@ -1060,9 +1118,20 @@ impl Interp {
         flat: bool,
         pos: Option<Pos>,
     ) -> R<opensolve_kernel::Solid> {
-        self.geo
-            .boolean(a, b, op, flat)
-            .map_err(|e| self.error(pos.unwrap_or_default(), e))
+        match self.geo.boolean(a, b, op, flat) {
+            Ok(s) => Ok(s),
+            // A union that fails, of shapes that are not closed or meet
+            // badly (as BOSL2's open surfaces and strokes), is both shapes
+            // as they are, said in a note; OpenSCAD shows them so too.
+            Err(e) if op == Op::Add => {
+                self.note(
+                    pos,
+                    format!("union: the shapes are put together without joining them ({e})"),
+                );
+                Ok(opensolve_kernel::Solid::merged(&[a.clone(), b.clone()]))
+            }
+            Err(e) => Err(self.error(pos.unwrap_or_default(), e)),
+        }
     }
 
     /// The first shape and the others by `op`, those of the other dimension

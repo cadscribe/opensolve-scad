@@ -17,11 +17,11 @@ fn arg<'a>(args: &'a Args, name: &str, at: usize) -> Option<&'a Value> {
         .map(|(_, v)| v)
 }
 
+/// The number at place `at`, named or not: OpenSCAD's built-in functions
+/// take their arguments in order, whatever they are called
+/// (`rands(0, 1, 3, seed = 7)`).
 fn num(args: &Args, at: usize) -> Option<f64> {
-    args.iter()
-        .filter(|(n, _)| n.is_none())
-        .nth(at)
-        .and_then(|(_, v)| v.num())
+    args.get(at).and_then(|(_, v)| v.num())
 }
 
 /// The names of the built-in functions.
@@ -407,17 +407,72 @@ impl Mt19937 {
     }
 }
 
-/// `rands(min, max, count, seed)`: with a seed, `rng` is seeded anew, as
-/// OpenSCAD does.
+/// A seed from a number as OpenSCAD makes it (Python's hash of a float,
+/// to 31 bits): the same numbers for `rands(…, 915.474)` as in OpenSCAD.
+fn seed_of(v: f64) -> u32 {
+    const BITS: u32 = 31;
+    const MODULUS: u32 = (1 << BITS) - 1;
+    if !v.is_finite() {
+        return if v.is_nan() {
+            0
+        } else if v > 0.0 {
+            314_159
+        } else {
+            314_159u32.wrapping_neg()
+        };
+    }
+    // frexp: v = m * 2^e with 0.5 <= |m| < 1.
+    let (mut m, mut e) = if v == 0.0 {
+        (0.0, 0)
+    } else {
+        let e = v.abs().log2().floor() as i32 + 1;
+        let m = v / 2f64.powi(e);
+        // Rounding may leave m just outside [0.5, 1).
+        if m.abs() >= 1.0 {
+            (m / 2.0, e + 1)
+        } else if m.abs() < 0.5 {
+            (m * 2.0, e - 1)
+        } else {
+            (m, e)
+        }
+    };
+    let negative = m < 0.0;
+    m = m.abs();
+    let mut x: u32 = 0;
+    while m != 0.0 {
+        x = ((x << 28) & MODULUS) | (x >> (BITS - 28));
+        m *= 268_435_456.0;
+        e -= 28;
+        let y = m as u32;
+        m -= f64::from(y);
+        x = x.wrapping_add(y);
+        if x >= MODULUS {
+            x -= MODULUS;
+        }
+    }
+    let e = if e >= 0 {
+        e as u32 % BITS
+    } else {
+        BITS - 1 - ((-1 - e) as u32 % BITS)
+    };
+    x = ((x << e) & MODULUS) | (x >> (BITS - e));
+    if negative { x.wrapping_neg() } else { x }
+}
+
+/// `rands(min, max, count, seed)` as OpenSCAD's: with a seed, `rng` is
+/// seeded anew; without, it goes on.
 pub fn rands(args: &Args, rng: &mut Mt19937) -> Value {
     let (Some(lo), Some(hi), Some(n)) = (num(args, 0), num(args, 1), num(args, 2)) else {
         return Value::Undef;
     };
     if let Some(seed) = num(args, 3) {
-        *rng = Mt19937::new(seed as i64 as u32);
+        *rng = Mt19937::new(seed_of(seed));
     }
     let (lo, hi) = if hi < lo { (hi, lo) } else { (lo, hi) };
     let n = (n.round().max(0.0) as usize).min(crate::value::MOST);
+    if lo >= hi {
+        return Value::list(vec![Value::Num(lo); n]);
+    }
     Value::list((0..n).map(|_| Value::Num(rng.uniform(lo, hi))).collect())
 }
 

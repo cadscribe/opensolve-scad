@@ -13,6 +13,7 @@ mod geom;
 mod lexer;
 pub mod library;
 mod parser;
+mod region;
 mod trig;
 mod value;
 

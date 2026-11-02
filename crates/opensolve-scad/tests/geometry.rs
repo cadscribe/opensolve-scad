@@ -281,11 +281,11 @@ fn polyhedrons_either_way_round() {
 
 #[test]
 fn not_supported_is_said() {
-    let out = solid("cube(1); projection() cube(1); text(\"a\");");
+    let out = solid("cube(1); surface(\"a.png\"); text(\"a\");");
     assert!(
         out.notes
             .iter()
-            .any(|n| n.contains("not supported: projection"))
+            .any(|n| n.contains("not supported: surface"))
     );
     assert!(out.notes.iter().any(|n| n.contains("not supported: text")));
 }
@@ -321,6 +321,65 @@ fn minkowski_sums() {
              [5, 20], [0, 20]]); circle(1, $fn = 8); }",
         ),
         515.071,
+    );
+}
+
+#[test]
+fn projections() {
+    let parts = "union() { cube([20, 10, 5]); translate([5, 5, 0]) rotate([30, 20, 10]) \
+                 cube([10, 10, 10]); translate([30, 0, 0]) difference() { \
+                 cylinder(r = 8, h = 4, $fn = 24); cylinder(r = 3, h = 10, center = true, \
+                 $fn = 12); } }";
+    // As OpenSCAD makes them: the shadow, and the section.
+    near(
+        volume(&format!("linear_extrude(1) projection() {parts}")),
+        427.176,
+    );
+    near(
+        volume(&format!(
+            "linear_extrude(1) projection(cut = true) translate([0, 0, -2]) {{ {parts} \
+             sphere(4, $fn = 12); }}"
+        )),
+        425.515,
+    );
+}
+
+#[test]
+fn polygons_that_cross_themselves_are_filled_even_odd() {
+    // As OpenSCAD fills them: a pentagram without its middle, a bow tie,
+    // a bar across a frame; closed, the points where parts touch apart.
+    for (text, v) in [
+        (
+            "polygon([for (i = [0:4]) 50 * [cos(90 + 144 * i), sin(90 + 144 * i)]]);",
+            1939.192,
+        ),
+        (
+            "polygon([[0, 0], [10, 0], [10, 10], [5, -5], [0, 10]]);",
+            41.667,
+        ),
+        (
+            "polygon(points = [[0, 0], [20, 0], [20, 20], [0, 20], [5, 5], [15, 5], [15, 15], \
+             [5, 15], [8, -3], [12, -3], [12, 25], [8, 25]], paths = [[0, 1, 2, 3], \
+             [4, 5, 6, 7], [8, 9, 10, 11]]);",
+            332.0,
+        ),
+    ] {
+        let v2 = volume(&format!("linear_extrude(1) {text}"));
+        assert!((v2 - v).abs() < 2e-3, "{v2} is not {v}: {text}");
+    }
+}
+
+#[test]
+fn nothing_made_is_a_child_too() {
+    // From nothing nothing is cut; an `if` that makes nothing is no child.
+    near(
+        volume(
+            "difference() { if (false) cube(1); cube(2); sphere(1); }\n\
+             translate([5, 0, 0]) intersection() { if (false) cube(1); cube(2); \
+             translate([1, 0, 0]) cube(2); }\n\
+             translate([10, 0, 0]) difference() { group() {} cube(3); }",
+        ),
+        11.693,
     );
 }
 

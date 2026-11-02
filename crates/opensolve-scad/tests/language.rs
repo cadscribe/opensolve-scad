@@ -214,10 +214,7 @@ fn errors_and_notes_say_where() {
     let e = run_with(&[("main.scad", "cube(1);\nsphere(2\n")], &[]).unwrap_err();
     assert!(e.starts_with("line 3, column 1:"), "{e}");
     let out = run_with(
-        &[(
-            "main.scad",
-            "cube(size);\nprojection() { cube(1); sphere(1); }\nfoo();",
-        )],
+        &[("main.scad", "cube(size);\nsurface(\"a.png\");\nfoo();")],
         &[],
     )
     .unwrap();
@@ -229,7 +226,7 @@ fn errors_and_notes_say_where() {
     );
     assert!(
         out.notes
-            .contains(&"line 2: not supported: projection".to_string())
+            .contains(&"line 2: not supported: surface".to_string())
     );
     assert!(
         out.notes
@@ -267,6 +264,33 @@ fn recursion_as_deep_as_openscad_goes() {
              echo(f(100000), g(5000), h(20000));"
         ),
         "5.00005e+09, 5000, \"done\""
+    );
+}
+
+#[test]
+fn children_counts_where_it_is_written() {
+    // `$children` is the module's whose body it is in; other `$` names
+    // come from who called.
+    assert_eq!(
+        echoes(
+            "module wrap() { $x = \"wrap\"; children(); }\n\
+             module outer() { $x = \"outer\"; wrap() echo($children, $x); }\n\
+             outer() { cube(1); cube(2); cube(3); }"
+        ),
+        ["3, \"wrap\""]
+    );
+}
+
+#[test]
+fn random_numbers_as_openscad_draws_them() {
+    // With a seed, OpenSCAD's numbers; a seed that is no whole number and
+    // a seed given by name count too.
+    assert_eq!(
+        echo(
+            "echo(rands(0, 1, 3, 42), rands(0, 10, 2, seed = 7), rands(10, 20, 2, 915.474), rands(0, 1, 2, -3.5));"
+        ),
+        "[0.796543, 0.183435, 0.779691], [2.27339, 3.18972], [15.7865, 19.0684], \
+         [0.0238099, 0.0774603]"
     );
 }
 

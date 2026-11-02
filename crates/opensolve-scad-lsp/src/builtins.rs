@@ -126,11 +126,11 @@ pub const BUILTINS: &[Builtin] = &[
         "surface(file, center = false, invert = false, convexity)",
         "A height map read from a file. Not supported by OpenSolve yet.",
     )),
-    no(m(
+    m(
         "projection",
         "projection(cut = false)",
-        "The 2D shadow of its 3D children on the xy plane. Not supported by OpenSolve yet.",
-    )),
+        "The 2D shadow of its 3D children on the xy plane. With `cut = true`, its section at z = 0.",
+    ),
     no(m(
         "roof",
         "roof(method = \"voronoi\")",
