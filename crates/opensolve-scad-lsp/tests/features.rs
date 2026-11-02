@@ -1,0 +1,184 @@
+//! What the language server answers about files: diagnostics, completion,
+//! definitions, hover, symbols and signatures.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+
+use opensolve_scad_lsp::{CompletionKind, DefKind, Severity, Workspace};
+
+/// A workspace whose files on "disk" are `files`, below `/p`.
+fn workspace(files: &[(&str, &str)]) -> Workspace {
+    let files: HashMap<PathBuf, String> = files
+        .iter()
+        .map(|(n, t)| (Path::new("/p").join(n), t.to_string()))
+        .collect();
+    Workspace::new(Box::new(move |p| files.get(p).cloned()))
+}
+
+fn main_path() -> &'static Path {
+    Path::new("/p/main.scad")
+}
+
+/// The byte offset just after the first `marker` in `text`.
+fn after(text: &str, marker: &str) -> usize {
+    text.find(marker).unwrap() + marker.len()
+}
+
+#[test]
+fn a_syntax_error_is_found_where_it_is() {
+    let text = "cube(1);\ntranslate([1, 0, 0] sphere(2);\n";
+    let mut w = workspace(&[]);
+    w.set(main_path(), text.to_string());
+    let d = w.diagnostics(main_path());
+    assert!(!d.is_empty());
+    assert!(d.iter().all(|d| d.severity == Severity::Error), "{d:?}");
+    let line = text[..d[0].range.start].matches('\n').count();
+    assert_eq!(line, 1, "{d:?}");
+}
+
+#[test]
+fn an_unknown_module_is_marked_at_its_name() {
+    let text = "cube(1);\n  frobnicate(2);\necho(\"hi\");\nminkowski() cube(1);\n";
+    let mut w = workspace(&[]);
+    w.set(main_path(), text.to_string());
+    let d = w.diagnostics(main_path());
+    let unknown = d
+        .iter()
+        .find(|d| d.message.contains("unknown module frobnicate"))
+        .unwrap_or_else(|| panic!("{d:?}"));
+    assert_eq!(unknown.severity, Severity::Warning);
+    assert_eq!(&text[unknown.range.clone()], "frobnicate");
+    let echo = d.iter().find(|d| d.message.contains("ECHO")).unwrap();
+    assert_eq!(echo.severity, Severity::Info);
+    assert!(
+        d.iter()
+            .any(|d| d.message.contains("not supported: minkowski"))
+    );
+    // A missing include is said at once.
+    w.set(main_path(), "include <gone.scad>\ncube(1);".to_string());
+    let d = w.syntax_diagnostics(main_path());
+    assert!(d.iter().any(|d| d.message.contains("gone.scad")), "{d:?}");
+}
+
+#[test]
+fn completion_in_a_module_body_offers_user_modules_and_built_ins() {
+    let lib = "module rounded(r = 1) { sphere(r); }\nfunction twice(x) = 2 * x;\nhidden = 3;\n";
+    let text = "use <lib.scad>\nwidth = 4;\nmodule plate(t) {\n  cu\n}\nmodule peg() {}\n";
+    let mut w = workspace(&[("lib.scad", lib)]);
+    w.set(main_path(), text.to_string());
+    let at = after(text, "  cu");
+    let items = w.completion(main_path(), at);
+    let has = |label: &str, kind: CompletionKind| {
+        items.iter().any(|c| c.label == label && c.kind == kind)
+    };
+    assert!(has("cube", CompletionKind::Module), "{items:?}");
+    assert!(
+        !has("cylinder", CompletionKind::Module),
+        "filtered by what is typed"
+    );
+    assert!(
+        !has("sphere", CompletionKind::Module),
+        "filtered by what is typed"
+    );
+    assert_eq!(items[0].replace, at - 2..at);
+    // With nothing typed: everything the place sees.
+    let at = after(text, "  cu") - 2;
+    let items = w.completion(main_path(), at);
+    let has = |label: &str, kind: CompletionKind| {
+        items.iter().any(|c| c.label == label && c.kind == kind)
+    };
+    assert!(has("rounded", CompletionKind::Module), "from use <>");
+    assert!(has("twice", CompletionKind::Function));
+    assert!(has("peg", CompletionKind::Module));
+    assert!(has("plate", CompletionKind::Module));
+    assert!(has("width", CompletionKind::Variable));
+    assert!(has("t", CompletionKind::Parameter));
+    assert!(has("$fn", CompletionKind::Constant));
+    assert!(has("for", CompletionKind::Keyword));
+    assert!(
+        !items.iter().any(|c| c.label == "hidden"),
+        "use <> brings no variables"
+    );
+    let rounded = items.iter().find(|c| c.label == "rounded").unwrap();
+    assert_eq!(rounded.detail, "module rounded(r = 1)");
+}
+
+#[test]
+fn go_to_definition_across_use_and_include() {
+    let lib = "include <deep.scad>\n// A rounded thing.\nmodule rounded(r = 1) { sphere(r); }\n";
+    let deep = "function far(x) = x;\n";
+    let text = "use <lib.scad>\nrounded(2);\ny = far(1);\nk = 2;\ncube(k);\n";
+    let mut w = workspace(&[("lib.scad", lib), ("deep.scad", deep)]);
+    w.set(main_path(), text.to_string());
+    let at = text.find("rounded(2)").unwrap() + 2;
+    let l = w.definition(main_path(), at).expect("rounded");
+    assert_eq!(l.path, Path::new("/p/lib.scad"));
+    assert_eq!(&lib[l.range], "rounded");
+    // What lib.scad includes is part of it for `use`, its functions too.
+    let l = w
+        .definition(main_path(), text.find("far(").unwrap())
+        .unwrap();
+    assert_eq!(l.path, Path::new("/p/deep.scad"));
+    // A variable in the same file.
+    let l = w
+        .definition(main_path(), text.find("cube(k").unwrap() + 5)
+        .unwrap();
+    assert_eq!(l.path, main_path());
+    assert_eq!(
+        l.range,
+        text.find("k = 2").unwrap()..text.find("k = 2").unwrap() + 1
+    );
+    // The path of `use` opens the file.
+    let l = w.definition(main_path(), 7).unwrap();
+    assert_eq!(l.path, Path::new("/p/lib.scad"));
+    // The comment above is the explanation.
+    let h = w
+        .hover(main_path(), text.find("rounded(2)").unwrap())
+        .unwrap();
+    assert_eq!(h.signature, "module rounded(r = 1)");
+    assert!(h.doc.starts_with("A rounded thing."), "{}", h.doc);
+}
+
+#[test]
+fn hover_on_a_built_in_shows_its_signature_and_what_it_does() {
+    let text = "cylinder(h = 2, r = 1);\nx = sin(30);\nsphere(r = 1, $fn = 20);\n";
+    let mut w = workspace(&[]);
+    w.set(main_path(), text.to_string());
+    let h = w.hover(main_path(), 3).expect("cylinder");
+    assert_eq!(&text[h.range.clone()], "cylinder");
+    assert!(h.signature.starts_with("cylinder(h = 1"), "{}", h.signature);
+    assert!(h.markdown.contains("cone"), "{}", h.markdown);
+    let h = w.hover(main_path(), after(text, "x = si")).unwrap();
+    assert_eq!(h.signature, "sin(degrees)");
+    let h = w.hover(main_path(), after(text, "$f")).unwrap();
+    assert_eq!(h.signature, "$fn");
+}
+
+#[test]
+fn symbols_and_signatures() {
+    let text = "w = 3;\nmodule box(size, center = false) { cube(size, center); }\nfunction f(a, b) = a + b;\nbox([1, 2, 3], );\n";
+    let mut w = workspace(&[]);
+    w.set(main_path(), text.to_string());
+    let s: Vec<_> = w
+        .symbols(main_path())
+        .into_iter()
+        .map(|s| (s.name, s.kind))
+        .collect();
+    assert_eq!(
+        s,
+        [
+            ("w".to_string(), DefKind::Variable),
+            ("box".to_string(), DefKind::Module),
+            ("f".to_string(), DefKind::Function)
+        ]
+    );
+    let sig = w
+        .signature(main_path(), after(text, "box([1, 2, 3], "))
+        .unwrap();
+    assert_eq!(sig.label, "box(size, center = false)");
+    assert_eq!(sig.parameters, ["size", "center = false"]);
+    assert_eq!(sig.active, 1);
+    let sig = w.signature(main_path(), after(text, "cube(")).unwrap();
+    assert_eq!(sig.active, 0);
+    assert!(sig.label.starts_with("cube("));
+}

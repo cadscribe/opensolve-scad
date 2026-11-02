@@ -58,6 +58,26 @@ impl std::fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// A note with where it is, for an editor: line and column from 1 (0 when
+/// it has no place), in `file` if that is not the main one. `echo` says it
+/// is what `echo` wrote rather than a problem.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Note {
+    pub file: Option<PathBuf>,
+    pub line: u32,
+    pub col: u32,
+    pub message: String,
+    pub echo: bool,
+}
+
+/// What an evaluation of a file finds, for an editor: the error that ends
+/// it, if any, and the notes on the way, each with its place.
+#[derive(Clone, Debug, Default)]
+pub struct Diagnosis {
+    pub error: Option<Error>,
+    pub notes: Vec<Note>,
+}
+
 /// A file's solid, and what is worth knowing about it: its `echo` output,
 /// what is not supported, unknown names.
 #[derive(Clone, Debug, Default)]
@@ -80,6 +100,37 @@ pub fn build(
     let mut sources = HashMap::new();
     gather(&path, read, &mut sources)?;
     deep(move || evaluate(path, sources, overrides))?
+}
+
+/// Runs the file at `path` as [`build`] does and tells what goes wrong,
+/// with places: what an editor marks. The shapes it makes do not matter.
+pub fn diagnose(path: &Path, read: Reader<'_>, overrides: &[(String, String)]) -> Diagnosis {
+    let path = plain(path);
+    let mut sources = HashMap::new();
+    if let Err(e) = gather(&path, read, &mut sources) {
+        return Diagnosis {
+            error: Some(Error::at(0, 0, e)),
+            notes: Vec::new(),
+        };
+    }
+    deep(move || {
+        let mut it = eval::Interp::new(sources);
+        let error = it
+            .load(path, &mut Vec::new())
+            .and_then(|mut stmts| {
+                override_values(&mut it, &mut stmts, overrides);
+                it.run(&stmts, &eval::Interp::root())
+            })
+            .err();
+        Diagnosis {
+            error,
+            notes: std::mem::take(&mut it.marks),
+        }
+    })
+    .unwrap_or_else(|e| Diagnosis {
+        error: Some(Error::at(0, 0, e)),
+        notes: Vec::new(),
+    })
 }
 
 /// The file at `path` and those it includes and uses, as far as they can
@@ -139,18 +190,7 @@ fn evaluate(
 ) -> Result<Output, String> {
     let mut it = eval::Interp::new(sources);
     let mut stmts = it.load(path, &mut Vec::new()).map_err(|e| e.to_string())?;
-    for (name, text) in overrides {
-        match parser::parse_expr(text) {
-            Ok(value) => stmts.push(ast::Stmt::Assign {
-                name: name.as_str().into(),
-                value,
-                pos: ast::Pos::default(),
-                span: (0, 0),
-                end_line: 0,
-            }),
-            Err(e) => it.note(None, format!("{name} = {text}: {}", e.message)),
-        }
-    }
+    override_values(&mut it, &mut stmts, overrides);
     let made = it
         .run(&stmts, &eval::Interp::root())
         .map_err(|e| e.to_string())?;
@@ -172,6 +212,26 @@ fn evaluate(
             Some(n) => format!("it makes no solid ({n})"),
             None => "it makes no solid".to_string(),
         }),
+    }
+}
+
+/// The values of `overrides` assigned after the file's own, as `-D` does.
+fn override_values(
+    it: &mut eval::Interp,
+    stmts: &mut Vec<ast::Stmt>,
+    overrides: &[(String, String)],
+) {
+    for (name, text) in overrides {
+        match parser::parse_expr(text) {
+            Ok(value) => stmts.push(ast::Stmt::Assign {
+                name: name.as_str().into(),
+                value,
+                pos: ast::Pos::default(),
+                span: (0, 0),
+                end_line: 0,
+            }),
+            Err(e) => it.note(None, format!("{name} = {text}: {}", e.message)),
+        }
     }
 }
 
