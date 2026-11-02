@@ -44,9 +44,12 @@ OpenSCAD does is the part that matters for parts that fit.
 - A 2D shape is a slab one unit thick: its booleans are the kernel's, and its
   top is the shape an extrusion takes. No polygon clipper of its own.
 - Not supported yet, and named in a note rather than left out silently:
-  `minkowski`, `offset`, `projection`, `text`, `import`, `surface`, `roof`.
-  `color` is kept as a group and its colour dropped: a link is one feature, and
-  colours are per part. `rands` gives other numbers than OpenSCAD.
+  `import`, `surface`, `roof`, `fill`. `color` is kept as a group and its
+  colour dropped: a link is one feature, and colours are per part.
+  (2026-11-02, ADR 0014: `minkowski`, `offset`, `projection` and `text`
+  are built now, `rands` gives OpenSCAD's numbers for a seed, and
+  `include <…>` finds libraries as OpenSCAD does, BOSL2 coming with the
+  app.)
 - A `.scad` file is linked like the others (`Feature::Link`): the file dialogs
   offer it, the solid is built when the model's links are read, and its
   problems are the link's, so the rest of the model still builds. A parse error
@@ -109,7 +112,9 @@ OpenSCAD does is the part that matters for parts that fit.
   `model_parameters`; `get_feature` shows `model_parameters` and
   `built_with`, the values the file gets.
 - Evaluation runs on a thread with a large stack: OpenSCAD files loop by
-  recursion. Calls deeper than 3,000 end with an error.
+  recursion. Calls deeper than 3,000 end with an error. (ADR 0014: a call
+  in a function's tail runs in a loop, up to a million steps; others may go
+  100,000 deep or until the stack runs short.)
 
 ## Consequences
 
@@ -125,4 +130,4 @@ OpenSCAD does is the part that matters for parts that fit.
   `Linked` is `Arc<(Solid, Facets, Vec<String>)>`.
 - BOSL2 and other large libraries need what v1 leaves out (`offset`,
   `minkowski`, `text`, `import`, `include` inside a module); nothing in the
-  design blocks them.
+  design blocks them. Done for BOSL2 in ADR 0014, but `import`.
