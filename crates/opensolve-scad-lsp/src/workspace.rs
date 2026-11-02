@@ -118,11 +118,16 @@ pub struct External {
     pub doc: String,
 }
 
+/// A file of a library folder and when it was changed when it was read.
+type Stamped = (Option<std::time::SystemTime>, Arc<Parsed>);
+
 /// The open files, and how others are read.
 pub struct Workspace {
     open: HashMap<PathBuf, Arc<Parsed>>,
     /// Files read from the disk, by their text.
     cache: Mutex<HashMap<PathBuf, Arc<Parsed>>>,
+    /// Files of the library folders, by when they were last changed.
+    libraries: Mutex<HashMap<PathBuf, Stamped>>,
     read: Box<Read>,
     /// The variables files are given from outside, by file.
     external: HashMap<PathBuf, Vec<External>>,
@@ -165,6 +170,7 @@ impl Workspace {
         Workspace {
             open: HashMap::new(),
             cache: Mutex::new(HashMap::new()),
+            libraries: Mutex::new(HashMap::new()),
             read,
             external: HashMap::new(),
         }
@@ -204,13 +210,29 @@ impl Workspace {
         self.open.contains_key(&plain(path))
     }
 
-    /// A file, open or read.
+    /// A file, open or read. A library's (BOSL2's sixty files) is read
+    /// and parsed once, and again only when it changes on the disk.
     pub fn file(&self, path: &Path) -> Option<Arc<Parsed>> {
         let path = plain(path);
         if let Some(p) = self.open.get(&path) {
             return Some(p.clone());
         }
-        let text = (self.read)(&path)?;
+        let library = opensolve_scad::library::is_library(&path);
+        let stamp = library.then(|| std::fs::metadata(&path).and_then(|m| m.modified()).ok());
+        if let Some(stamp) = &stamp {
+            let libs = self.libraries.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((when, p)) = libs.get(&path)
+                && when == stamp
+            {
+                return Some(p.clone());
+            }
+        }
+        let text = (self.read)(&path).or_else(|| {
+            library
+                .then(|| opensolve_scad::library::read(&path).ok())
+                .flatten()
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+        })?;
         let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(p) = cache.get(&path)
             && p.text == text
@@ -218,13 +240,36 @@ impl Workspace {
             return Some(p.clone());
         }
         let p = Arc::new(Parsed::new(text));
-        cache.insert(path, p.clone());
+        if let Some(stamp) = stamp {
+            let mut libs = self.libraries.lock().unwrap_or_else(|e| e.into_inner());
+            libs.insert(path, (stamp, p.clone()));
+        } else {
+            cache.insert(path, p.clone());
+        }
         Some(p)
     }
 
-    /// The file an `include` or `use` in `from` names.
-    fn import_path(from: &Path, path: &str) -> PathBuf {
-        plain(&from.parent().unwrap_or(Path::new("")).join(path))
+    /// The file an `include` or `use` in `from` names: beside it, else in
+    /// the library folders, as OpenSCAD looks (ADR 0014).
+    fn import_path(&self, from: &Path, path: &str) -> PathBuf {
+        let local = plain(&from.parent().unwrap_or(Path::new("")).join(path));
+        if Path::new(path).is_absolute() || self.file(&local).is_some() {
+            return local;
+        }
+        let found = opensolve_scad::library::search()
+            .into_iter()
+            .map(|lib| plain(&lib.join(path)))
+            .find(|p| self.file(p).is_some());
+        if let Some(f) = found {
+            return f;
+        }
+        if Path::new(path).starts_with(opensolve_scad::library::BUNDLED) {
+            opensolve_scad::library::ensure_bundled();
+            if let Some(own) = opensolve_scad::library::own_dir() {
+                return plain(&own.join(path));
+            }
+        }
+        local
     }
 
     /// The highlighted pieces of a file.
@@ -241,7 +286,7 @@ impl Workspace {
         let mut out = syntax::errors(&p.tree, &p.text);
         // An `include` or `use` of a file that is not there.
         for i in &p.index.imports {
-            if self.file(&Self::import_path(path, &i.path)).is_none() {
+            if self.file(&self.import_path(path, &i.path)).is_none() {
                 out.push(Diagnostic {
                     range: i.range.clone(),
                     severity: Severity::Error,
@@ -338,7 +383,7 @@ impl Workspace {
             }
         }
         for i in &p.index.imports {
-            let file = Self::import_path(path, &i.path);
+            let file = self.import_path(path, &i.path);
             if i.include {
                 self.gather(&file, all, seen, out);
             } else if all {
@@ -414,7 +459,7 @@ impl Workspace {
     pub fn link_at(&self, path: &Path, offset: usize) -> Option<Range<usize>> {
         let p = self.file(path)?;
         if let Some(i) = p.index.imports.iter().find(|i| i.range.contains(&offset)) {
-            let file = Self::import_path(path, &i.path);
+            let file = self.import_path(path, &i.path);
             return self.file(&file).map(|_| i.range.clone());
         }
         match self.resolve(path, offset)? {
@@ -426,7 +471,7 @@ impl Workspace {
     pub fn definition(&self, path: &Path, offset: usize) -> Option<Location> {
         let p = self.file(path)?;
         if let Some(i) = p.index.imports.iter().find(|i| i.range.contains(&offset)) {
-            let file = Self::import_path(path, &i.path);
+            let file = self.import_path(path, &i.path);
             return self.file(&file).map(|_| Location {
                 path: file,
                 range: 0..0,
@@ -564,9 +609,13 @@ impl Workspace {
                 insert: e.name.clone(),
             });
         }
-        for (d, _) in self.visible(path) {
-            // Not the name being typed.
-            if d.name_range.end == offset {
+        let own = plain(path);
+        for (d, file) in self.visible(path) {
+            // Not the name being typed; a library's inner names (BOSL2's
+            // `_cut_to_seg_u_form`) only when an underscore is typed.
+            if d.name_range.end == offset
+                || (file != own && d.name.starts_with('_') && !typed.starts_with('_'))
+            {
                 continue;
             }
             add(def_completion(&d, replace.clone()));
@@ -589,10 +638,19 @@ impl Workspace {
             Some(i) => (&typed[..=i], &typed[i + 1..]),
             None => ("", typed),
         };
-        let base = path.parent().unwrap_or(Path::new("")).join(dir_part);
-        let mut out = Vec::new();
-        let entries = std::fs::read_dir(&base).ok()?;
-        for e in entries.flatten() {
+        let mut bases = vec![path.parent().unwrap_or(Path::new("")).join(dir_part)];
+        bases.extend(
+            opensolve_scad::library::search()
+                .into_iter()
+                .map(|lib| lib.join(dir_part)),
+        );
+        let mut out: Vec<Completion> = Vec::new();
+        let entries: Vec<std::fs::DirEntry> = bases
+            .iter()
+            .filter_map(|b| std::fs::read_dir(b).ok())
+            .flat_map(|r| r.flatten())
+            .collect();
+        for e in entries {
             let name = e.file_name().to_string_lossy().into_owned();
             let is_dir = e.file_type().is_ok_and(|t| t.is_dir());
             let scad = Path::new(&name)
@@ -602,6 +660,9 @@ impl Workspace {
                 continue;
             }
             let label = if is_dir { format!("{name}/") } else { name };
+            if out.iter().any(|c| c.label == label) {
+                continue;
+            }
             out.push(Completion {
                 insert: label.clone(),
                 label,

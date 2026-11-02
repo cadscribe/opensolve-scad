@@ -95,12 +95,12 @@ pub fn openscad_path() -> Vec<PathBuf> {
 /// The folders searched for libraries, in their order.
 pub fn dirs() -> Vec<PathBuf> {
     if let Some(d) = DIRS.read().ok().and_then(|d| d.clone()) {
-        return d;
+        return d.iter().map(|p| crate::plain(p)).collect();
     }
     let mut out = openscad_path();
     out.extend(openscad_user_dir());
     out.extend(own_dir());
-    out
+    out.iter().map(|p| crate::plain(p)).collect()
 }
 
 /// The folders an include is looked for in after the file's own: [`dirs`],
