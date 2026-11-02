@@ -262,3 +262,17 @@ fn variables_given_from_outside_are_known_completed_and_shown() {
     assert!(w.set_external(main_path(), Vec::new()));
     assert_eq!(unknown(&w).len(), 2);
 }
+
+#[test]
+fn what_a_command_click_goes_to_is_a_link() {
+    let lib = "module rounded(r = 1) { sphere(r); }\n";
+    let text = "use <lib.scad>\nrounded(2);\ncube(1);\nuse <gone.scad>\n";
+    let mut w = workspace(&[("lib.scad", lib)]);
+    w.set(main_path(), text.to_string());
+    let link = |at: usize| w.link_at(main_path(), at).map(|r| &text[r]);
+    assert_eq!(link(text.find("rounded").unwrap() + 3), Some("rounded"));
+    assert_eq!(link(text.find("lib.scad").unwrap()), Some("<lib.scad>"));
+    // A built-in and a file not there go nowhere.
+    assert_eq!(link(text.find("cube").unwrap() + 1), None);
+    assert_eq!(link(text.find("gone").unwrap()), None);
+}

@@ -409,6 +409,20 @@ impl Workspace {
 
     /// Where the name at `offset` is defined; the file an `include` or
     /// `use` names when at its path.
+    /// What a Cmd+click at `offset` would go to, as the text to mark as a
+    /// link: an included file's path, a name defined in the files.
+    pub fn link_at(&self, path: &Path, offset: usize) -> Option<Range<usize>> {
+        let p = self.file(path)?;
+        if let Some(i) = p.index.imports.iter().find(|i| i.range.contains(&offset)) {
+            let file = Self::import_path(path, &i.path);
+            return self.file(&file).map(|_| i.range.clone());
+        }
+        match self.resolve(path, offset)? {
+            (Resolved::User(..), range) => Some(range),
+            (Resolved::Builtin(_), _) => None,
+        }
+    }
+
     pub fn definition(&self, path: &Path, offset: usize) -> Option<Location> {
         let p = self.file(path)?;
         if let Some(i) = p.index.imports.iter().find(|i| i.range.contains(&offset)) {
