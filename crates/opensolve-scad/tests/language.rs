@@ -102,7 +102,7 @@ fn list_comprehensions() {
     );
     assert_eq!(
         echo("echo([for (i = 0, s = 0; i < 4; i = i + 1, s = s + i) s]);"),
-        "[0, 0, 1, 3]"
+        "[0, 1, 3, 6]"
     );
     assert_eq!(
         echo("echo([each [1, 2], each [5:7], for (x = [1, 2]) let (y = x * 10) y]);"),

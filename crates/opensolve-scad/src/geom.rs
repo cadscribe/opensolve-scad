@@ -45,34 +45,13 @@ pub fn fragments(r: f64, fn_: f64, fs: f64, fa: f64) -> usize {
 }
 
 /// The sine of `x` degrees, exact at multiples of 30° as in OpenSCAD.
-#[allow(clippy::float_cmp)]
 pub fn sin_deg(x: f64) -> f64 {
-    if !x.is_finite() {
-        return f64::NAN;
-    }
-    let mut x = x.rem_euclid(360.0);
-    let oppose = x >= 180.0;
-    if oppose {
-        x -= 180.0;
-    }
-    if x > 90.0 {
-        x = 180.0 - x;
-    }
-    let s = if x < 45.0 {
-        if x == 30.0 { 0.5 } else { x.to_radians().sin() }
-    } else if x == 45.0 {
-        std::f64::consts::FRAC_1_SQRT_2
-    } else if x == 60.0 {
-        3f64.sqrt() / 2.0
-    } else {
-        (90.0 - x).to_radians().cos()
-    };
-    if oppose { -s } else { s }
+    crate::trig::sin(x)
 }
 
-/// The cosine of `x` degrees, exact at multiples of 30°.
+/// The cosine of `x` degrees, exact at multiples of 30° as in OpenSCAD.
 pub fn cos_deg(x: f64) -> f64 {
-    sin_deg(x + 90.0)
+    crate::trig::cos(x)
 }
 
 fn sub(a: V3, b: V3) -> V3 {

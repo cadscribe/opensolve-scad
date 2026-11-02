@@ -4,7 +4,8 @@
 use std::rc::Rc;
 
 use crate::geom::{cos_deg, sin_deg};
-use crate::value::{Value, item};
+use crate::trig;
+use crate::value::Value;
 
 /// Arguments as given: by position, or named.
 pub type Args = [(Option<Rc<str>>, Value)];
@@ -21,6 +22,53 @@ fn num(args: &Args, at: usize) -> Option<f64> {
         .filter(|(n, _)| n.is_none())
         .nth(at)
         .and_then(|(_, v)| v.num())
+}
+
+/// The names of the built-in functions.
+pub const NAMES: &[&str] = &[
+    "abs",
+    "sign",
+    "sin",
+    "cos",
+    "tan",
+    "asin",
+    "acos",
+    "atan",
+    "atan2",
+    "floor",
+    "ceil",
+    "round",
+    "sqrt",
+    "exp",
+    "ln",
+    "log",
+    "pow",
+    "min",
+    "max",
+    "norm",
+    "cross",
+    "len",
+    "concat",
+    "lookup",
+    "str",
+    "chr",
+    "ord",
+    "search",
+    "rands",
+    "version",
+    "version_num",
+    "is_undef",
+    "is_bool",
+    "is_num",
+    "is_string",
+    "is_list",
+    "is_function",
+    "parent_module",
+];
+
+/// Whether `name` is a built-in function.
+pub fn is_builtin(name: &str) -> bool {
+    NAMES.contains(&name)
 }
 
 /// The value of built-in function `name`, `None` if there is none of that
@@ -40,19 +88,12 @@ pub fn call(name: &str, args: &Args) -> Option<Value> {
         }),
         "sin" => one(sin_deg),
         "cos" => one(cos_deg),
-        "tan" => one(|x| {
-            let c = cos_deg(x);
-            if c == 0.0 {
-                f64::INFINITY
-            } else {
-                sin_deg(x) / c
-            }
-        }),
-        "asin" => one(|x| x.asin().to_degrees()),
-        "acos" => one(|x| x.acos().to_degrees()),
-        "atan" => one(|x| x.atan().to_degrees()),
+        "tan" => one(trig::tan),
+        "asin" => one(trig::asin),
+        "acos" => one(trig::acos),
+        "atan" => one(trig::atan),
         "atan2" => Some(match (num(args, 0), num(args, 1)) {
-            (Some(y), Some(x)) => Value::Num(y.atan2(x).to_degrees()),
+            (Some(y), Some(x)) => Value::Num(trig::atan2(y, x)),
             _ => Value::Undef,
         }),
         "floor" => one(f64::floor),
@@ -113,7 +154,6 @@ pub fn call(name: &str, args: &Args) -> Option<Value> {
             _ => Value::Undef,
         }),
         "search" => Some(search(args)),
-        "rands" => Some(rands(args)),
         "version" => Some(Value::list(vec![
             Value::Num(2021.0),
             Value::Num(1.0),
@@ -233,9 +273,9 @@ fn lookup(args: &Args) -> Value {
     }
 }
 
-/// `search(match, in, num_returns_per_match = 1, index_col_num = 0)`, for
-/// what is commonly asked: a value in a list (or a column of it), or each
-/// character of a string in a string or list.
+/// `search(match, in, num_returns_per_match = 1, index_col_num = 0)`, as
+/// OpenSCAD's: a number, each element of a vector, or each character of a
+/// string looked for in a list (an element, or its column) or a string.
 fn search(args: &Args) -> Value {
     let (Some(what), Some(within)) = (
         arg(args, "match_value", 0),
@@ -245,88 +285,140 @@ fn search(args: &Args) -> Value {
     };
     let returns = arg(args, "num_returns_per_match", 2)
         .and_then(Value::num)
-        .unwrap_or(1.0) as usize;
+        .unwrap_or(1.0)
+        .max(0.0) as usize;
     let col = arg(args, "index_col_num", 3)
         .and_then(Value::num)
-        .unwrap_or(0.0) as usize;
-    let haystack: Vec<Value> = match within {
-        Value::Str(s) => s.chars().map(|c| Value::str(&c.to_string())).collect(),
-        Value::List(v) => v
-            .iter()
-            .map(|x| match x {
-                Value::List(_) => item(x, col),
-                x => x.clone(),
-            })
-            .collect(),
-        _ => return Value::Undef,
+        .unwrap_or(0.0)
+        .max(0.0) as usize;
+    let table: &[Value] = match within {
+        Value::List(v) => v,
+        _ => &[],
     };
-    let find = |needle: &Value| -> Vec<Value> {
-        let hits = haystack
-            .iter()
-            .enumerate()
-            .filter(|(_, h)| *h == needle)
-            .map(|(i, _)| Value::Num(i as f64));
-        if returns == 0 {
-            hits.collect()
-        } else {
-            hits.take(returns).collect()
+    let hit = |find: &Value, element: &Value| {
+        (col == 0 && find == element)
+            || matches!(element, Value::List(e) if e.get(col).is_some_and(|x| x == find))
+    };
+    // The places where `is` holds, as many as asked for (0: all).
+    let places = |is: &dyn Fn(usize) -> bool, n: usize| -> Vec<Value> {
+        let mut found = Vec::new();
+        for j in (0..n).filter(|j| is(*j)) {
+            found.push(Value::Num(j as f64));
+            if returns != 0 && found.len() >= returns {
+                break;
+            }
         }
+        found
     };
     match what {
-        Value::Num(_) => Value::list(find(what)),
-        Value::Str(s) if matches!(within, Value::Str(_)) || s.chars().count() != 1 => {
-            let per: Vec<Value> = s
-                .chars()
-                .map(|c| {
-                    let hits = find(&Value::str(&c.to_string()));
-                    if returns == 1 {
-                        hits.into_iter()
-                            .next()
-                            .unwrap_or_else(|| Value::list(Vec::new()))
-                    } else {
-                        Value::list(hits)
-                    }
-                })
-                .collect();
-            Value::list(per)
+        Value::Num(_) | Value::Bool(_) | Value::Undef => {
+            Value::list(places(&|j| hit(what, &table[j]), table.len()))
         }
-        Value::Str(_) => Value::list(find(what)),
-        Value::List(needles) => Value::list(
-            needles
-                .iter()
-                .map(|n| {
-                    let hits = find(n);
-                    if returns == 1 {
-                        hits.into_iter()
-                            .next()
-                            .unwrap_or_else(|| Value::list(Vec::new()))
-                    } else {
-                        Value::list(hits)
-                    }
-                })
-                .collect(),
-        ),
+        Value::Str(s) => {
+            let glyphs: Vec<Option<char>> = match within {
+                Value::Str(t) => t.chars().map(Some).collect(),
+                _ => table
+                    .iter()
+                    .map(|e| match e {
+                        Value::List(e) => e.get(col).and_then(|x| x.to_string().chars().next()),
+                        _ => None,
+                    })
+                    .collect(),
+            };
+            let mut out = Vec::new();
+            for c in s.chars() {
+                let found = places(&|j| glyphs[j] == Some(c), glyphs.len());
+                // One asked for and none found: nothing for this character.
+                if returns == 1 {
+                    out.extend(found);
+                } else {
+                    out.push(Value::list(found));
+                }
+            }
+            Value::list(out)
+        }
+        Value::List(needles) => {
+            let mut out = Vec::new();
+            for n in needles.iter() {
+                let found = places(&|j| hit(n, &table[j]), table.len());
+                match (returns, found.first()) {
+                    (1, Some(first)) => out.push(first.clone()),
+                    _ => out.push(Value::list(found)),
+                }
+            }
+            Value::list(out)
+        }
         _ => Value::Undef,
     }
 }
 
-/// Random numbers, from a seed if one is given; not OpenSCAD's sequence.
-fn rands(args: &Args) -> Value {
+/// The Mersenne Twister of C++'s `std::mt19937`, which OpenSCAD's `rands`
+/// draws from: with a seed, the same numbers as OpenSCAD.
+#[derive(Clone, Debug)]
+pub struct Mt19937 {
+    state: [u32; 624],
+    at: usize,
+}
+
+impl Mt19937 {
+    pub fn new(seed: u32) -> Mt19937 {
+        let mut state = [0u32; 624];
+        state[0] = seed;
+        for i in 1..624 {
+            let prev = state[i - 1];
+            state[i] = 1_812_433_253u32
+                .wrapping_mul(prev ^ (prev >> 30))
+                .wrapping_add(i as u32);
+        }
+        Mt19937 { state, at: 624 }
+    }
+
+    pub fn next_u32(&mut self) -> u32 {
+        if self.at >= 624 {
+            for i in 0..624 {
+                let y = (self.state[i] & 0x8000_0000) | (self.state[(i + 1) % 624] & 0x7fff_ffff);
+                let mut v = self.state[(i + 397) % 624] ^ (y >> 1);
+                if y & 1 != 0 {
+                    v ^= 0x9908_b0df;
+                }
+                self.state[i] = v;
+            }
+            self.at = 0;
+        }
+        let mut y = self.state[self.at];
+        self.at += 1;
+        y ^= y >> 11;
+        y ^= (y << 7) & 0x9d2c_5680;
+        y ^= (y << 15) & 0xefc6_0000;
+        y ^ (y >> 18)
+    }
+
+    /// `std::uniform_real_distribution<double>(lo, hi)`: two draws make
+    /// 53 bits (`generate_canonical`).
+    pub fn uniform(&mut self, lo: f64, hi: f64) -> f64 {
+        let a = f64::from(self.next_u32());
+        let b = f64::from(self.next_u32());
+        let r = 4_294_967_296.0;
+        let mut u = (a + b * r) / (r * r);
+        if u >= 1.0 {
+            u = 1.0 - f64::EPSILON / 2.0;
+        }
+        lo + (hi - lo) * u
+    }
+}
+
+/// `rands(min, max, count, seed)`: with a seed, `rng` is seeded anew, as
+/// OpenSCAD does.
+pub fn rands(args: &Args, rng: &mut Mt19937) -> Value {
     let (Some(lo), Some(hi), Some(n)) = (num(args, 0), num(args, 1), num(args, 2)) else {
         return Value::Undef;
     };
-    let mut state = num(args, 3).map_or(0x2545_f491_4f6c_dd1d, |s| s.to_bits() | 1);
-    let n = (n.max(0.0) as usize).min(crate::value::MOST);
-    let out = (0..n)
-        .map(|_| {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            let u = (state >> 11) as f64 / (1u64 << 53) as f64;
-            Value::Num(lo + (hi - lo) * u)
-        })
-        .collect();
-    Value::list(out)
+    if let Some(seed) = num(args, 3) {
+        *rng = Mt19937::new(seed as i64 as u32);
+    }
+    let (lo, hi) = if hi < lo { (hi, lo) } else { (lo, hi) };
+    let n = (n.round().max(0.0) as usize).min(crate::value::MOST);
+    Value::list((0..n).map(|_| Value::Num(rng.uniform(lo, hi))).collect())
 }
 
 #[cfg(test)]

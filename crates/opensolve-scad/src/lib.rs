@@ -10,7 +10,9 @@ mod customizer;
 mod eval;
 mod geom;
 mod lexer;
+pub mod library;
 mod parser;
+mod trig;
 mod value;
 
 use std::collections::HashMap;
@@ -163,7 +165,8 @@ pub fn includes(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Reads a file and, as far as they can be read, those it names.
+/// Reads a file and, as far as they can be read, those it names: from
+/// the folder of the file that names them, else from the library folders.
 fn gather(
     path: &Path,
     read: Reader<'_>,
@@ -172,13 +175,30 @@ fn gather(
     if sources.contains_key(path) {
         return Ok(());
     }
-    let bytes = read(path)?;
+    let bytes = match read(path) {
+        Ok(b) => b,
+        Err(e) if library::is_library(path) => library::read(path).map_err(|_| e)?,
+        Err(e) => return Err(e),
+    };
     let text = String::from_utf8_lossy(&bytes).into_owned();
     let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
     let named = includes(&text);
     sources.insert(path.to_path_buf(), text);
     for p in named {
-        let _ = gather(&plain(&dir.join(p)), read, sources);
+        let local = plain(&dir.join(&p));
+        if gather(&local, read, sources).is_ok() || Path::new(&p).is_absolute() {
+            continue;
+        }
+        let mut found = library::search()
+            .iter()
+            .any(|lib| gather(&plain(&lib.join(&p)), read, sources).is_ok());
+        if !found && Path::new(&p).starts_with(library::BUNDLED) {
+            library::ensure_bundled();
+            if let Some(own) = library::own_dir() {
+                found = gather(&plain(&own.join(&p)), read, sources).is_ok();
+            }
+        }
+        let _ = found;
     }
     Ok(())
 }

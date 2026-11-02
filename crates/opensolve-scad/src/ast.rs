@@ -112,3 +112,114 @@ pub enum Modifier {
     Root,
     Highlight,
 }
+
+impl std::fmt::Display for Expr {
+    /// The expression as OpenSCAD writes it back: what `str` makes of a
+    /// function literal, and what a failed assertion says.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Expr::Num(x) => f.write_str(&crate::value::number(*x)),
+            Expr::Str(s) => f.write_str(&crate::value::repr(&crate::value::Value::Str(s.clone()))),
+            Expr::Bool(b) => write!(f, "{b}"),
+            Expr::Undef => f.write_str("undef"),
+            Expr::Var(n, _) => f.write_str(n),
+            Expr::List(e) => {
+                f.write_str("[")?;
+                for (i, x) in e.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{x}")?;
+                }
+                f.write_str("]")
+            }
+            Expr::Range(b, s, e) => match s {
+                Some(s) => write!(f, "[{b} : {s} : {e}]"),
+                None => write!(f, "[{b} : {e}]"),
+            },
+            Expr::Unary(op, x) => write!(f, "{op}{x}"),
+            Expr::Binary(op, a, b) => write!(f, "({a} {op} {b})"),
+            Expr::Ternary(c, y, n) => write!(f, "({c} ? {y} : {n})"),
+            Expr::Call(c, args, _) => {
+                write!(f, "{c}(")?;
+                write_args(f, args)?;
+                f.write_str(")")
+            }
+            Expr::Index(v, i) => write!(f, "{v}[{i}]"),
+            Expr::Member(v, m) => write!(f, "{v}.{m}"),
+            Expr::Let(args, body) => {
+                f.write_str("let(")?;
+                write_args(f, args)?;
+                write!(f, ") {body}")
+            }
+            Expr::Echo(args, body, _) => {
+                f.write_str("echo(")?;
+                write_args(f, args)?;
+                write!(f, ") {body}")
+            }
+            Expr::Assert(args, body, _) => {
+                f.write_str("assert(")?;
+                write_args(f, args)?;
+                write!(f, ") {body}")
+            }
+            Expr::Lambda(func) => write!(f, "{func}"),
+        }
+    }
+}
+
+impl std::fmt::Display for Func {
+    /// `function(a, b = 1) body`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("function(")?;
+        write_args(f, &self.params)?;
+        write!(f, ") {}", self.body)
+    }
+}
+
+impl std::fmt::Display for Elem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Elem::Expr(e) => write!(f, "{e}"),
+            Elem::For(args, body) => {
+                f.write_str("for(")?;
+                write_args(f, args)?;
+                write!(f, ") ({body})")
+            }
+            Elem::ForC(init, cond, next, body) => {
+                f.write_str("for(")?;
+                write_args(f, init)?;
+                write!(f, ";{cond};")?;
+                write_args(f, next)?;
+                write!(f, ") {body}")
+            }
+            Elem::If(c, then, or) => {
+                write!(f, "if({c}) ({then})")?;
+                match or {
+                    Some(o) => write!(f, " else ({o})"),
+                    None => Ok(()),
+                }
+            }
+            Elem::Let(args, body) => {
+                f.write_str("let(")?;
+                write_args(f, args)?;
+                write!(f, ") ({body})")
+            }
+            Elem::Each(body) => write!(f, "each ({body})"),
+        }
+    }
+}
+
+fn write_args(f: &mut std::fmt::Formatter<'_>, args: &[Arg]) -> std::fmt::Result {
+    for (i, a) in args.iter().enumerate() {
+        if i > 0 {
+            f.write_str(", ")?;
+        }
+        match (&a.name, &a.value) {
+            (Some(n), Some(v)) => write!(f, "{n} = {v}")?,
+            (Some(n), None) => f.write_str(n)?,
+            (None, Some(v)) => write!(f, "{v}")?,
+            (None, None) => {}
+        }
+    }
+    Ok(())
+}

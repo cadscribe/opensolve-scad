@@ -162,6 +162,11 @@ pub struct Interp {
     depth: usize,
     /// What a `!` made: the whole result.
     root: Option<Option<Geom>>,
+    /// The modules being run, the innermost last: `parent_module`.
+    modules: Vec<Rc<str>>,
+    /// What `rands` draws from: seeded anew by a seed, else the same
+    /// numbers in each run, so that a part is built the same each time.
+    rng: builtins::Mt19937,
 }
 
 impl Interp {
@@ -176,6 +181,8 @@ impl Interp {
             geo: Builder::default(),
             depth: 0,
             root: None,
+            modules: Vec::new(),
+            rng: builtins::Mt19937::new(5489),
         }
     }
 
@@ -279,7 +286,8 @@ impl Interp {
         })
     }
 
-    /// A path in `include` or `use`, from the folder of the file it is in.
+    /// A path in `include` or `use`, from the folder of the file it is in,
+    /// else from the library folders: the first that was read.
     fn path_of(&self, from: Pos, path: &str) -> PathBuf {
         let dir = self
             .files
@@ -287,7 +295,15 @@ impl Interp {
             .and_then(|f| f.0.parent())
             .map(PathBuf::from)
             .unwrap_or_default();
-        crate::plain(&dir.join(path))
+        let local = crate::plain(&dir.join(path));
+        if self.sources.contains_key(&local) {
+            return local;
+        }
+        crate::library::search()
+            .iter()
+            .map(|lib| crate::plain(&lib.join(path)))
+            .find(|p| self.sources.contains_key(p))
+            .unwrap_or(local)
     }
 
     /// The statements of a file with what it includes put in their place.
@@ -520,6 +536,20 @@ impl Interp {
     }
 
     fn call_module(
+        &mut self,
+        name: &Rc<str>,
+        args: &[Arg],
+        children: &Rc<[Stmt]>,
+        pos: Pos,
+        f: &Rc<Frame>,
+    ) -> R<Option<Geom>> {
+        self.modules.push(name.clone());
+        let made = self.module_call(name, args, children, pos, f);
+        self.modules.pop();
+        made
+    }
+
+    fn module_call(
         &mut self,
         name: &Rc<str>,
         args: &[Arg],
@@ -847,7 +877,7 @@ impl Interp {
             None => args
                 .first()
                 .and_then(|a| a.value.as_ref())
-                .map_or_else(String::new, |_| "the condition is false".into()),
+                .map_or_else(String::new, |e| format!("{e} is false")),
         };
         Err(self.error(pos, format!("assertion failed: {what}")))
     }
@@ -1081,6 +1111,7 @@ impl Interp {
             Expr::Undef => Value::Undef,
             Expr::Var(n, pos) => match f.get(n) {
                 Some(v) => v,
+                None if &**n == "$parent_modules" => Value::Num(self.modules.len() as f64),
                 None => {
                     if !n.starts_with('$') {
                         self.note(Some(*pos), format!("unknown variable {n}"));
@@ -1180,25 +1211,20 @@ impl Interp {
     }
 
     fn call(&mut self, callee: &Expr, args: &[Arg], pos: Pos, f: &Rc<Frame>) -> R<Value> {
+        // Functions have names of their own: a variable of the same name
+        // is only called when there is no function of it.
         if let Expr::Var(name, _) = callee {
             if let Some((def, home)) = self.find_func(f, name) {
                 return self.call_func(&def, &home, args, pos, f);
             }
-            if f.get(name).is_none() {
+            if builtins::is_builtin(name) {
                 let a = self.args(args, f)?;
-                let list: Vec<(Option<Rc<str>>, Value)> = a
-                    .pos
-                    .into_iter()
-                    .map(|v| (None, v))
-                    .chain(a.named.into_iter().map(|(n, v)| (Some(n), v)))
-                    .collect();
-                return Ok(match builtins::call(name, &list) {
-                    Some(v) => v,
-                    None => {
-                        self.note(Some(pos), format!("unknown function {name}"));
-                        Value::Undef
-                    }
-                });
+                return Ok(self.builtin(name, a));
+            }
+            if f.get(name).is_none() {
+                self.args(args, f)?;
+                self.note(Some(pos), format!("unknown function {name}"));
+                return Ok(Value::Undef);
             }
         }
         match self.eval(callee, f)? {
@@ -1211,6 +1237,29 @@ impl Interp {
                 Ok(Value::Undef)
             }
         }
+    }
+
+    /// A built-in function; those that know the evaluation here.
+    fn builtin(&mut self, name: &str, a: Args) -> Value {
+        if name == "parent_module" {
+            let n = a.num("n", 0).unwrap_or(0.0);
+            let depth = self.modules.len();
+            return if n >= 0.0 && (n as usize) < depth {
+                Value::Str(self.modules[depth - 1 - n as usize].clone())
+            } else {
+                Value::Undef
+            };
+        }
+        let list: Vec<(Option<Rc<str>>, Value)> = a
+            .pos
+            .into_iter()
+            .map(|v| (None, v))
+            .chain(a.named.into_iter().map(|(n, v)| (Some(n), v)))
+            .collect();
+        if name == "rands" {
+            return builtins::rands(&list, &mut self.rng);
+        }
+        builtins::call(name, &list).unwrap_or_default()
     }
 
     fn call_func(
@@ -1249,17 +1298,16 @@ impl Interp {
                 let mut n = 0;
                 while self.eval(cond, &frame)?.truthy() {
                     self.elem(body, &frame, out)?;
+                    // The next values one after the other, each seeing
+                    // those before it; what `next` does not set stays.
                     let step = Frame::inner(f);
+                    for (name, v) in frame.vars.borrow().iter() {
+                        step.set(name, v.clone());
+                    }
                     for a in next {
                         if let (Some(name), Some(e)) = (&a.name, &a.value) {
-                            let v = self.eval(e, &frame)?;
+                            let v = self.eval(e, &step)?;
                             step.set(name, v);
-                        }
-                    }
-                    // What `next` does not set stays.
-                    for (name, v) in frame.vars.borrow().iter() {
-                        if step.own(name).is_none() {
-                            step.set(name, v.clone());
                         }
                     }
                     frame = step;
@@ -1285,7 +1333,7 @@ impl Interp {
                 self.elem(body, f, &mut inner)?;
                 for v in inner {
                     match v {
-                        Value::List(_) | Value::Range(..) => {
+                        Value::List(_) | Value::Range(..) | Value::Str(_) => {
                             out.extend(v.items().map_err(|m| Error::at(0, 0, m))?);
                         }
                         v => out.push(v),
@@ -1397,18 +1445,36 @@ fn rotation(a: &Args) -> Option<Matrix> {
     };
     match (a.get("a", 0)?, a.get("v", 1)) {
         (Value::Num(deg), Some(v)) => {
+            // As OpenSCAD's angle_axis_degrees: dividing by the length
+            // as little as may be.
             let k = v.point()?;
-            let l = (k[0] * k[0] + k[1] * k[1] + k[2] * k[2]).sqrt();
-            if l < 1e-12 {
+            let m = k[0] * k[0] + k[1] * k[1] + k[2] * k[2];
+            if m <= 0.0 {
                 return Some(IDENTITY);
             }
-            let [x, y, z] = k.map(|c| c / l);
             let (s, c) = (sin_deg(*deg), cos_deg(*deg));
-            let t = 1.0 - c;
+            let cv = k.map(|x| x * ((1.0 - c) / m));
+            let l = m.sqrt();
+            let us = k.map(|x| x / l * s);
             Some([
-                [t * x * x + c, t * x * y - s * z, t * x * z + s * y, 0.0],
-                [t * x * y + s * z, t * y * y + c, t * y * z - s * x, 0.0],
-                [t * x * z - s * y, t * y * z + s * x, t * z * z + c, 0.0],
+                [
+                    cv[0] * k[0] + c,
+                    cv[1] * k[0] - us[2],
+                    cv[2] * k[0] + us[1],
+                    0.0,
+                ],
+                [
+                    cv[0] * k[1] + us[2],
+                    cv[1] * k[1] + c,
+                    cv[2] * k[1] - us[0],
+                    0.0,
+                ],
+                [
+                    cv[0] * k[2] - us[1],
+                    cv[1] * k[2] + us[0],
+                    cv[2] * k[2] + c,
+                    0.0,
+                ],
             ])
         }
         (Value::Num(deg), None) => Some(about(2, *deg)),
