@@ -61,8 +61,8 @@ newest from 2026-10-08).
 - tree-sitter is C, so it stays out of the crates built for wasm32
   (`make wasm`): `opensolve-scad` stays pure Rust; the language server and
   the app's editor are native only.
-- The editor in the app (`scad_editor.rs`): a panel beside the part (egui's
-  text field with a layouter), with OpenCAD's tokens for its colours in
+- The editor in the app (`scad_editor.rs`): a tab of its own in the middle
+  pane beside 3D and the sketch (egui's text field with a layouter), with OpenCAD's tokens for its colours in
   light and dark, line numbers, the diagnostics as squiggles, gutter marks
   and a list of problems, completion (Ctrl+Space, or while typing a name),
   hover, go to definition (Cmd+click or F12, also into included and used
