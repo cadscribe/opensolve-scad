@@ -1147,6 +1147,10 @@ impl Builder {
         if let Some(Ok(s)) = self.batch(&refs, Op::Add) {
             return ((!s.is_empty()).then_some(s), Vec::new());
         }
+        // Asked to stop: nothing, the caller ends the evaluation.
+        if opensolve_kernel::stopped() {
+            return (None, Vec::new());
+        }
         let meeting = {
             let refs: Vec<&Solid> = list.iter().collect();
             opensolve_kernel::meeting(&refs)
@@ -1175,6 +1179,9 @@ impl Builder {
         }
         let mut errors = Vec::new();
         while groups.iter().any(|g| g.len() > 1) {
+            if opensolve_kernel::stopped() {
+                return (None, Vec::new());
+            }
             // Each group's list of the next round: a pair's result, by the
             // pair's number, or one left over, in their order.
             let mut jobs: Vec<(Solid, Solid)> = Vec::new();

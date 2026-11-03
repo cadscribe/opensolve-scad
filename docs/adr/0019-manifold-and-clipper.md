@@ -103,6 +103,14 @@ main 14 s; Manifold on one thread, batched, 6.0 s; on TBB 2.6 s (OpenSCAD
   cuts the union of its cutters at once. `Solid::mapped` moves a solid
   with one facet per plane, and `triangulate_loops` cuts polygons as
   Manifold does.
+- **Long booleans can be stopped** (2026-11-03, ADR 0011): the
+  `Stop` of the evaluation's thread (`opensolve_kernel::stopping`) is
+  looked at between the rounds of pairs of `Solid::batch` and of
+  `Solid::booleans`, by each pair before it starts on its thread, between
+  the cutters' union and the cut, and before a result is read back from
+  Manifold; then `Error::Stopped`. One pair inside Manifold runs to its
+  end: Manifold 3.5.2's `ExecutionContext` too only checks between the
+  booleans of a tree, which the kernel already goes through itself.
 - **2D shapes are polygons** (`flat.rs`): their booleans, offsets and
   Minkowski sums by `clipper2-rust` 1.2.0 (BSL-1.0, a pure Rust port of
   Clipper2, which builds for wasm), on integers scaled and simplified as

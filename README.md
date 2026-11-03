@@ -106,6 +106,25 @@ std::fs::write("part.stl", out.solid.to_stl()).map_err(|e| e.to_string())?;
 statements, colours, 2D shapes); `diagnose` tells what an editor marks;
 `parameters` reads the Customizer's.
 
+An evaluation on another thread can be stopped: give `build_with_stop`,
+`diagnose_with_stop` or `Run { stop, .. }` a `Stop` and call `stop()` on a
+clone of it. The run ends soon after (between statements, calls, steps of a
+loop and the booleans of a batch; a single boolean runs to its end) with
+the error `CANCELLED` (`Error::is_cancelled` for `make` and `diagnose`),
+and keeps nothing of what it made.
+
+```rust
+let stop = opensolve_scad::Stop::new();
+let theirs = stop.clone();
+let run = std::thread::spawn(move || {
+    let read = |p: &std::path::Path| std::fs::read(p).map_err(|e| e.to_string());
+    opensolve_scad::build_with_stop(std::path::Path::new("part.scad"), &read, &[], &theirs)
+});
+stop.stop();
+// Unless it was done before: Err(CANCELLED).
+let out = run.join().unwrap();
+```
+
 ## Building
 
 Rust 1.95 (`rust-toolchain.toml`) and a C++17 compiler (Xcode's command

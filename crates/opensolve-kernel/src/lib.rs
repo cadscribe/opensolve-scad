@@ -211,6 +211,8 @@ pub enum Error {
     AxisOffPlane,
     /// A revolve's profile lies on both sides of its axis.
     CrossesAxis,
+    /// The work was asked to stop (see [`Stop`]).
+    Stopped,
 }
 
 impl std::fmt::Display for Error {
@@ -220,11 +222,66 @@ impl std::fmt::Display for Error {
             Error::Boolean(m) => write!(f, "boolean failed: {m}"),
             Error::AxisOffPlane => f.write_str("the axis is not in the sketch's plane"),
             Error::CrossesAxis => f.write_str("the profile crosses the axis"),
+            Error::Stopped => f.write_str("stopped"),
         }
     }
 }
 
 impl std::error::Error for Error {}
+
+/// Asks long work to stop: a flag that every clone shares, cheap to clone
+/// and to look at. Set once, it stays set. The booleans of many solids
+/// ([`Solid::batch`], [`Solid::booleans`]) look at the one of their thread
+/// ([`stopping`]) between their rounds of pairs and before each pair, and
+/// end with [`Error::Stopped`]; a single pair, in the mesh library, runs to
+/// its end.
+#[derive(Clone, Debug, Default)]
+pub struct Stop(Arc<std::sync::atomic::AtomicBool>);
+
+impl Stop {
+    pub fn new() -> Stop {
+        Stop::default()
+    }
+
+    /// Asks the work this is given to to stop.
+    pub fn stop(&self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Whether it was asked to stop.
+    pub fn is_stopped(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The one of this thread, set by [`stopping`].
+    fn current() -> Option<Stop> {
+        STOP.with(|s| s.borrow().clone())
+    }
+}
+
+thread_local! {
+    /// What the work on this thread looks at (see [`stopping`]).
+    static STOP: std::cell::RefCell<Option<Stop>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `f` with `stop` as what the kernel's long work on this thread looks
+/// at; the one before is back after.
+pub fn stopping<T>(stop: &Stop, f: impl FnOnce() -> T) -> T {
+    struct Back(Option<Stop>);
+    impl Drop for Back {
+        fn drop(&mut self) {
+            let before = self.0.take();
+            STOP.with(|s| *s.borrow_mut() = before);
+        }
+    }
+    let _back = Back(STOP.with(|s| s.borrow_mut().replace(stop.clone())));
+    f()
+}
+
+/// Whether the work on this thread was asked to stop (see [`stopping`]).
+pub fn stopped() -> bool {
+    STOP.with(|s| s.borrow().as_ref().is_some_and(Stop::is_stopped))
+}
 
 /// One outline of a profile, counter-clockwise, with the face of each edge.
 #[derive(Clone, Debug, PartialEq)]
@@ -817,14 +874,19 @@ impl Solid {
             })
             .collect();
         let todo: Vec<usize> = (0..pairs.len()).filter(|&i| out[i].is_none()).collect();
+        let stop = Stop::current();
+        let halted = || stop.as_ref().is_some_and(Stop::is_stopped);
         let first = parallel(todo.len(), |k| {
+            if halted() {
+                return Err(Error::Stopped);
+            }
             let (a, b) = pairs[todo[k]];
             run_boolean(a, b, op)
         });
         for (&i, mut result) in todo.iter().zip(first) {
             let (a, b) = pairs[i];
             for (which, k) in [(1, 1e-6), (1, -1e-6), (0, 1e-6)] {
-                if result.is_ok() {
+                if result.is_ok() || halted() {
                     break;
                 }
                 result = if which == 1 {
@@ -834,6 +896,8 @@ impl Solid {
                 };
             }
             out[i] = Some(match result {
+                // Stopped: what was made is not read back.
+                _ if halted() => Err(Error::Stopped),
                 Err(e) => Err(e),
                 Ok(Some(m)) => Ok(Solid::from_manifold(m, facets)),
                 Ok(None) => Ok(Solid::default()),
@@ -880,6 +944,9 @@ impl Solid {
             Ok(m) => m,
             Err(e) => return Some(Err(e)),
         };
+        if stopped() {
+            return Some(Err(Error::Stopped));
+        }
         let refs: Vec<&engine::Mesh> = meshes.iter().map(|m| &**m).collect();
         // Those that meet joined, each such group put together with the
         // others as it is: a boolean of solids apart is wasted work.
@@ -918,29 +985,42 @@ impl Solid {
         // are put together here, not in the library: a mesh of them read
         // in again came out with parts of a face moved.
         let together = |parts: Vec<engine::Mesh>, facets: &mut Facets| {
+            if stopped() {
+                return Err(Error::Stopped);
+            }
             let solids: Vec<Solid> = parts
                 .into_iter()
                 .map(|m| Solid::from_manifold(m, facets))
                 .collect();
-            match solids.len() {
+            Ok(match solids.len() {
                 1 => solids.into_iter().next().unwrap_or_default(),
                 _ => Solid::merged(&solids),
+            })
+        };
+        // A result read back as a solid, unless the work was stopped.
+        let read = |m: Option<engine::Mesh>, facets: &mut Facets| {
+            if stopped() {
+                return Err(Error::Stopped);
             }
+            Ok(m.map_or_else(Solid::default, |m| Solid::from_manifold(m, facets)))
         };
         let done = match op {
-            Op::Add => joined(0).map(|parts| together(parts, facets)),
+            Op::Add => joined(0).and_then(|parts| together(parts, facets)),
             Op::Intersect => catch_unwind(AssertUnwindSafe(|| engine::intersection(&refs)))
                 .unwrap_or_else(|e| Err(caught(e)))
-                .map(|m| m.map_or_else(Solid::default, |m| Solid::from_manifold(m, facets))),
+                .and_then(|m| read(m, facets)),
             Op::Subtract => joined(1).and_then(|mut parts| {
                 let cut = match parts.len() {
                     0 => return Ok((*keep[0]).clone()),
                     1 => Arc::new(parts.remove(0)),
-                    _ => together(parts, facets).manifold()?,
+                    _ => together(parts, facets)?.manifold()?,
                 };
+                if stopped() {
+                    return Err(Error::Stopped);
+                }
                 catch_unwind(AssertUnwindSafe(|| engine::boolean(refs[0], &cut, op)))
                     .unwrap_or_else(|e| Err(caught(e)))
-                    .map(|m| m.map_or_else(Solid::default, |m| Solid::from_manifold(m, facets)))
+                    .and_then(|m| read(m, facets))
             }),
         };
         Some(done)
@@ -1779,5 +1859,26 @@ mod tests {
         let mut f = Facets::default();
         let a = block(&mut f, rect(0.0, 0.0, 1.0, 1.0), 0.0, 1.0, 0);
         assert_eq!(a.to_stl().len(), 84 + 50 * a.tris.len());
+    }
+
+    #[test]
+    fn a_batch_asked_to_stop_ends_with_stopped() {
+        let mut f = Facets::default();
+        let balls: Vec<Solid> = (0..64)
+            .map(|i| Solid::sphere(&mut f, [f64::from(i) * 0.5, 0.0, 0.0], 1.0, 16, FaceId(1)))
+            .collect();
+        let refs: Vec<&Solid> = balls.iter().collect();
+        let stop = Stop::new();
+        stop.stop();
+        let made = stopping(&stop, || Solid::batch(&refs, Op::Add, &mut f));
+        if engine::BATCHES {
+            assert_eq!(made.map(|r| r.err()), Some(Some(Error::Stopped)));
+        }
+        let pairs: Vec<(&Solid, &Solid)> = refs.windows(2).map(|w| (w[0], w[1])).collect();
+        let made = stopping(&stop, || Solid::booleans(&pairs, Op::Add, &mut f));
+        assert!(made.iter().all(|r| r == &Err(Error::Stopped)));
+        // Outside, the stop of the thread is the one before: none.
+        assert!(!stopped());
+        assert!(Solid::batch(&refs, Op::Add, &mut f).is_none_or(|r| r.is_ok()));
     }
 }

@@ -6,7 +6,7 @@ use opensolve_manifold::Error as Refused;
 
 use std::collections::HashMap;
 
-use crate::{Affine, Error, Facets, Fx, Op, Solid, nearest_facet};
+use crate::{Affine, Error, Facets, Fx, Op, Solid, Stop, nearest_facet};
 
 pub(crate) type Mesh = opensolve_manifold::Solid;
 
@@ -106,8 +106,16 @@ pub(crate) fn intersection(list: &[&Mesh]) -> Result<Option<Mesh>, Error> {
 
 /// Each list brought down to one by `op` in rounds of pairs, the small
 /// ones first, the pairs of all lists in a round on threads of their own.
+///
+/// Asked to stop ([`crate::stopping`]), it ends between rounds and leaves
+/// out the pairs of a round not begun: [`Error::Stopped`].
 fn rounds(levels: &mut [Vec<Item<'_>>], op: Op) -> Result<(), Error> {
+    let stop = Stop::current();
+    let halted = || stop.as_ref().is_some_and(Stop::is_stopped);
     loop {
+        if halted() {
+            return Err(Error::Stopped);
+        }
         let mut jobs: Vec<(usize, usize)> = Vec::new();
         for (g, level) in levels.iter_mut().enumerate() {
             if level.len() > 1 {
@@ -119,6 +127,9 @@ fn rounds(levels: &mut [Vec<Item<'_>>], op: Op) -> Result<(), Error> {
             return Ok(());
         }
         let made = crate::parallel(jobs.len(), |j| {
+            if halted() {
+                return Err(Error::Stopped);
+            }
             let (g, k) = jobs[j];
             let level = &levels[g];
             level[2 * k]

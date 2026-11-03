@@ -118,6 +118,26 @@ OpenSCAD does is the part that matters for parts that fit.
   recursion. Calls deeper than 3,000 end with an error. (ADR 0014: a call
   in a function's tail runs in a loop, up to a million steps; others may go
   100,000 deep or until the stack runs short.)
+- An evaluation can be stopped (2026-11-03): `build_with_stop`,
+  `diagnose_with_stop` and `Run::stop` take a `Stop`, a flag shared by its
+  clones, which another thread sets. The interpreter looks at it for each
+  statement, each call of a module or function, each step of a `for`, of
+  a list comprehension and of a function's tail loop, and before each
+  union, difference, intersection, hull, Minkowski sum and extrusion; the
+  kernel looks at it between the rounds of pairs of a batch, before each
+  pair it starts and before it reads a result back (ADR 0019). Stopped,
+  the run ends with `Error::cancelled()` (`is_cancelled`, the message
+  `CANCELLED`; `build_with_stop` returns that message), never with a part
+  of the shape: a run is checked once more at its end. What a run keeps
+  (the modules' results, the batches', the caps) is its own and goes with
+  it; the parsed files are kept only whole. A single boolean of Manifold
+  runs to its end, so on the basket (render_baskets.scad, 9 s) a stop
+  takes at most about half a second, mostly well under 0.1 s. A run not
+  stopped is as fast as before: a relaxed load of an atomic flag. The
+  editor's `Evaluation::run_with_stop` stops a check of a text superseded
+  by a newer one. The stdio server evaluates a file when it is opened or
+  saved, one message after the other: a newer text waits, and there is
+  nothing to stop.
 
 ## Consequences
 

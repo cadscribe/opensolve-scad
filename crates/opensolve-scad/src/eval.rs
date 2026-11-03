@@ -327,6 +327,9 @@ pub struct Interp {
     pub colours: Vec<Rgba>,
     /// Told every echo and warning as it comes (see [`crate::Run::log`]).
     pub log: Option<fn(&str)>,
+    /// Asked to stop, the evaluation ends with [`Error::cancelled`]: looked
+    /// at for each statement, call, step of a loop and before each boolean.
+    pub stop: opensolve_kernel::Stop,
 }
 
 impl Interp {
@@ -361,7 +364,17 @@ impl Interp {
             cut_rest: false,
             colours: Vec::new(),
             log: None,
+            stop: opensolve_kernel::Stop::default(),
         }
+    }
+
+    /// An error if the evaluation was asked to stop.
+    #[inline]
+    fn halt(&self) -> R<()> {
+        if self.stop.is_stopped() {
+            return Err(Error::cancelled());
+        }
+        Ok(())
     }
 
     pub fn note(&mut self, pos: Option<Pos>, text: impl Into<String>) {
@@ -681,6 +694,7 @@ impl Interp {
             }
         }
         for (name, value) in order {
+            self.halt()?;
             let v = self.eval(value, f)?;
             f.set(name, v);
         }
@@ -691,6 +705,7 @@ impl Interp {
             if only.is_some_and(|o| !o.contains(&k)) {
                 continue;
             }
+            self.halt()?;
             self.cutting = cutting || (cut_rest && !out.is_empty());
             let made = self.instance(s, f);
             self.cutting = cutting;
@@ -843,6 +858,7 @@ impl Interp {
         pos: Pos,
         f: &Rc<Frame>,
     ) -> R<Option<Geom>> {
+        self.halt()?;
         if let Some((def, home)) = self.find_module(f, name) {
             return self.user_module(&def, &home, args, children, pos, f);
         }
@@ -1064,6 +1080,7 @@ impl Interp {
             }
             "hull" => {
                 let made = kids(self)?;
+                self.halt()?;
                 self.hull(made, pos)
             }
             "linear_extrude" | "rotate_extrude" => {
@@ -1242,6 +1259,7 @@ impl Interp {
     }
 
     fn enter(&mut self, pos: Pos) -> R<()> {
+        self.halt()?;
         self.depth += 1;
         if self.depth > DEPTH || crate::stack_low() {
             self.depth -= 1;
@@ -1342,6 +1360,7 @@ impl Interp {
         let items = over.items().map_err(|m| Error::at(0, 0, m))?;
         // Without a name it runs as often, binding nothing.
         for v in items {
+            self.halt()?;
             let inner = Frame::inner(f);
             if let Some(name) = &var.name {
                 inner.set(name, v);
@@ -1371,6 +1390,7 @@ impl Interp {
         if made.len() <= 1 {
             return Ok(made.into_iter().next());
         }
+        self.halt()?;
         let is_flat = matches!(made[0], Geom::D2(_));
         let (list, other): (Vec<Geom>, Vec<Geom>) = made
             .into_iter()
@@ -1413,6 +1433,7 @@ impl Interp {
         pos: Option<Pos>,
     ) -> R<Option<opensolve_kernel::Solid>> {
         let (out, errors) = self.geo.union_many(list);
+        self.halt()?;
         for e in errors {
             self.note(
                 pos,
@@ -1429,6 +1450,7 @@ impl Interp {
         op: Op,
         pos: Option<Pos>,
     ) -> R<opensolve_kernel::Solid> {
+        self.halt()?;
         match self.geo.boolean(a, b, op) {
             Ok(s) => Ok(s),
             // A union that fails, of shapes that are not closed or meet
@@ -1460,6 +1482,7 @@ impl Interp {
         let Some(first) = made.first() else {
             return Ok(None);
         };
+        self.halt()?;
         if matches!(first, Geom::D2(_)) {
             let mut shapes: Vec<&Region> = Vec::with_capacity(made.len());
             let mut others = false;
@@ -1499,11 +1522,13 @@ impl Interp {
             if let Some(Ok(s)) = self.geo.batch(&all, op) {
                 return Ok(Some(Geom::D3(s)));
             }
+            self.halt()?;
         }
         if op == Op::Subtract {
             // All that is cut away at once: much faster than one by one;
             // where that fails, one by one.
             if let Some(cut) = self.join(others.clone(), Some(pos))? {
+                self.halt()?;
                 match self.geo.boolean(&acc, &cut, op) {
                     Ok(s) => acc = s,
                     Err(_) => {
@@ -1763,6 +1788,7 @@ impl Interp {
             return Ok(None);
         };
         for g in it {
+            self.halt()?;
             let sum = match (&acc, &g) {
                 (Geom::D3(a), Geom::D3(b)) => self.geo.minkowski(a, b).map(|s| s.map(Geom::D3)),
                 (Geom::D2(a), Geom::D2(b)) => Ok(self.geo.minkowski_2d(a, b).map(Geom::D2)),
@@ -1842,6 +1868,7 @@ impl Interp {
         f: &Rc<Frame>,
         pos: Pos,
     ) -> R<Option<Geom>> {
+        self.halt()?;
         let shape = match shape {
             None => return Ok(None),
             Some(Geom::D3(_)) => {
@@ -2011,6 +2038,7 @@ impl Interp {
     }
 
     fn call(&mut self, callee: &Expr, args: &[Arg], pos: Pos, f: &Rc<Frame>) -> R<Value> {
+        self.halt()?;
         // Functions have names of their own: a variable of the same name
         // is only called when there is no function of it.
         if let Expr::Var(name, _) = callee {
@@ -2098,6 +2126,7 @@ impl Interp {
             match self.eval_tail(&def.body, &frame)? {
                 Tail::Value(v) => return Ok(v),
                 Tail::Call(d, h, args, at) => {
+                    self.halt()?;
                     steps += 1;
                     if steps > MOST {
                         return Err(Error::at(0, 0, "a recursion of more than a million steps"));
@@ -2179,6 +2208,7 @@ impl Interp {
                 let mut frame = self.lets(init, f)?;
                 let mut n = 0;
                 while self.eval(cond, &frame)?.truthy() {
+                    self.halt()?;
                     self.elem(body, &frame, out)?;
                     // The next values one after the other, each seeing
                     // those before it; what `next` does not set stays.

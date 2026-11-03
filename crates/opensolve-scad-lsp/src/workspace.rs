@@ -895,8 +895,15 @@ impl Evaluation {
     /// in this file: unknown names, what is not supported, failed
     /// assertions, `echo` output.
     pub fn run(self) -> Vec<Diagnostic> {
+        self.run_with_stop(&opensolve_scad::Stop::new())
+            .unwrap_or_default()
+    }
+
+    /// [`Evaluation::run`], ended early when `stop` is set (from another
+    /// thread, as when a newer text is to be evaluated): then `None`.
+    pub fn run_with_stop(self, stop: &opensolve_scad::Stop) -> Option<Vec<Diagnostic>> {
         let Some(main) = self.sources.get(&self.path).cloned() else {
-            return Vec::new();
+            return Some(Vec::new());
         };
         let read = |p: &Path| {
             self.sources
@@ -904,7 +911,14 @@ impl Evaluation {
                 .map(|t| t.as_bytes().to_vec())
                 .ok_or_else(|| format!("{} cannot be read", p.display()))
         };
-        let found = opensolve_scad::diagnose(&self.path, &read, &self.external);
+        let found = opensolve_scad::diagnose_with_stop(&self.path, &read, &self.external, stop);
+        if found
+            .error
+            .as_ref()
+            .is_some_and(opensolve_scad::Error::is_cancelled)
+        {
+            return None;
+        }
         let lines = Lines::new(&main);
         let here = |file: Option<&Path>| file.is_none_or(|f| plain(f) == self.path);
         let range = |line: u32, col: u32| {
@@ -953,6 +967,6 @@ impl Evaluation {
                 },
             });
         }
-        out
+        Some(out)
     }
 }

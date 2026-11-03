@@ -231,6 +231,7 @@ fn make(
         defines: defines.to_vec(),
         paint,
         log,
+        ..Run::default()
     };
     opensolve_scad::make(input, &read, &run).map_err(|mut e| {
         if e.file.is_none() && e.line > 0 {

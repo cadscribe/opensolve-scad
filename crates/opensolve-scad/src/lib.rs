@@ -27,6 +27,7 @@ use std::path::{Component, Path, PathBuf};
 use opensolve_kernel::{Facets, Solid};
 
 pub use customizer::{Choices, Kind, Param, parameters};
+pub use opensolve_kernel::Stop;
 pub use paint::{Rgba, text as rgba_text};
 
 /// Reads a whole file.
@@ -42,6 +43,11 @@ pub struct Error {
     pub message: String,
 }
 
+/// The message of the error an evaluation ends with when it was asked to
+/// stop (see [`Stop`]): what [`build_with_stop`] returns then, and the
+/// message of [`Error::cancelled`].
+pub const CANCELLED: &str = "the evaluation was cancelled";
+
 impl Error {
     pub fn at(line: u32, col: u32, message: impl Into<String>) -> Error {
         Error {
@@ -50,6 +56,16 @@ impl Error {
             col,
             message: message.into(),
         }
+    }
+
+    /// The error of an evaluation asked to stop: no place, [`CANCELLED`].
+    pub fn cancelled() -> Error {
+        Error::at(0, 0, CANCELLED)
+    }
+
+    /// Whether this is [`Error::cancelled`] rather than a fault of the file.
+    pub fn is_cancelled(&self) -> bool {
+        self.line == 0 && self.file.is_none() && self.message == CANCELLED
     }
 }
 
@@ -105,10 +121,30 @@ pub fn build(
     read: Reader<'_>,
     overrides: &[(String, String)],
 ) -> Result<Output, String> {
+    build_with_stop(path, read, overrides, &Stop::new())
+}
+
+/// [`build`], ended early when `stop` is set (from another thread): then
+/// the error is [`CANCELLED`], and nothing of the run is kept (see
+/// [`Stop`] for how soon it ends).
+pub fn build_with_stop(
+    path: &Path,
+    read: Reader<'_>,
+    overrides: &[(String, String)],
+    stop: &Stop,
+) -> Result<Output, String> {
     let path = plain(path);
     let mut sources = Sources::default();
     gather(&path, read, &mut sources)?;
-    deep(move || evaluate(path, sources, overrides))?
+    deep(move || {
+        opensolve_kernel::stopping(stop, || {
+            let out = evaluate(path, sources, overrides, stop);
+            if stop.is_stopped() {
+                return Err(CANCELLED.to_string());
+            }
+            out
+        })
+    })?
 }
 
 /// Which of a file's coloured parts a run makes: all, as OpenSCAD renders
@@ -135,6 +171,9 @@ pub struct Run {
     /// each time: OpenSCAD's console. The notes of [`Made`] have each once
     /// and at most a few dozen.
     pub log: Option<fn(&str)>,
+    /// Set (from another thread), the run ends early with
+    /// [`Error::cancelled`].
+    pub stop: Stop,
 }
 
 /// What a file makes, as [`make`] finds it.
@@ -167,10 +206,12 @@ pub fn make(path: &Path, read: Reader<'_>, run: &Run) -> Result<Made, Error> {
     let path = plain(path);
     let mut sources = Sources::default();
     gather(&path, read, &mut sources).map_err(|e| Error::at(0, 0, e))?;
+    let stop = &run.stop;
     deep(move || {
         let mut it = eval::Interp::new(sources.files, sources.blobs);
         it.paint = run.paint;
         it.log = run.log;
+        it.stop = stop.clone();
         let mut stmts = it.load(path, &mut Vec::new())?;
         for d in &run.defines {
             // As OpenSCAD adds them: each after the file, with a `;`.
@@ -180,7 +221,10 @@ pub fn make(path: &Path, read: Reader<'_>, run: &Run) -> Result<Made, Error> {
                 e
             })?);
         }
-        let made = it.run(&stmts, &eval::Interp::root())?;
+        let made = opensolve_kernel::stopping(stop, || it.run(&stmts, &eval::Interp::root()))?;
+        if stop.is_stopped() {
+            return Err(Error::cancelled());
+        }
         let shape = match made {
             Some(geom::Geom::D3(s)) if !s.is_empty() => {
                 let mut facets = Facets::default();
@@ -202,6 +246,17 @@ pub fn make(path: &Path, read: Reader<'_>, run: &Run) -> Result<Made, Error> {
 /// Runs the file at `path` as [`build`] does and tells what goes wrong,
 /// with places: what an editor marks. The shapes it makes do not matter.
 pub fn diagnose(path: &Path, read: Reader<'_>, overrides: &[(String, String)]) -> Diagnosis {
+    diagnose_with_stop(path, read, overrides, &Stop::new())
+}
+
+/// [`diagnose`], ended early when `stop` is set (from another thread):
+/// then its error is [`Error::cancelled`] and it has no notes.
+pub fn diagnose_with_stop(
+    path: &Path,
+    read: Reader<'_>,
+    overrides: &[(String, String)],
+    stop: &Stop,
+) -> Diagnosis {
     let path = plain(path);
     let mut sources = Sources::default();
     if let Err(e) = gather(&path, read, &mut sources) {
@@ -212,13 +267,20 @@ pub fn diagnose(path: &Path, read: Reader<'_>, overrides: &[(String, String)]) -
     }
     deep(move || {
         let mut it = eval::Interp::new(sources.files, sources.blobs);
+        it.stop = stop.clone();
         let error = it
             .load(path, &mut Vec::new())
             .and_then(|mut stmts| {
                 override_values(&mut it, &mut stmts, overrides);
-                it.run(&stmts, &eval::Interp::root())
+                opensolve_kernel::stopping(stop, || it.run(&stmts, &eval::Interp::root()))
             })
             .err();
+        if stop.is_stopped() {
+            return Diagnosis {
+                error: Some(Error::cancelled()),
+                notes: Vec::new(),
+            };
+        }
         Diagnosis {
             error,
             notes: std::mem::take(&mut it.marks),
@@ -354,8 +416,10 @@ fn evaluate(
     path: PathBuf,
     sources: Sources,
     overrides: &[(String, String)],
+    stop: &Stop,
 ) -> Result<Output, String> {
     let mut it = eval::Interp::new(sources.files, sources.blobs);
+    it.stop = stop.clone();
     let mut stmts = it.load(path, &mut Vec::new()).map_err(|e| e.to_string())?;
     override_values(&mut it, &mut stmts, overrides);
     let made = it
