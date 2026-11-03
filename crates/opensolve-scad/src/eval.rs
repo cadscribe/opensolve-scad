@@ -1141,6 +1141,20 @@ impl Interp {
         {
             return Ok(g.clone());
         }
+        // When all is made, what a call outside any colour made does inside
+        // one as well: its colours are told already.
+        if let Some(k) = &key
+            && self.paint == crate::Paint::All
+            && self.painted
+        {
+            let mut outside = k.clone();
+            if let Some(last) = outside.last_mut() {
+                *last = 0;
+            }
+            if let Some((g, ..)) = self.made.get(&outside) {
+                return Ok(g.clone());
+            }
+        }
         let frame = Rc::new(Frame {
             parent: Some(home.clone()),
             caller: Some(f.clone()),
@@ -1217,8 +1231,13 @@ impl Interp {
         }
         k.push(u8::from(self.modules.len() > 1));
         // Inside a colour, or cutting, a `color()` does not choose what is
-        // made.
-        k.push(u8::from(self.painted) | (u8::from(self.cutting) << 1));
+        // made. When all is made, cutting changes nothing, and inside a
+        // colour only that the colours inside are not told (see
+        // `user_module`).
+        k.push(match self.paint {
+            crate::Paint::All => u8::from(self.painted),
+            _ => u8::from(self.painted) | (u8::from(self.cutting) << 1),
+        });
         Some(k)
     }
 

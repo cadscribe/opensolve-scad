@@ -556,3 +556,39 @@ fn many_parts_apart_and_a_module_called_again() {
         2.0 * ngon(5.0, 16) + 2.0 * ngon(5.0, 6),
     );
 }
+
+#[test]
+fn a_module_made_outside_a_colour_is_kept_for_inside_one() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use opensolve_scad::{Run, make};
+    static MADE: AtomicUsize = AtomicUsize::new(0);
+    fn told(line: &str) {
+        if line.contains("made") {
+            MADE.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    let made = |text: &str| {
+        let read = |_: &Path| Ok(text.as_bytes().to_vec());
+        let run = Run {
+            log: Some(told),
+            ..Run::default()
+        };
+        make(Path::new("main.scad"), &read, &run).unwrap_or_else(|e| panic!("{e:?}"))
+    };
+    // Cut away first, then shown in a colour: made once.
+    made(
+        "module m() { echo(\"made\"); cube(1); }\n\
+         difference() { cube(3); m(); }\n\
+         color(\"red\") translate([5, 0, 0]) m();",
+    );
+    assert_eq!(MADE.load(Ordering::Relaxed), 1);
+    // Made in a colour first: made again outside, where its own colour
+    // counts.
+    let m = made(
+        "module n() color(\"blue\") cube(1);\n\
+         color(\"red\") n();\n\
+         translate([5, 0, 0]) n();",
+    );
+    assert_eq!(m.colours.len(), 2, "{:?}", m.colours);
+}
