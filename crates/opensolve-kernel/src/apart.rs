@@ -11,7 +11,7 @@ type P = [f64; 3];
 struct Bvh {
     /// Box and either the triangles `[start, start + len)` of `order` or,
     /// with `len` 0, the children at `start` and `start + 1`.
-    nodes: Vec<(P, P, u32, u32)>,
+    nodes: Vec<Node>,
     order: Vec<u32>,
 }
 
@@ -22,50 +22,113 @@ fn tri(s: &Solid, t: u32) -> [P; 3] {
     s.tris[t as usize].map(|i| s.points[i as usize])
 }
 
+/// A tree's node: its box and either its triangles or its children.
+type Node = (P, P, u32, u32);
+
+/// Triangles beyond which a tree is built on several threads.
+const BIG: usize = 1 << 16;
+
 impl Bvh {
+    /// The tree, split at the middle of the triangles' centres along the
+    /// longest side of each box. Of a large solid, the subtrees below the
+    /// first few splits are built on threads of their own: each from its
+    /// own part of the triangles, so the tree is the one a single thread
+    /// builds.
     fn new(s: &Solid) -> Bvh {
-        let mut b = Bvh {
-            nodes: Vec::with_capacity(2 * s.tris.len() / LEAF + 1),
-            order: (0..s.tris.len() as u32).collect(),
-        };
-        let centre: Vec<P> = (0..s.tris.len() as u32)
+        let n = s.tris.len();
+        let centre: Vec<P> = (0..n as u32)
             .map(|t| {
                 let [a, p, c] = tri(s, t);
                 std::array::from_fn(|k| (a[k] + p[k] + c[k]) / 3.0)
             })
             .collect();
-        b.nodes.push(([0.0; 3], [0.0; 3], 0, 0));
-        let mut stack = vec![(0usize, 0usize, s.tris.len())];
-        while let Some((node, start, len)) = stack.pop() {
-            let mut lo = [f64::MAX; 3];
-            let mut hi = [f64::MIN; 3];
-            for &t in &b.order[start..start + len] {
-                for p in tri(s, t) {
-                    for k in 0..3 {
-                        lo[k] = lo[k].min(p[k]);
-                        hi[k] = hi[k].max(p[k]);
-                    }
+        let mut order: Vec<u32> = (0..n as u32).collect();
+        // Subtrees no larger than this are built apart; of a small solid,
+        // none.
+        let apart = if n >= BIG {
+            n.div_ceil(4 * crate::threads())
+        } else {
+            0
+        };
+        let mut later: Vec<(usize, usize, usize)> = Vec::new();
+        let mut nodes = Vec::with_capacity(2 * n / LEAF + 1);
+        split(s, &centre, &mut order, 0, &mut nodes, apart, &mut later);
+        let built = crate::parallel(later.len(), |k| {
+            let (_, start, len) = later[k];
+            let mut part = order[start..start + len].to_vec();
+            let mut sub = Vec::with_capacity(2 * len / LEAF + 1);
+            split(s, &centre, &mut part, start, &mut sub, 0, &mut Vec::new());
+            (sub, part)
+        });
+        for (&(node, start, len), (sub, part)) in later.iter().zip(built) {
+            order[start..start + len].copy_from_slice(&part);
+            // The subtree's root takes the node kept for it, the rest go
+            // after the nodes there are.
+            let base = nodes.len() as u32 - 1;
+            for (k, x) in sub.into_iter().enumerate() {
+                let x = if x.3 == 0 {
+                    (x.0, x.1, x.2 + base, 0)
+                } else {
+                    x
+                };
+                if k == 0 {
+                    nodes[node] = x;
+                } else {
+                    nodes.push(x);
                 }
             }
-            if len <= LEAF {
-                b.nodes[node] = (lo, hi, start as u32, len as u32);
-                continue;
-            }
-            let axis = (0..3)
-                .max_by(|&x, &y| (hi[x] - lo[x]).total_cmp(&(hi[y] - lo[y])))
-                .unwrap_or(0);
-            let half = len / 2;
-            b.order[start..start + len].select_nth_unstable_by(half, |&x, &y| {
-                centre[x as usize][axis].total_cmp(&centre[y as usize][axis])
-            });
-            let left = b.nodes.len();
-            b.nodes.push(([0.0; 3], [0.0; 3], 0, 0));
-            b.nodes.push(([0.0; 3], [0.0; 3], 0, 0));
-            b.nodes[node] = (lo, hi, left as u32, 0);
-            stack.push((left, start, half));
-            stack.push((left + 1, start + half, len - half));
         }
-        b
+        Bvh { nodes, order }
+    }
+}
+
+/// The tree of the triangles `order` (those from `offset` on of the whole
+/// order) into `nodes`, its root first. Subtrees of more than `LEAF` and at
+/// most `apart` triangles (none for 0) are left to be built later: their
+/// node, where their triangles begin in the whole order, and how many.
+fn split(
+    s: &Solid,
+    centre: &[P],
+    order: &mut [u32],
+    offset: usize,
+    nodes: &mut Vec<Node>,
+    apart: usize,
+    later: &mut Vec<(usize, usize, usize)>,
+) {
+    nodes.push(([0.0; 3], [0.0; 3], 0, 0));
+    let mut stack = vec![(nodes.len() - 1, 0usize, order.len())];
+    while let Some((node, start, len)) = stack.pop() {
+        if len > LEAF && len <= apart {
+            later.push((node, offset + start, len));
+            continue;
+        }
+        let mut lo = [f64::MAX; 3];
+        let mut hi = [f64::MIN; 3];
+        for &t in &order[start..start + len] {
+            for p in tri(s, t) {
+                for k in 0..3 {
+                    lo[k] = lo[k].min(p[k]);
+                    hi[k] = hi[k].max(p[k]);
+                }
+            }
+        }
+        if len <= LEAF {
+            nodes[node] = (lo, hi, (offset + start) as u32, len as u32);
+            continue;
+        }
+        let axis = (0..3)
+            .max_by(|&x, &y| (hi[x] - lo[x]).total_cmp(&(hi[y] - lo[y])))
+            .unwrap_or(0);
+        let half = len / 2;
+        order[start..start + len].select_nth_unstable_by(half, |&x, &y| {
+            centre[x as usize][axis].total_cmp(&centre[y as usize][axis])
+        });
+        let left = nodes.len();
+        nodes.push(([0.0; 3], [0.0; 3], 0, 0));
+        nodes.push(([0.0; 3], [0.0; 3], 0, 0));
+        nodes[node] = (lo, hi, left as u32, 0);
+        stack.push((left, start, half));
+        stack.push((left + 1, start + half, len - half));
     }
 }
 
@@ -228,6 +291,56 @@ mod tests {
             .flat_map(|q| [[p(q[0]), p(q[1]), p(q[2])], [p(q[0]), p(q[2]), p(q[3])]])
             .collect();
         Solid::from_triangles(&tris, f, |k| FaceId(k as u64))
+    }
+
+    #[test]
+    fn a_large_tree_built_on_threads_is_the_one_built_on_one() {
+        let mut f = Facets::default();
+        let cubes: Vec<Solid> = (0..6000)
+            .map(|i| {
+                let o = [
+                    (i % 20) as f64 * 0.7,
+                    (i / 20 % 20) as f64 * 0.7,
+                    (i / 400) as f64,
+                ];
+                cube(&mut f, o, 1.0)
+            })
+            .collect();
+        let s = Solid::merged(&cubes);
+        assert!(s.tris.len() >= BIG);
+        let leaves = |nodes: &[Node], order: &[u32]| {
+            let mut out: Vec<(Vec<u32>, [u64; 6])> = nodes
+                .iter()
+                .filter(|n| n.3 > 0)
+                .map(|n| {
+                    let mut t = order[n.2 as usize..(n.2 + n.3) as usize].to_vec();
+                    t.sort_unstable();
+                    let b = |k: usize| if k < 3 { n.0[k] } else { n.1[k - 3] };
+                    (t, std::array::from_fn::<u64, 6, _>(|k| b(k).to_bits()))
+                })
+                .collect();
+            out.sort_unstable();
+            out
+        };
+        let tree = Bvh::new(&s);
+        let centre: Vec<P> = (0..s.tris.len() as u32)
+            .map(|t| {
+                let [a, p, c] = tri(&s, t);
+                std::array::from_fn(|k| (a[k] + p[k] + c[k]) / 3.0)
+            })
+            .collect();
+        let mut order: Vec<u32> = (0..s.tris.len() as u32).collect();
+        let mut nodes = Vec::new();
+        split(&s, &centre, &mut order, 0, &mut nodes, 0, &mut Vec::new());
+        assert_eq!(tree.nodes.len(), nodes.len());
+        assert_eq!(tree.order, order);
+        assert_eq!(leaves(&tree.nodes, &tree.order), leaves(&nodes, &order));
+        // Every node's children lie in it.
+        for n in tree.nodes.iter().filter(|n| n.3 == 0) {
+            for c in [&tree.nodes[n.2 as usize], &tree.nodes[n.2 as usize + 1]] {
+                assert!((0..3).all(|k| n.0[k] <= c.0[k] && c.1[k] <= n.1[k]));
+            }
+        }
     }
 
     #[test]

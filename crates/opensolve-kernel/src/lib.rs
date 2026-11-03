@@ -994,14 +994,18 @@ impl Solid {
             let r = |v: f64| (v * 1e6).round() as i64;
             (x.normal.map(r), r(x.offset))
         };
+        // Each facet once (many triangles share one), the oldest first: the
+        // first of a plane is its oldest.
+        let mut distinct = facets_of.clone();
+        distinct.sort_unstable();
+        distinct.dedup();
         let mut oldest: HashMap<([i64; 3], i64), u32, Fx> = HashMap::default();
-        for &f in &facets_of {
-            oldest
-                .entry(plane(f))
-                .and_modify(|o| *o = (*o).min(f))
-                .or_insert(f);
+        let mut renamed: HashMap<u32, u32, Fx> =
+            HashMap::with_capacity_and_hasher(distinct.len(), Fx);
+        for &f in &distinct {
+            renamed.insert(f, *oldest.entry(plane(f)).or_insert(f));
         }
-        let facets_of: Vec<u32> = facets_of.iter().map(|&f| oldest[&plane(f)]).collect();
+        let facets_of: Vec<u32> = facets_of.iter().map(|&f| renamed[&f]).collect();
         let m = engine::retag(m, &facets_of);
         Solid {
             points,
@@ -1186,15 +1190,57 @@ impl Solid {
 
     /// `true` if every edge has exactly one partner running the other way.
     pub fn is_closed(&self) -> bool {
-        let mut e: HashMap<(u32, u32), u32, Fx> =
-            HashMap::with_capacity_and_hasher(3 * self.tris.len(), Fx);
-        for t in &self.tris {
-            for k in 0..3 {
-                *e.entry((t[k], t[(k + 1) % 3])).or_default() += 1;
-            }
+        // Each half-edge in the bucket of its lower corner, as its other
+        // corner and which way it runs; an edge of one corner (both ends
+        // the same) is its own partner.
+        let corners = self
+            .tris
+            .iter()
+            .flatten()
+            .max()
+            .map_or(0, |&m| m as usize + 1);
+        let mut start = vec![0u32; corners + 1];
+        let halves = || {
+            self.tris
+                .iter()
+                .flat_map(|t| (0..3).map(move |k| (t[k], t[(k + 1) % 3])))
+        };
+        for (a, b) in halves() {
+            start[a.min(b) as usize + 1] += 1;
         }
-        e.iter()
-            .all(|(&(a, b), &n)| n == 1 && e.get(&(b, a)) == Some(&1))
+        for v in 1..start.len() {
+            start[v] += start[v - 1];
+        }
+        let mut at = start.clone();
+        let mut bucket = vec![0u64; 3 * self.tris.len()];
+        for (a, b) in halves() {
+            let lo = a.min(b) as usize;
+            bucket[at[lo] as usize] = u64::from(a.max(b)) << 1 | u64::from(a > b);
+            at[lo] += 1;
+        }
+        start.windows(2).enumerate().all(|(lo, w)| {
+            let edges = &mut bucket[w[0] as usize..w[1] as usize];
+            edges.sort_unstable();
+            // Each edge once each way: in order, pairs of the other corner
+            // running up then down, but the edge of one corner alone.
+            let mut i = 0;
+            while i < edges.len() {
+                let hi = edges[i] >> 1;
+                if hi == lo as u64 {
+                    if edges.get(i + 1).is_some_and(|&e| e >> 1 == hi) {
+                        return false;
+                    }
+                    i += 1;
+                    continue;
+                }
+                let pair = edges.get(i + 1).is_some_and(|&e| e == edges[i] | 1);
+                if edges[i] & 1 == 1 || !pair || edges.get(i + 2).is_some_and(|&e| e >> 1 == hi) {
+                    return false;
+                }
+                i += 2;
+            }
+            true
+        })
     }
 
     pub fn volume(&self) -> f64 {
@@ -1244,6 +1290,11 @@ fn run_boolean(a: &Solid, b: &Solid, op: Op) -> Result<Option<engine::Mesh>, Err
         engine::boolean(&a, &b, op)
     }))
     .map_err(|_| Error::Boolean("the mesh library panicked".to_string()))?
+}
+
+/// How many threads the machine has (one in the browser).
+pub(crate) fn threads() -> usize {
+    std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
 }
 
 /// `f` of `0..n`, on as many threads as the machine has (in the browser
@@ -1343,6 +1394,51 @@ mod tests {
             FaceId(base + 1001),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn closed_is_each_edge_once_each_way() {
+        // As it was defined: a map of the half-edges.
+        fn by_map(s: &Solid) -> bool {
+            let mut e: HashMap<(u32, u32), u32> = HashMap::new();
+            for t in &s.tris {
+                for k in 0..3 {
+                    *e.entry((t[k], t[(k + 1) % 3])).or_default() += 1;
+                }
+            }
+            e.iter()
+                .all(|(&(a, b), &n)| n == 1 && e.get(&(b, a)) == Some(&1))
+        }
+        let mut f = Facets::default();
+        let cube = block(&mut f, rect(0.0, 0.0, 1.0, 1.0), 0.0, 1.0, 0);
+        let with = |tris: Vec<[u32; 3]>| Solid {
+            tris,
+            facets: Vec::new(),
+            ..cube.clone()
+        };
+        let mut cases = vec![
+            cube.tris.clone(),
+            Vec::new(),
+            cube.tris[1..].to_vec(),
+            [cube.tris.clone(), cube.tris.clone()].concat(),
+            [cube.tris.clone(), vec![[0, 0, 0]]].concat(),
+            [cube.tris.clone(), vec![[0, 0, 0], [0, 0, 0]]].concat(),
+            [cube.tris.clone(), vec![[0, 1, 1], [1, 0, 0]]].concat(),
+            vec![[0, 1, 2], [0, 2, 1]],
+            vec![[0, 1, 2], [0, 1, 2]],
+            vec![[0, 1, 2], [2, 1, 0], [0, 1, 2], [2, 1, 0]],
+        ];
+        // Turned round: the same answer.
+        let turned: Vec<Vec<[u32; 3]>> = cases
+            .iter()
+            .map(|c| c.iter().map(|t| [t[0], t[2], t[1]]).collect())
+            .collect();
+        cases.extend(turned);
+        for (i, tris) in cases.into_iter().enumerate() {
+            let s = with(tris);
+            assert_eq!(s.is_closed(), by_map(&s), "case {i}");
+        }
+        assert!(cube.is_closed());
     }
 
     #[test]
