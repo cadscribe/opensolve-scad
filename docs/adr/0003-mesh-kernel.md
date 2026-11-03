@@ -1,6 +1,7 @@
 # ADR 0003 — Mesh kernel for printing
 
-- Status: accepted
+- Status: accepted; natively the booleans are Manifold's since ADR 0019,
+  `boolmesh` stays for the browser
 - Date: 2026-10-31
 
 ## Context

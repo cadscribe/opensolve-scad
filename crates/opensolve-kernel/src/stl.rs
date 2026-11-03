@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::{FaceId, Facets, Solid, cross, dot, snap, sub};
+use crate::{FaceId, Facets, Fx, Solid, cross, dot, snap, sub};
 
 /// The triangles of an STL file, binary or text; `None` when it is neither.
 #[must_use]
@@ -44,8 +44,8 @@ pub fn read_stl(b: &[u8]) -> Option<Vec<[[f64; 3]; 3]>> {
 
 impl Solid {
     /// A solid from loose triangles: corners at one place become one vertex,
-    /// triangles of one plane one face, named `face(k)` for the k-th plane.
-    /// Triangles without area are left out.
+    /// on the kernel's grid, triangles of one plane one face, named `face(k)`
+    /// for the k-th plane. Triangles without area are left out.
     pub fn from_triangles(
         tris: &[[[f64; 3]; 3]],
         facets: &mut Facets,
@@ -53,8 +53,8 @@ impl Solid {
     ) -> Solid {
         // Welded on a grid finer than a print and coarser than f32 noise.
         let key = |p: [f64; 3]| p.map(|x| (x * 1e5).round() as i64);
-        let mut at: HashMap<[i64; 3], u32> = HashMap::new();
-        let mut planes: HashMap<([i64; 3], i64), u32> = HashMap::new();
+        let mut at: HashMap<[i64; 3], u32, Fx> = HashMap::default();
+        let mut planes: HashMap<([i64; 3], i64), u32, Fx> = HashMap::default();
         let mut s = Solid::default();
         for t in tris {
             let ids = t.map(|p| {
@@ -81,6 +81,49 @@ impl Solid {
                 .entry(plane)
                 .or_insert_with(|| facets.add(face(k), n, t[0]));
             s.tris.push(ids);
+            s.facets.push(facet);
+        }
+        s
+    }
+
+    /// A solid from its corners and triangles, as [`Solid::from_triangles`]
+    /// makes one from loose triangles, the corners on the kernel's grid, but
+    /// no two at one place may be meant as one. Triangles of one plane are one
+    /// face, named `face(k)` for the k-th plane; those without area are
+    /// left out.
+    pub fn from_indexed(
+        points: Vec<[f64; 3]>,
+        tris: &[[u32; 3]],
+        facets: &mut Facets,
+        face: impl Fn(usize) -> FaceId,
+    ) -> Solid {
+        let mut planes: HashMap<([i64; 3], i64), u32, Fx> = HashMap::default();
+        let mut s = Solid {
+            points: points.into_iter().map(|p| p.map(snap)).collect(),
+            ..Solid::default()
+        };
+        s.tris.reserve(tris.len());
+        s.facets.reserve(tris.len());
+        for &t in tris {
+            if t[0] == t[1] || t[1] == t[2] || t[0] == t[2] {
+                continue;
+            }
+            let [a, b, c] = t.map(|i| s.points[i as usize]);
+            let n = cross(sub(b, a), sub(c, a));
+            let l = dot(n, n).sqrt();
+            if l < 1e-12 {
+                continue;
+            }
+            let n = n.map(|x| x / l);
+            let plane = (
+                n.map(|x| (x * 1e4).round() as i64),
+                (dot(n, a) * 1e3).round() as i64,
+            );
+            let k = planes.len();
+            let facet = *planes
+                .entry(plane)
+                .or_insert_with(|| facets.add(face(k), n, a));
+            s.tris.push(t);
             s.facets.push(facet);
         }
         s

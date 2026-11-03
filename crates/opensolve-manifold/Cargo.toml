@@ -1,0 +1,27 @@
+[package]
+name = "opensolve-manifold"
+description = "Manifold, the C++ mesh boolean library OpenSCAD uses, for the mesh kernel"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+cxx.workspace = true
+
+[build-dependencies]
+cc.workspace = true
+cxx-build.workspace = true
+flate2.workspace = true
+minreq.workspace = true
+ring.workspace = true
+tar.workspace = true
+
+# Not the workspace's lints: the cxx bridge is unsafe code by nature, which
+# the workspace forbids.
+[lints.rust]
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
