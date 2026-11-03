@@ -1186,7 +1186,8 @@ impl Solid {
 
     /// `true` if every edge has exactly one partner running the other way.
     pub fn is_closed(&self) -> bool {
-        let mut e: HashMap<(u32, u32), u32, Fx> = HashMap::default();
+        let mut e: HashMap<(u32, u32), u32, Fx> =
+            HashMap::with_capacity_and_hasher(3 * self.tris.len(), Fx);
         for t in &self.tris {
             for k in 0..3 {
                 *e.entry((t[k], t[(k + 1) % 3])).or_default() += 1;

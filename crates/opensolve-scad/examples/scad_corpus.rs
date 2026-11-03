@@ -10,9 +10,9 @@
 //! `… -- compare A.stl B.stl [SAMPLES]` reads two STL files (A the
 //! reference) and writes a line of JSON: each one's triangles, volume,
 //! closedness and bounding box, and the volume of their symmetric
-//! difference, |A−B| + |B−A|, by the kernel's booleans; when a boolean is
-//! refused, estimated from points sampled in both boxes instead (`method`
-//! says which).
+//! difference, |A−B| + |B−A|, by the kernel's booleans; when a mesh is not
+//! closed or a boolean is refused, estimated from points sampled in both
+//! boxes instead (`method` says which).
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -62,8 +62,8 @@ fn build(args: &[String]) {
     match out {
         Ok(o) => {
             let _ = write!(j, ",\"ok\":true");
-            stats(&mut j, "", &o.solid);
-            let _ = write!(j, ",\"closed_in_memory\":{}", o.solid.is_closed());
+            let closed = stats(&mut j, "", &o.solid);
+            let _ = write!(j, ",\"closed_in_memory\":{closed}");
             let notes: Vec<String> = o.notes.iter().take(200).map(|n| quote(n)).collect();
             let _ = write!(
                 j,
@@ -107,10 +107,14 @@ fn compare(args: &[String]) {
     let sb = Solid::from_triangles(&tb, &mut facets, |k| FaceId(1 << 32 | k as u64));
     let mut j = String::from("{");
     let _ = write!(j, "\"a_raw_tris\":{},\"b_raw_tris\":{}", ta.len(), tb.len());
-    stats(&mut j, "a_", &sa);
-    stats(&mut j, "b_", &sb);
+    let closed = stats(&mut j, "a_", &sa) & stats(&mut j, "b_", &sb);
     let t = Instant::now();
     let booleans = (|| -> Result<(f64, f64), String> {
+        // Booleans of a mesh that is not closed (OpenSCAD writes parts that
+        // touch along an edge so) can come out as anything: sampled.
+        if !closed {
+            return Err("a mesh is not closed".into());
+        }
         let ab = sa
             .boolean(&sb, Op::Subtract, &mut facets)
             .map_err(|e| e.to_string())?;
@@ -145,14 +149,15 @@ fn compare(args: &[String]) {
     println!("{j}");
 }
 
-/// Volume, triangles, closedness and box of a solid, as JSON fields.
-fn stats(j: &mut String, prefix: &str, s: &Solid) {
+/// Volume, triangles, closedness and box of a solid, as JSON fields;
+/// whether it is closed.
+fn stats(j: &mut String, prefix: &str, s: &Solid) -> bool {
+    let closed = s.is_closed();
     let _ = write!(
         j,
-        ",\"{prefix}volume\":{:.6},\"{prefix}tris\":{},\"{prefix}closed\":{}",
+        ",\"{prefix}volume\":{:.6},\"{prefix}tris\":{},\"{prefix}closed\":{closed}",
         s.volume(),
         s.tris.len(),
-        s.is_closed()
     );
     if let Some((lo, hi)) = s.bounds() {
         let _ = write!(
@@ -161,6 +166,7 @@ fn stats(j: &mut String, prefix: &str, s: &Solid) {
             lo[0], lo[1], lo[2], hi[0], hi[1], hi[2]
         );
     }
+    closed
 }
 
 fn quote(s: &str) -> String {
