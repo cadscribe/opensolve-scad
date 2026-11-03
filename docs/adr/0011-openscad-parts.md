@@ -43,6 +43,9 @@ OpenSCAD does is the part that matters for parts that fit.
   does not keep the app busy for minutes.
 - A 2D shape is a slab one unit thick: its booleans are the kernel's, and its
   top is the shape an extrusion takes. No polygon clipper of its own.
+  (2026-11-03, ADR 0019: 2D shapes are polygons now, their booleans,
+  offsets and Minkowski sums by Clipper2 as in OpenSCAD; they become meshes
+  only when extruded.)
 - Not supported yet, and named in a note rather than left out silently:
   `import`, `surface`, `roof`, `fill`. `color` is kept as a group and its
   colour dropped: a link is one feature, and colours are per part.

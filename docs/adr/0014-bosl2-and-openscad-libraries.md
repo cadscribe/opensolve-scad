@@ -143,6 +143,9 @@ cuts of `edge_profile` masks and jigsaw `partition`s (11), examples whose
 2D and 3D parts are mixed (9). A rounded block with a hole, a gear,
 a threaded rod, an attachment tree and an `offset_sweep` have OpenSCAD's
 volume to the third decimal (tests in `tests/bosl2.rs`, `geometry.rs`).
+These counts were taken with boolmesh; since ADR 0019 the native booleans
+are Manifold's, the library OpenSCAD uses, and the examples were not
+counted again.
 
 ## Speed
 
@@ -186,8 +189,9 @@ use BOSL2 and how it is included.
 - `random_polygon` in BOSL2 gives other points than OpenSCAD 2026 for some
   seeds (`rands` itself is the same).
 - boolmesh 0.2.1 panics on some unions (BOSL2's `cubetruss`, `joiners`):
-  they become shapes put together with a note. boolmesh 0.2.2 (2026-10-27)
-  may fix it; it may be taken once it is a week old.
+  they become shapes put together with a note. (2026-11-03: natively the
+  booleans are Manifold's since ADR 0019; only the browser build still uses
+  boolmesh.)
 
 ## Consequences
 

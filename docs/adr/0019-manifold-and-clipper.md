@@ -1,7 +1,16 @@
 # ADR 0019 — Manifold for the mesh booleans, Clipper2 for 2D
 
-- Status: accepted (branch `scad-speed`)
+- Status: accepted (on `main` since 2026-11-03)
 - Date: 2026-11-03
+
+## Result
+
+On the user's 216 timed OpenSCAD files: OpenSCAD 2026.10.11 73.6 s in all,
+OpenSolve now 33.1 s (before this ADR 273.2 s). 214 files as fast as
+OpenSCAD or faster, two a little slower (`gridfinity-rebuilt-lite` 0.55 s
+against 0.46 s, `logo_full` 1.78 s against 1.73 s). Against OpenSCAD's
+results 208 identical, 1 close, 1 differs, none fails. Details under
+Corpus below; the numbers in Context are those before.
 
 ## Context
 
@@ -9,7 +18,7 @@ ADR 0003 chose `boolmesh` 0.2.1, a Rust port of Manifold, for the mesh
 booleans, and kept 2D shapes of OpenSCAD files as slabs one unit thick that
 went through those booleans (ADR 0011). Against OpenSCAD 2026.10.11 (its
 default backend, Manifold in C++) on the user's 235 own OpenSCAD files, 210
-timed, a cold process each: OpenSCAD 69.8 s in all, here 261.8 s; 146 files
+timed, a cold process each, before this ADR: OpenSCAD 69.8 s in all, here 261.8 s; 146 files
 faster here, 64 slower, and the slow ones the large models
 (`render_baskets` 104 s against 26.6 s, the logos 68.7 s against 1.8 s and
 24 s against 0.56 s, `tamper-station` 13.9 s against 6.9 s). The time of a
@@ -138,7 +147,7 @@ main 14 s; Manifold on one thread, batched, 6.0 s; on TBB 2.6 s (OpenSCAD
 
 The same 216 files timed as before, one process at a time, OpenSCAD, main
 and this branch back to back per file, the median of three under 5 s: in
-all OpenSCAD 73.6 s, main 273.2 s, here 33.1 s. 214 files are as fast as
+all OpenSCAD 73.6 s, before 273.2 s, now 33.1 s. 214 files are as fast as
 OpenSCAD or faster, two slower: `gridfinity-rebuilt-lite` (0.55 s against
 0.46 s; its rounded corners are slanted planes the grid bends, 132 000
 triangles against OpenSCAD's 82 000) and `logo_full` (1.78 s against
@@ -147,7 +156,7 @@ with 9 500 corners). Against OpenSCAD's results: 208 identical (204
 before), 1 close (4), 1 differs (2, the same sampled estimate as before),
 none fails.
 
-| file | OpenSCAD | main | here |
+| file | OpenSCAD | before | now |
 |---|---:|---:|---:|
 | render_baskets | 26.55 s | 102.80 s | 10.98 s |
 | logo_full | 1.73 s | 74.12 s | 1.78 s |
