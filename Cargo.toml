@@ -5,6 +5,7 @@ members = [
     "crates/opensolve-kernel",
     "crates/opensolve-manifold",
     "crates/opensolve-scad",
+    "crates/opensolve-scad-cli",
     "crates/opensolve-scad-lsp",
 ]
 

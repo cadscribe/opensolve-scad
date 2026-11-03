@@ -1,0 +1,19 @@
+[package]
+name = "opensolve-scad-cli"
+description = "opensolve-scad: OpenSCAD files to STL, 3MF, OFF, OBJ, CSG, STEP, SVG and DXF on the command line, as `openscad -o` makes them"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "opensolve-scad"
+path = "src/main.rs"
+
+[dependencies]
+opensolve-kernel.workspace = true
+opensolve-scad.workspace = true
+
+[lints]
+workspace = true
