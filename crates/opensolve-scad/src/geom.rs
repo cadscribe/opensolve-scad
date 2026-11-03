@@ -471,13 +471,16 @@ impl Builder {
         if lo < -1e-9 && hi > 1e-9 {
             return Err("rotate_extrude: the shape lies on both sides of the Y axis".into());
         }
-        // All on the left: as OpenSCAD does, the mirror image.
+        // All on the left: turned with its x as it is, as OpenSCAD's
+        // `x · sin a, x · cos a` turns it, so the solid lies on the other
+        // side of the axis (a half turn of the one of the mirror image).
         let mirrored = hi <= 1e-9;
         if mirrored {
             for p in &mut corners {
                 p[0] = -p[0];
             }
         }
+        let side = if mirrored { -1.0 } else { 1.0 };
         let whole = angle.abs() >= 360.0;
         let n = n.max(1);
         let at = |j: usize, p: V2| -> V3 {
@@ -486,7 +489,7 @@ impl Builder {
             } else {
                 90.0 - j as f64 * angle / n as f64
             };
-            let x = p[0].max(0.0);
+            let x = p[0].max(0.0) * side;
             [x * sin_deg(a), x * cos_deg(a), p[1]]
         };
         // Each corner at each step, numbered; one on the axis is one point

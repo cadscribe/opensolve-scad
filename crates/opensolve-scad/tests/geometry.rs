@@ -255,6 +255,15 @@ fn rotate_extrusions() {
         volume("rotate_extrude($fn = 12) polygon([[0, 0], [3, 0], [0, 4]]);"),
         ngon(3.0, 12) * 4.0 / 3.0,
     );
+    // Left of the axis: turned as it lies, as OpenSCAD 2026 turns it (x
+    // sin a, x cos a), so a quarter lands on −X and −Y, not mirrored.
+    let s = solid("rotate_extrude(angle = 90, $fn = 16) translate([-7, 0]) square([2, 4]);").solid;
+    let (lo, hi) = s.bounds().unwrap();
+    assert!(
+        lo[0] < -6.9 && lo[1] < -6.9 && hi[0] < 1e-6 && hi[1] < 1e-6,
+        "{lo:?} {hi:?}"
+    );
+    near(s.volume(), 4.0 * (wedge(7.0) - wedge(5.0)));
 }
 
 #[test]
