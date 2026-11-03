@@ -923,6 +923,15 @@ impl Interp {
                 let m = matrix(name, &a);
                 let made = kids(self)?;
                 match m {
+                    // A map of numbers that are none (a turn by 360 / 0)
+                    // leaves nothing a boolean could take, in OpenSCAD too.
+                    Some(m) if m.iter().flatten().any(|x| !x.is_finite()) => {
+                        self.note(
+                            Some(pos),
+                            format!("{name}: its argument is not a number: left out"),
+                        );
+                        None
+                    }
                     Some(m) => {
                         let one = self.union(made, Some(pos))?;
                         one.map(|g| self.transform(g, &m))
@@ -1005,7 +1014,7 @@ impl Interp {
                     None => None,
                 }
             }
-            "text" => self.text(&a, pos),
+            "text" => self.text(&a, f, pos),
             "import" => self.import(&a, f, pos),
             "surface" | "roof" | "fill" => {
                 self.note(Some(pos), format!("not supported: {name}"));
@@ -1451,7 +1460,7 @@ impl Interp {
     /// so that a capital H of size 10 is about 9.5 high. The font is found
     /// by family and style as OpenSCAD finds it (see [`crate::fonts`]):
     /// Liberation Sans without a name or for one the machine lacks.
-    fn text(&mut self, a: &Args, pos: Pos) -> Option<Geom> {
+    fn text(&mut self, a: &Args, f: &Rc<Frame>, pos: Pos) -> Option<Geom> {
         let words = match a.get("text", 0) {
             Some(Value::Str(s)) => s.to_string(),
             Some(v) => v.to_string(),
@@ -1472,8 +1481,10 @@ impl Interp {
         }
         let (data, index) = (found.data, found.index);
         let spacing = a.num("spacing", usize::MAX).unwrap_or(1.0);
-        // In cap heights; a chord within a thousandth of the letters.
-        let outlines = opensolve_sketch::text::outlines_in(&words, data, index, 1e-3);
+        // Each curve in as many chords as OpenSCAD cuts it into: an eighth
+        // of the pieces of a circle of the size, plus one, at least two.
+        let steps = (self.fragments(a, f, size, pos) / 8 + 1).max(2);
+        let outlines = opensolve_sketch::text::outlines_in_steps(&words, data, index, steps);
         if outlines.is_empty() {
             return None;
         }
@@ -1743,7 +1754,9 @@ impl Interp {
             .fold(0.0, f64::max);
         if name == "rotate_extrude" {
             let angle = a.num("angle", 0).unwrap_or(360.0).clamp(-360.0, 360.0);
-            if angle == 0.0 {
+            // No angle (0, or 0 / 0 from a parameter left out) makes nothing,
+            // as in OpenSCAD.
+            if angle == 0.0 || !angle.is_finite() {
                 return Ok(None);
             }
             let max_x = shape

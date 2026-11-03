@@ -493,7 +493,9 @@ impl Solid {
     /// A copy mapped by the affine map `m` (three rows of a 4×4 matrix), a
     /// mirror turned round, on facets of its own: each facet's plane mapped,
     /// so that the triangles of a plane stay one facet (and the boolean
-    /// library joins them up again). `None` if the map flattens it.
+    /// library joins them up again). The corners are mapped as they are,
+    /// not onto the grid, which would bend planes a hair. `None` if the map
+    /// flattens it.
     pub fn mapped(&self, facets: &mut Facets, m: &[[f64; 4]; 3]) -> Option<Solid> {
         let row = |i: usize| [m[i][0], m[i][1], m[i][2]];
         let det = dot(row(0), cross(row(1), row(2)));
@@ -525,7 +527,7 @@ impl Solid {
             .collect();
         let flip = det < 0.0;
         Some(Solid {
-            points: self.points.iter().map(|p| at(*p).map(snap)).collect(),
+            points: self.points.iter().map(|p| at(*p)).collect(),
             tris: self
                 .tris
                 .iter()

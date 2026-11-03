@@ -160,7 +160,7 @@ impl Builder {
     fn solid(&mut self, tris: &[[V3; 3]]) -> Solid {
         let base = self.next_face + 1;
         self.next_face += tris.len() as u64 + 1;
-        Solid::from_triangles(tris, &mut self.facets, |k| FaceId(base + k as u64))
+        Solid::from_triangles_exact(tris, &mut self.facets, |k| FaceId(base + k as u64))
     }
 
     /// Loose triangles turned inside out if they enclose a negative volume.
@@ -400,9 +400,7 @@ impl Builder {
         if height <= 0.0 || !height.is_finite() {
             return None;
         }
-        let shape = shape.parted();
-        let tris = cap(&shape)?;
-        let loops = &shape.loops;
+        let (loops, tris) = cap_indexed(&shape.parted())?;
         let z0 = if center { -height / 2.0 } else { 0.0 };
         let n = slices.max(1);
         let layer = |k: usize, p: V2| -> V3 {
@@ -413,28 +411,46 @@ impl Builder {
             let (c, si) = (cos_deg(a), sin_deg(a));
             [x * c - y * si, x * si + y * c, z0 + height * t]
         };
-        let mut soup = Vec::new();
+        // The corners of each layer, numbered as the caps number them.
+        let corners: Vec<V2> = loops.concat();
+        let m = corners.len() as u32;
+        let points: Vec<V3> = (0..=n)
+            .flat_map(|k| corners.iter().map(move |p| (k, *p)))
+            .map(|(k, p)| layer(k, p))
+            .collect();
+        let at = |k: usize, i: u32| k as u32 * m + i;
+        let mut faces: Vec<[u32; 3]> = Vec::with_capacity(2 * tris.len() + 2 * n * corners.len());
         for t in &tris {
-            soup.push([layer(0, t[0]), layer(0, t[2]), layer(0, t[1])]);
-            soup.push([layer(n, t[0]), layer(n, t[1]), layer(n, t[2])]);
+            faces.push([t[0], t[2], t[1]]);
+            faces.push(t.map(|i| at(n, i)));
         }
         // Twisted, a side is no plane: split as OpenSCAD splits it, by the
         // way it turns, the other way in holes.
         let turns_back = sin_deg(-twist / n as f64) >= 0.0;
-        for (a, b, ring) in edges_of(loops) {
+        let mut first = 0u32;
+        for ring in &loops {
             let hole = area(ring) < 0.0;
-            for k in 0..n {
-                let (a0, b0, a1, b1) = (layer(k, a), layer(k, b), layer(k + 1, a), layer(k + 1, b));
-                if turns_back != hole {
-                    soup.push([a0, b0, b1]);
-                    soup.push([a0, b1, a1]);
-                } else {
-                    soup.push([a0, b0, a1]);
-                    soup.push([a1, b0, b1]);
+            let len = ring.len() as u32;
+            for i in 0..len {
+                let (a, b) = (first + i, first + (i + 1) % len);
+                for k in 0..n {
+                    let (a0, b0, a1, b1) = (at(k, a), at(k, b), at(k + 1, a), at(k + 1, b));
+                    if turns_back != hole {
+                        faces.push([a0, b0, b1]);
+                        faces.push([a0, b1, a1]);
+                    } else {
+                        faces.push([a0, b0, a1]);
+                        faces.push([a1, b0, b1]);
+                    }
                 }
             }
+            first += len;
         }
-        Some(self.solid(&soup))
+        let base = self.next_face + 1;
+        self.next_face += faces.len() as u64 + 1;
+        Some(Solid::from_indexed(points, &faces, &mut self.facets, |k| {
+            FaceId(base + k as u64)
+        }))
     }
 
     /// OpenSCAD's `rotate_extrude`: the shape, in the XZ plane, turned about
@@ -446,26 +462,20 @@ impl Builder {
         angle: f64,
         n: usize,
     ) -> Result<Option<Solid>, String> {
-        let shape = shape.parted();
-        let Some(mut tris) = cap(&shape) else {
+        let Some((loops, tris)) = cap_indexed(&shape.parted()) else {
             return Ok(None);
         };
-        let mut loops = shape.loops;
-        let xs = tris.iter().flatten().map(|p| p[0]);
+        let mut corners: Vec<V2> = loops.concat();
+        let xs = corners.iter().map(|p| p[0]);
         let (lo, hi) = xs.fold((f64::MAX, f64::MIN), |(l, h), x| (l.min(x), h.max(x)));
         if lo < -1e-9 && hi > 1e-9 {
             return Err("rotate_extrude: the shape lies on both sides of the Y axis".into());
         }
-        if hi <= 1e-9 {
-            // All on the left: as OpenSCAD does, the mirror image.
-            for t in &mut tris {
-                *t = [t[0], t[2], t[1]].map(|p| [-p[0], p[1]]);
-            }
-            for l in &mut loops {
-                l.reverse();
-                for p in l.iter_mut() {
-                    p[0] = -p[0];
-                }
+        // All on the left: as OpenSCAD does, the mirror image.
+        let mirrored = hi <= 1e-9;
+        if mirrored {
+            for p in &mut corners {
+                p[0] = -p[0];
             }
         }
         let whole = angle.abs() >= 360.0;
@@ -479,21 +489,71 @@ impl Builder {
             let x = p[0].max(0.0);
             [x * sin_deg(a), x * cos_deg(a), p[1]]
         };
-        let mut soup = Vec::new();
+        // Each corner at each step, numbered; one on the axis is one point
+        // at all steps.
+        let m = corners.len();
+        let rings = if whole { n } else { n + 1 };
+        let on_axis = |i: usize| corners[i][0] <= 0.0;
+        let mut number = vec![0u32; rings * m];
+        let mut points: Vec<V3> = Vec::with_capacity(rings * m);
+        for i in (0..m).filter(|&i| on_axis(i)) {
+            for j in 0..rings {
+                number[j * m + i] = points.len() as u32;
+            }
+            points.push(at(0, corners[i]));
+        }
+        for j in 0..rings {
+            for i in (0..m).filter(|&i| !on_axis(i)) {
+                number[j * m + i] = points.len() as u32;
+                points.push(at(j, corners[i]));
+            }
+        }
+        let id = |j: usize, i: u32| number[(j % rings) * m + i as usize];
+        let mut faces: Vec<[u32; 3]> = Vec::new();
         if !whole {
             for t in &tris {
-                soup.push([at(0, t[0]), at(0, t[2]), at(0, t[1])]);
-                soup.push([at(n, t[0]), at(n, t[1]), at(n, t[2])]);
+                let t = if mirrored { [t[0], t[2], t[1]] } else { *t };
+                faces.push([id(0, t[0]), id(0, t[2]), id(0, t[1])]);
+                faces.push(t.map(|i| id(n, i)));
             }
         }
-        for (a, b, _) in edges_of(&loops) {
-            for j in 0..n {
-                let (a0, b0, a1, b1) = (at(j, a), at(j, b), at(j + 1, a), at(j + 1, b));
-                soup.push([a0, b0, b1]);
-                soup.push([a0, b1, a1]);
+        let mut first = 0u32;
+        for ring in &loops {
+            let len = ring.len() as u32;
+            for k in 0..len {
+                let (mut a, mut b) = (first + k, first + (k + 1) % len);
+                if mirrored {
+                    std::mem::swap(&mut a, &mut b);
+                }
+                for j in 0..n {
+                    let (a0, b0, a1, b1) = (id(j, a), id(j, b), id(j + 1, a), id(j + 1, b));
+                    faces.push([a0, b0, b1]);
+                    faces.push([a0, b1, a1]);
+                }
+            }
+            first += len;
+        }
+        // Outward, whichever way the profile ran.
+        let volume: f64 = faces
+            .iter()
+            .map(|t| {
+                let [a, b, c] = t.map(|i| points[i as usize]);
+                dot(a, cross(b, c))
+            })
+            .sum();
+        if volume < 0.0 {
+            for t in &mut faces {
+                t.swap(1, 2);
             }
         }
-        Ok(Some(self.outward(soup)))
+        let base = self.next_face + 1;
+        self.next_face += faces.len() as u64 + 1;
+        Ok(Some(Solid::from_indexed(
+            points,
+            &faces,
+            &mut self.facets,
+            |k| FaceId(base + k as u64),
+        )))
     }
 }
 
@@ -621,19 +681,6 @@ fn area(p: &[V2]) -> f64 {
         / 2.0
 }
 
-/// The triangles of loops (outlines counter-clockwise, holes clockwise) by
-/// the kernel's triangulator, Manifold's, as OpenSCAD triangulates its
-/// polygons; `None` where there is none (in the browser).
-fn triangles_of(loops: &[Vec<V2>]) -> Option<Vec<[V2; 3]>> {
-    let corners: Vec<V2> = loops.iter().flatten().copied().collect();
-    let tris = opensolve_kernel::triangulate_loops(loops)?;
-    Some(
-        tris.iter()
-            .map(|t| t.map(|i| corners[i as usize]))
-            .collect(),
-    )
-}
-
 /// Ear clipping of a simple counter-clockwise polygon.
 fn ear_clip(p: &[V2]) -> Option<Vec<[usize; 3]>> {
     let inside = |q: V2, a: V2, b: V2, c: V2| {
@@ -666,19 +713,23 @@ fn ear_clip(p: &[V2]) -> Option<Vec<[usize; 3]>> {
     Some(out)
 }
 
-/// The triangles of a 2D shape, for the caps of an extrusion: Manifold's,
-/// as OpenSCAD triangulates; where there is none (in the browser), each
+/// Loops, and triangles of their corners numbered through all of them.
+type Cap = (Vec<Vec<V2>>, Vec<[u32; 3]>);
+
+/// The caps of a 2D shape: its loops, cleaned, and triangles of their
+/// corners, numbered through all loops in order. Manifold's triangles, as
+/// OpenSCAD triangulates; where there is none (in the browser), each
 /// outline with the holes it holds bridged into one loop and clipped.
 /// `None` if it has none.
-fn cap(r: &Region) -> Option<Vec<[V2; 3]>> {
+fn cap_indexed(r: &Region) -> Option<Cap> {
     let loops: Vec<Vec<V2>> = r
         .loops
         .iter()
         .map(|l| clean(l))
         .filter(|l| l.len() >= 3 && area(l).abs() > 1e-18)
         .collect();
-    if let Some(tris) = triangles_of(&loops) {
-        return (!tris.is_empty()).then_some(tris);
+    if let Some(tris) = opensolve_kernel::triangulate_loops(&loops) {
+        return (!tris.is_empty()).then_some((loops, tris));
     }
     let (outers, holes): (Vec<&Vec<V2>>, Vec<&Vec<V2>>) = loops.iter().partition(|l| area(l) > 0.0);
     let mut held: Vec<Vec<Vec<V2>>> = vec![Vec::new(); outers.len()];
@@ -698,20 +749,19 @@ fn cap(r: &Region) -> Option<Vec<[V2; 3]>> {
             held[o].push(h.clone());
         }
     }
+    // The bridged loops repeat corners: back to their numbers by place.
+    let mut number: HashMap<[u64; 2], u32, Fx> = HashMap::default();
+    for (i, p) in loops.iter().flatten().enumerate() {
+        number.entry(p.map(f64::to_bits)).or_insert(i as u32);
+    }
     let mut tris = Vec::new();
     for (o, outer) in outers.iter().enumerate() {
         let poly = crate::region::bridge(outer, &held[o]);
-        let ears = ear_clip(&poly)?;
-        tris.extend(ears.iter().map(|t| t.map(|i| poly[i])));
+        for t in ear_clip(&poly)? {
+            tris.push(t.map(|i| number.get(&poly[i].map(f64::to_bits)).copied().unwrap_or(0)));
+        }
     }
-    (!tris.is_empty()).then_some(tris)
-}
-
-/// The edges of loops, each from a corner to the next, with its loop.
-fn edges_of(loops: &[Vec<V2>]) -> impl Iterator<Item = (V2, V2, &Vec<V2>)> {
-    loops
-        .iter()
-        .flat_map(|l| (0..l.len()).map(move |i| (l[i], l[(i + 1) % l.len()], l)))
+    (!tris.is_empty()).then_some((loops, tris))
 }
 
 /// The convex hull of points in the plane, counter-clockwise (Andrew).
@@ -1420,8 +1470,15 @@ mod tests {
         let r = b.polygon(&[outer, hole]).unwrap();
         assert!((r.area() - 96.0).abs() < 1e-6, "{}", r.area());
         assert_eq!(r.loops.len(), 2);
-        let tris = cap(&r).unwrap();
-        let a: f64 = tris.iter().map(|t| cross2(t[0], t[1], t[2]) / 2.0).sum();
+        let (loops, tris) = cap_indexed(&r).unwrap();
+        let corners: Vec<V2> = loops.concat();
+        let a: f64 = tris
+            .iter()
+            .map(|t| {
+                let [p, q, w] = t.map(|i| corners[i as usize]);
+                cross2(p, q, w) / 2.0
+            })
+            .sum();
         assert!((a - 96.0).abs() < 1e-6);
         let s = b
             .linear_extrude(&r, 2.0, false, 0.0, 1, [1.0, 1.0])
