@@ -2,8 +2,6 @@
 //! with the edges where faces meet at an angle, as the app's 3D view draws
 //! them. For previews from the command line and for assistants.
 
-use std::collections::HashMap;
-
 use crate::{Facets, Solid, cross, dot};
 
 /// Two faces meeting flatter than this share no drawn edge.
@@ -13,27 +11,66 @@ const EDGE_COS: f64 = 0.985;
 const SAMPLES: usize = 3;
 
 impl Solid {
-    /// The edges where two faces meet at an angle.
+    /// The edges where two faces meet at an angle, in the order of the
+    /// triangle that closes each. The half-edges are put in buckets by
+    /// the lower of their two corners rather than in a map: for millions
+    /// of triangles (render_baskets has 2.4 million) the map's lookups were
+    /// most of the time.
     pub fn feature_edges(&self, facets: &Facets) -> Vec<([f64; 3], [f64; 3])> {
-        let mut out = Vec::new();
-        let mut seen: HashMap<(u32, u32), u32> = HashMap::new();
-        for (t, &facet) in self.tris.iter().zip(&self.facets) {
-            for k in 0..3 {
-                let (a, b) = (t[k], t[(k + 1) % 3]);
-                match seen.remove(&(b, a)) {
-                    Some(other) => {
-                        let (f, g) = (facets.get(facet), facets.get(other));
-                        if f.face != g.face && dot(f.normal, g.normal) < EDGE_COS {
-                            out.push((self.points[a as usize], self.points[b as usize]));
-                        }
+        let half = |h: u32| {
+            let t = self.tris[h as usize / 3];
+            let k = h as usize % 3;
+            (t[k], t[(k + 1) % 3])
+        };
+        let halves = 3 * self.tris.len() as u32;
+        // Each half-edge in the bucket of its lower corner, with the other
+        // one, the buckets in the order of the half-edges (three per
+        // triangle).
+        let mut start = vec![0u32; self.points.len() + 1];
+        for h in 0..halves {
+            let (a, b) = half(h);
+            start[a.min(b) as usize + 1] += 1;
+        }
+        for v in 1..start.len() {
+            start[v] += start[v - 1];
+        }
+        let mut at = start.clone();
+        let mut bucket = vec![(0u32, 0u32); halves as usize];
+        for h in 0..halves {
+            let (a, b) = half(h);
+            let lo = a.min(b) as usize;
+            bucket[at[lo] as usize] = (a.max(b), h);
+            at[lo] += 1;
+        }
+        // In a bucket, each half-edge closes the open one that runs the
+        // other way along its edge, if there is one, else stays open.
+        let mut crease = vec![false; halves as usize];
+        let mut open: Vec<u32> = Vec::new();
+        for w in start.windows(2) {
+            open.clear();
+            for &(_, h) in &bucket[w[0] as usize..w[1] as usize] {
+                let (a, b) = half(h);
+                match open.iter().position(|&o| half(o) == (b, a)) {
+                    Some(i) => {
+                        let other = open.remove(i);
+                        let f = facets.get(self.facets[h as usize / 3]);
+                        let g = facets.get(self.facets[other as usize / 3]);
+                        crease[h as usize] = f.face != g.face && dot(f.normal, g.normal) < EDGE_COS;
                     }
                     None => {
-                        seen.insert((a, b), facet);
+                        open.retain(|&o| half(o) != (a, b));
+                        open.push(h);
                     }
                 }
             }
         }
-        out
+        (0..halves)
+            .filter(|&h| crease[h as usize])
+            .map(|h| {
+                let (a, b) = half(h);
+                (self.points[a as usize], self.points[b as usize])
+            })
+            .collect()
     }
 }
 
@@ -264,6 +301,65 @@ mod tests {
         let edge = Shot::default().edge;
         let lines = px.chunks(4).filter(|p| p[..3] == edge).count();
         assert!(lines > 40, "{lines} edge pixels");
+    }
+
+    /// The edges as a map of open half-edges finds them, in its order.
+    fn by_map(s: &Solid, facets: &Facets) -> Vec<([f64; 3], [f64; 3])> {
+        let mut out = Vec::new();
+        let mut seen: std::collections::HashMap<(u32, u32), u32> = Default::default();
+        for (t, &facet) in s.tris.iter().zip(&s.facets) {
+            for k in 0..3 {
+                let (a, b) = (t[k], t[(k + 1) % 3]);
+                match seen.remove(&(b, a)) {
+                    Some(other) => {
+                        let (f, g) = (facets.get(facet), facets.get(other));
+                        if f.face != g.face && dot(f.normal, g.normal) < EDGE_COS {
+                            out.push((s.points[a as usize], s.points[b as usize]));
+                        }
+                    }
+                    None => {
+                        seen.insert((a, b), facet);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn edges_come_as_a_map_of_half_edges_finds_them() {
+        let mut f = Facets::default();
+        let a = block(&mut f);
+        // Two blocks sharing the corners of an edge (four triangles on it)
+        // and a stray triangle.
+        let b = a
+            .mapped(
+                &mut f,
+                &[
+                    [1.0, 0.0, 0.0, 20.0],
+                    [0.0, 1.0, 0.0, 10.0],
+                    [0.0, 0.0, 1.0, 0.0],
+                ],
+            )
+            .expect("moved");
+        let mut s = Solid::merged(&[a, b]);
+        let n = s.points.len() as u32;
+        s.points.push([40.0, 40.0, 40.0]);
+        s.tris.push([0, 1, n]);
+        s.facets.push(s.facets[0]);
+        let mut weld: std::collections::HashMap<[u64; 3], u32> = Default::default();
+        let ids: Vec<u32> = s
+            .points
+            .iter()
+            .enumerate()
+            .map(|(i, p)| *weld.entry(p.map(f64::to_bits)).or_insert(i as u32))
+            .collect();
+        for t in &mut s.tris {
+            *t = t.map(|i| ids[i as usize]);
+        }
+        let want = by_map(&s, &f);
+        assert!(want.len() > 12);
+        assert_eq!(s.feature_edges(&f), want);
     }
 
     #[test]
