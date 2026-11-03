@@ -5,6 +5,7 @@
 //! (see [`crate::flat`]).
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use opensolve_kernel::{FaceId, Facets, Op, Solid};
 
@@ -107,10 +108,36 @@ pub struct Builder {
     made: HashMap<(u64, u64), Solid, Fx>,
     /// Their triangles, all told.
     made_size: usize,
+    /// The caps of 2D shapes extruded, by the shape (see [`Builder::cap`]).
+    caps: HashMap<(u64, u64), Option<Arc<Cap>>, Fx>,
+    /// Their corners, all told.
+    caps_size: usize,
 }
 
 /// Results kept, at most, in triangles: a few hundred megabytes.
 const MOST_KEPT: usize = 4_000_000;
+
+/// Caps kept, at most, in corners: some tens of megabytes.
+const MOST_CAPS: usize = 2_000_000;
+
+/// Two hashes of a 2D shape's loops and their corners in order: as good as
+/// the shape for a key.
+fn region_key(r: &Region) -> (u64, u64) {
+    let (mut a, mut b) = (0u64, 0x9e37_79b9_7f4a_7c15u64);
+    let mut add = |x: u64| {
+        a = (a.rotate_left(5) ^ x).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+        b = (b ^ x).wrapping_mul(0x0000_0100_0000_01b3).rotate_left(23);
+    };
+    add(r.loops.len() as u64);
+    for l in &r.loops {
+        add(l.len() as u64);
+        for p in l {
+            add(p[0].to_bits());
+            add(p[1].to_bits());
+        }
+    }
+    (a, b)
+}
 
 /// Two hashes of solids' corners and triangles in order, with `op`: as
 /// good as their contents for a key.
@@ -154,6 +181,25 @@ impl Builder {
             self.made.insert(key, s.clone());
         }
         Some(made)
+    }
+
+    /// The caps of a 2D shape to extrude ([`cap_indexed`] of it parted),
+    /// kept: the same shape extruded again (the layers of a stack, the same
+    /// before each is moved up) is triangulated once.
+    fn cap(&mut self, shape: &Region) -> Option<Arc<Cap>> {
+        let key = region_key(shape);
+        if let Some(cap) = self.caps.get(&key) {
+            return cap.clone();
+        }
+        let cap = cap_indexed(&shape.parted()).map(Arc::new);
+        let size: usize = shape.loops.iter().map(Vec::len).sum();
+        if self.caps_size + size > MOST_CAPS {
+            self.caps.clear();
+            self.caps_size = 0;
+        }
+        self.caps_size += size;
+        self.caps.insert(key, cap.clone());
+        cap
     }
 
     /// A solid from loose triangles, its faces named anew.
@@ -400,7 +446,8 @@ impl Builder {
         if height <= 0.0 || !height.is_finite() {
             return None;
         }
-        let (loops, tris) = cap_indexed(&shape.parted())?;
+        let cap = self.cap(shape)?;
+        let (loops, tris) = (&cap.0, &cap.1);
         let z0 = if center { -height / 2.0 } else { 0.0 };
         let n = slices.max(1);
         let layer = |k: usize, p: V2| -> V3 {
@@ -420,7 +467,7 @@ impl Builder {
             .collect();
         let at = |k: usize, i: u32| k as u32 * m + i;
         let mut faces: Vec<[u32; 3]> = Vec::with_capacity(2 * tris.len() + 2 * n * corners.len());
-        for t in &tris {
+        for t in tris {
             faces.push([t[0], t[2], t[1]]);
             faces.push(t.map(|i| at(n, i)));
         }
@@ -428,7 +475,7 @@ impl Builder {
         // way it turns, the other way in holes.
         let turns_back = sin_deg(-twist / n as f64) >= 0.0;
         let mut first = 0u32;
-        for ring in &loops {
+        for ring in loops {
             let hole = area(ring) < 0.0;
             let len = ring.len() as u32;
             for i in 0..len {
@@ -462,9 +509,10 @@ impl Builder {
         angle: f64,
         n: usize,
     ) -> Result<Option<Solid>, String> {
-        let Some((loops, tris)) = cap_indexed(&shape.parted()) else {
+        let Some(cap) = self.cap(shape) else {
             return Ok(None);
         };
+        let (loops, tris) = (&cap.0, &cap.1);
         let mut corners: Vec<V2> = loops.concat();
         let xs = corners.iter().map(|p| p[0]);
         let (lo, hi) = xs.fold((f64::MAX, f64::MIN), |(l, h), x| (l.min(x), h.max(x)));
@@ -514,14 +562,14 @@ impl Builder {
         let id = |j: usize, i: u32| number[(j % rings) * m + i as usize];
         let mut faces: Vec<[u32; 3]> = Vec::new();
         if !whole {
-            for t in &tris {
+            for t in tris {
                 let t = if mirrored { [t[0], t[2], t[1]] } else { *t };
                 faces.push([id(0, t[0]), id(0, t[2]), id(0, t[1])]);
                 faces.push(t.map(|i| id(n, i)));
             }
         }
         let mut first = 0u32;
-        for ring in &loops {
+        for ring in loops {
             let len = ring.len() as u32;
             for k in 0..len {
                 let (mut a, mut b) = (first + k, first + (k + 1) % len);
