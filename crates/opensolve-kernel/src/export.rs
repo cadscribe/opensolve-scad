@@ -90,6 +90,64 @@ pub fn three_mf_assembly(name: &str, parts: &[(&Solid, &str, u32)]) -> Vec<u8> {
 /// with the objects, their parts' extruders and one plate), so that it
 /// takes more than the geometry; other slicers read the core 3MF in it.
 pub fn three_mf_print(objects: &[PrintObject]) -> Vec<u8> {
+    print_package_painted(objects, &[], &[])
+}
+
+/// Red, green, blue and opacity, each from 0 to 1.
+pub type Rgba = [f64; 4];
+
+/// Solids in colours as one object of a 3MF package, as
+/// [`three_mf_assembly`] puts them together: each part with its name and
+/// colour, or none. The colours are the core's base materials, which
+/// slicers show; each colour is a filament slot of its own as well, in the
+/// order they first come, slot 1 for parts without one.
+pub fn three_mf_painted(name: &str, parts: &[(&Solid, &str, Option<Rgba>)]) -> Vec<u8> {
+    let mut colours: Vec<Rgba> = Vec::new();
+    let mut slots = Vec::new();
+    for (solid, part, colour) in parts {
+        let slot = match colour {
+            Some(c) => match colours
+                .iter()
+                .position(|k| k.map(f64::to_bits) == c.map(f64::to_bits))
+            {
+                Some(i) => i + 1,
+                None => {
+                    colours.push(*c);
+                    colours.len()
+                }
+            },
+            None => 0,
+        };
+        slots.push((*solid, *part, slot as u32));
+    }
+    // Slot 0 is for parts without a colour: the first filament.
+    let parts: Vec<(&Solid, &str, u32)> = slots.iter().map(|&(s, p, k)| (s, p, k.max(1))).collect();
+    let painted: Vec<Option<usize>> = slots
+        .iter()
+        .map(|&(_, _, k)| (k > 0).then(|| k as usize - 1))
+        .collect();
+    print_package_painted(&[(name, parts)], &colours, &painted)
+}
+
+/// `#RRGGBBAA` of a colour.
+fn hex(c: &Rgba) -> String {
+    let byte = |x: f64| (x.clamp(0.0, 1.0) * 255.0).round() as u8;
+    format!(
+        "#{:02X}{:02X}{:02X}{:02X}",
+        byte(c[0]),
+        byte(c[1]),
+        byte(c[2]),
+        byte(c[3])
+    )
+}
+
+/// [`three_mf_print`], the parts given colours (the base material of
+/// `colours` that `painted` names, part by part in order) where there are.
+fn print_package_painted(
+    objects: &[PrintObject],
+    colours: &[Rgba],
+    painted: &[Option<usize>],
+) -> Vec<u8> {
     let identity = "1 0 0 0 1 0 0 0 1 0 0 0";
     let mut resources = String::new();
     let mut build = String::new();
@@ -97,6 +155,23 @@ pub fn three_mf_print(objects: &[PrintObject]) -> Vec<u8> {
     let mut instances = String::new();
     let mut assemble = String::new();
     let mut next = 1;
+    // The colours first: a resource is defined before it is used.
+    let materials = (!colours.is_empty()).then(|| {
+        let id = next;
+        next += 1;
+        let _ = writeln!(resources, "<basematerials id=\"{id}\">");
+        for (i, c) in colours.iter().enumerate() {
+            let _ = writeln!(
+                resources,
+                "<base name=\"Colour {}\" displaycolor=\"{}\"/>",
+                i + 1,
+                hex(c)
+            );
+        }
+        resources.push_str("</basematerials>\n");
+        id
+    });
+    let mut part_no = 0;
     for (k, (name, parts)) in objects.iter().enumerate() {
         let name = xml_text(name);
         let mut components = String::new();
@@ -107,7 +182,9 @@ pub fn three_mf_print(objects: &[PrintObject]) -> Vec<u8> {
             let id = next;
             next += 1;
             let part = xml_text(part);
-            mesh_object(&mut resources, id, &part, solid);
+            let material = materials.zip(painted.get(part_no).copied().flatten());
+            part_no += 1;
+            mesh_object(&mut resources, id, &part, solid, material);
             let _ = writeln!(
                 components,
                 "<component objectid=\"{id}\" p:UUID=\"{}\" transform=\"{identity}\"/>",
@@ -171,10 +248,20 @@ pub fn three_mf_print(objects: &[PrintObject]) -> Vec<u8> {
 }
 
 /// A mesh as an object of a 3MF package.
-fn mesh_object(out: &mut String, id: usize, name: &str, solid: &Solid) {
+/// With `material`, the base materials' id and the number of its colour.
+fn mesh_object(
+    out: &mut String,
+    id: usize,
+    name: &str,
+    solid: &Solid,
+    material: Option<(usize, usize)>,
+) {
+    let paint = material.map_or(String::new(), |(m, i)| {
+        format!(" pid=\"{m}\" pindex=\"{i}\"")
+    });
     let _ = writeln!(
         out,
-        "<object id=\"{id}\" name=\"{name}\" type=\"model\" p:UUID=\"{}\">\n<mesh>\n<vertices>",
+        "<object id=\"{id}\" name=\"{name}\" type=\"model\"{paint} p:UUID=\"{}\">\n<mesh>\n<vertices>",
         uuid(&format!("object {id} {name}"))
     );
     for p in &solid.points {
@@ -446,6 +533,26 @@ mod tests {
         // One object of two parts, each its filament.
         assert!(text.contains(r#"<part id="2" subtype="normal_part">"#));
         assert!(text.contains(r#"<metadata key="extruder" value="2"/>"#));
+    }
+
+    #[test]
+    fn three_mf_paints_parts_in_their_colours() {
+        let (s, _) = holed_block();
+        let red = [1.0, 0.0, 0.0, 1.0];
+        let z = three_mf_painted(
+            "Box",
+            &[(&s, "a", Some(red)), (&s, "b", None), (&s, "c", Some(red))],
+        );
+        let text = String::from_utf8_lossy(&z);
+        // One colour, defined first; two parts in it, one in none.
+        assert_eq!(text.matches("<base ").count(), 1);
+        assert!(text.contains(r##"<basematerials id="1">"##));
+        assert!(text.contains(r##"displaycolor="#FF0000FF""##));
+        assert_eq!(text.matches(r#"pid="1" pindex="0""#).count(), 2);
+        assert_eq!(text.matches("<mesh>").count(), 3);
+        // Without colours, no materials.
+        let plain = three_mf_assembly("Box", &[(&s, "a", 1)]);
+        assert!(!String::from_utf8_lossy(&plain).contains("basematerials"));
     }
 
     #[test]

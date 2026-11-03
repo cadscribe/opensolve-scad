@@ -28,7 +28,8 @@ mod zip;
 
 pub use apart::meeting;
 pub use export::{
-    PrintObject, encode, step, three_mf, three_mf_assembly, three_mf_objects, three_mf_print,
+    PrintObject, Rgba, encode, step, three_mf, three_mf_assembly, three_mf_objects,
+    three_mf_painted, three_mf_print,
 };
 pub use raster::{Shot, render};
 pub use revolve::{revolve, revolve_radius};

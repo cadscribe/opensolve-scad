@@ -15,6 +15,7 @@ mod geom;
 mod import;
 mod lexer;
 pub mod library;
+mod paint;
 mod parser;
 mod region;
 mod trig;
@@ -26,6 +27,7 @@ use std::path::{Component, Path, PathBuf};
 use opensolve_kernel::{Facets, Solid};
 
 pub use customizer::{Choices, Kind, Param, parameters};
+pub use paint::{Rgba, text as rgba_text};
 
 /// Reads a whole file.
 pub type Reader<'a> = &'a dyn Fn(&Path) -> Result<Vec<u8>, String>;
@@ -107,6 +109,94 @@ pub fn build(
     let mut sources = Sources::default();
     gather(&path, read, &mut sources)?;
     deep(move || evaluate(path, sources, overrides))?
+}
+
+/// Which of a file's coloured parts a run makes: all, as OpenSCAD renders
+/// them; only what no `color()` is around; or only what the outermost
+/// `color()` gives this colour. The booleans keep no colours, so the parts
+/// of a file in each colour are made one colour at a time.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum Paint {
+    #[default]
+    All,
+    Uncoloured,
+    Only(Rgba),
+}
+
+/// How a file is run by [`make`].
+#[derive(Clone, Debug, Default)]
+pub struct Run {
+    /// Statements after the main file's, each the text of one of
+    /// OpenSCAD's `-D`: `name=value`, or any statement, such as a module
+    /// that replaces one of the file's or a built-in one.
+    pub defines: Vec<String>,
+    pub paint: Paint,
+    /// Told every echo (`ECHO: …`) and warning (`WARNING: …`) as it comes,
+    /// each time: OpenSCAD's console. The notes of [`Made`] have each once
+    /// and at most a few dozen.
+    pub log: Option<fn(&str)>,
+}
+
+/// What a file makes, as [`make`] finds it.
+#[derive(Clone, Debug, Default)]
+pub enum Shape {
+    /// Nothing.
+    #[default]
+    Empty,
+    /// A solid.
+    Solid(Solid, Facets),
+    /// A 2D shape: closed loops that do not cross, outlines
+    /// counter-clockwise, holes clockwise.
+    Flat(Vec<Vec<[f64; 2]>>),
+}
+
+/// The result of [`make`]: the shape, the colours of the outermost
+/// `color()`s met on the way (each once), and the notes as in [`Output`].
+#[derive(Clone, Debug, Default)]
+pub struct Made {
+    pub shape: Shape,
+    pub colours: Vec<Rgba>,
+    pub notes: Vec<String>,
+}
+
+/// Runs the file at `path` as OpenSCAD's command line does: with the
+/// statements of `run.defines` after its own, making the parts that
+/// `run.paint` asks for. What it includes and uses is read by `read`, as
+/// in [`build`]. An empty or 2D result is no error here.
+pub fn make(path: &Path, read: Reader<'_>, run: &Run) -> Result<Made, Error> {
+    let path = plain(path);
+    let mut sources = Sources::default();
+    gather(&path, read, &mut sources).map_err(|e| Error::at(0, 0, e))?;
+    deep(move || {
+        let mut it = eval::Interp::new(sources.files, sources.blobs);
+        it.paint = run.paint;
+        it.log = run.log;
+        let mut stmts = it.load(path, &mut Vec::new())?;
+        for d in &run.defines {
+            // As OpenSCAD adds them: each after the file, with a `;`.
+            stmts.extend(parser::parse(&format!("{d};\n"), 0).map_err(|mut e| {
+                e.message = format!("-D {d}: {}", e.message);
+                e.line = 0;
+                e
+            })?);
+        }
+        let made = it.run(&stmts, &eval::Interp::root())?;
+        let shape = match made {
+            Some(geom::Geom::D3(s)) if !s.is_empty() => {
+                let mut facets = Facets::default();
+                let solid = s.rehome(&it.geo.facets, &mut facets);
+                Shape::Solid(solid, facets)
+            }
+            Some(geom::Geom::D2(r)) if !r.loops.is_empty() => Shape::Flat(r.loops),
+            _ => Shape::Empty,
+        };
+        Ok(Made {
+            shape,
+            colours: std::mem::take(&mut it.colours),
+            notes: it.take_notes(),
+        })
+    })
+    .map_err(|e| Error::at(0, 0, e))?
 }
 
 /// Runs the file at `path` as [`build`] does and tells what goes wrong,

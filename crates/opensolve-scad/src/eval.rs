@@ -17,6 +17,7 @@ use crate::builtins;
 use crate::cache::Parsed;
 use crate::flat::{self, Region};
 use crate::geom::{self, Builder, Geom, IDENTITY, Matrix, V2, V3, cos_deg, fragments, sin_deg};
+use crate::paint::{self, Rgba};
 use crate::value::{self, MOST, Value, item, repr};
 
 /// Deeper calls than this end the evaluation: a recursion without end. A
@@ -312,6 +313,20 @@ pub struct Interp {
     /// part of what a call depends on. BOSL2 asks only to say what is
     /// wrong when it stops.
     parents_matter: bool,
+    /// Which coloured parts are made (see [`crate::Paint`]).
+    pub paint: crate::Paint,
+    /// Inside a `color()` that counts: the outermost one.
+    painted: bool,
+    /// Making what cuts or limits a shape (the second and later children
+    /// of `difference` and `intersection`): made whatever its colour.
+    cutting: bool,
+    /// The next [`Interp::exec_nodes`] makes the children after its first
+    /// as [`Interp::cutting`].
+    cut_rest: bool,
+    /// The colours of the outermost `color()`s met, each once.
+    pub colours: Vec<Rgba>,
+    /// Told every echo and warning as it comes (see [`crate::Run::log`]).
+    pub log: Option<fn(&str)>,
 }
 
 impl Interp {
@@ -340,6 +355,12 @@ impl Interp {
             modules: Vec::new(),
             rng: builtins::Mt19937::new(5489),
             made: HashMap::new(),
+            paint: crate::Paint::All,
+            painted: false,
+            cutting: false,
+            cut_rest: false,
+            colours: Vec::new(),
+            log: None,
         }
     }
 
@@ -350,12 +371,18 @@ impl Interp {
             Some(p) => format!("{}: {text}", self.place(p)),
             None => text,
         };
+        if let Some(log) = self.log {
+            log(&format!("WARNING: {text}"));
+        }
         self.keep(text);
     }
 
     /// What `echo` writes: a note without its place, a mark with it.
     fn echo(&mut self, pos: Pos, text: String) {
         let text = format!("ECHO: {text}");
+        if let Some(log) = self.log {
+            log(&text);
+        }
         self.mark(Some(pos), &text, true);
         self.keep(text);
     }
@@ -610,6 +637,27 @@ impl Interp {
         f: &Rc<Frame>,
         only: Option<&[usize]>,
     ) -> R<Vec<Option<Geom>>> {
+        // An `include` in a block, as GoSTL puts a 2D file in a module:
+        // the file's statements in its place.
+        if stmts.iter().any(|s| matches!(s, Stmt::Include(..))) {
+            let mut all = Vec::with_capacity(stmts.len());
+            for s in stmts {
+                match s {
+                    Stmt::Include(p, pos) => {
+                        let file = self.path_of(*pos, p);
+                        if !self.sources.contains_key(&file) {
+                            return Err(
+                                self.error(*pos, format!("include <{p}>: the file cannot be read"))
+                            );
+                        }
+                        all.extend(self.load(file, &mut Vec::new())?);
+                    }
+                    s => all.push(s.clone()),
+                }
+            }
+            return self.exec_nodes(&all, f, only);
+        }
+        let cut_rest = std::mem::take(&mut self.cut_rest);
         for s in stmts {
             match s {
                 // The last definition of a name wins, as in OpenSCAD.
@@ -637,12 +685,16 @@ impl Interp {
             f.set(name, v);
         }
         let mut out = Vec::new();
+        let cutting = self.cutting;
         let instances = stmts.iter().filter(|s| is_instance(s));
         for (k, s) in instances.enumerate() {
             if only.is_some_and(|o| !o.contains(&k)) {
                 continue;
             }
-            if let Some(g) = self.instance(s, f)? {
+            self.cutting = cutting || (cut_rest && !out.is_empty());
+            let made = self.instance(s, f);
+            self.cutting = cutting;
+            if let Some(g) = made? {
                 out.push(g);
             }
         }
@@ -818,6 +870,15 @@ impl Interp {
             }
             _ => {}
         }
+        // A shape of no colour is left out when one colour is made, unless
+        // it cuts.
+        if matches!(self.paint, crate::Paint::Only(_))
+            && !self.painted
+            && !self.cutting
+            && SHAPES.contains(&&**name)
+        {
+            return Ok(None);
+        }
         let a = self.args(args, f)?;
         let inner = Self::with_specials(f, &a);
         let kids = |me: &mut Self| me.exec(children, &inner, None);
@@ -947,11 +1008,42 @@ impl Interp {
                 let one = self.union(made, Some(pos))?;
                 one.map(|g| self.resize(g, &a))
             }
-            "union" | "group" | "render" | "color" => {
+            "color" => {
+                let alpha = a.num("alpha", 1);
+                let c = paint::parse(a.get("c", 0), alpha);
+                if c.is_none()
+                    && let Some(Value::Str(name)) = a.get("c", 0)
+                {
+                    self.note(Some(pos), format!("color: {name} is no colour"));
+                }
+                let outermost = c.filter(|_| !self.painted);
+                if let Some(c) = outermost
+                    && !self.colours.iter().any(|k| paint::same(k, &c))
+                {
+                    self.colours.push(c);
+                }
+                let wanted = self.cutting
+                    || outermost.is_none_or(|c| match self.paint {
+                        crate::Paint::All => true,
+                        crate::Paint::Uncoloured => false,
+                        crate::Paint::Only(w) => paint::same(&w, &c),
+                    });
+                if wanted {
+                    let was = self.painted;
+                    self.painted = was || c.is_some();
+                    let made = kids(self);
+                    self.painted = was;
+                    self.union(made?, Some(pos))?
+                } else {
+                    None
+                }
+            }
+            "union" | "group" | "render" => {
                 let made = kids(self)?;
                 self.union(made, Some(pos))?
             }
             "difference" | "intersection" => {
+                self.cut_rest = true;
                 let made = self.exec_nodes(children, &inner, None)?;
                 let op = if &**name == "difference" {
                     Op::Subtract
@@ -1124,6 +1216,9 @@ impl Interp {
             }
         }
         k.push(u8::from(self.modules.len() > 1));
+        // Inside a colour, or cutting, a `color()` does not choose what is
+        // made.
+        k.push(u8::from(self.painted) | (u8::from(self.cutting) << 1));
         Some(k)
     }
 
@@ -2163,6 +2258,20 @@ fn key_of(v: &Value, out: &mut Vec<u8>) -> Option<()> {
 }
 
 /// The modules OpenSCAD has.
+/// The built-in modules that make shapes of their own.
+const SHAPES: &[&str] = &[
+    "cube",
+    "sphere",
+    "cylinder",
+    "polyhedron",
+    "square",
+    "circle",
+    "polygon",
+    "text",
+    "import",
+    "surface",
+];
+
 const BUILT_IN_MODULES: &[&str] = &[
     "cube",
     "sphere",
