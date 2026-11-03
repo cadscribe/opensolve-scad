@@ -22,20 +22,6 @@ fn tri(s: &Solid, t: u32) -> [P; 3] {
     s.tris[t as usize].map(|i| s.points[i as usize])
 }
 
-fn bounds_of(ts: &[[P; 3]]) -> (P, P) {
-    let mut lo = [f64::MAX; 3];
-    let mut hi = [f64::MIN; 3];
-    for t in ts {
-        for p in t {
-            for k in 0..3 {
-                lo[k] = lo[k].min(p[k]);
-                hi[k] = hi[k].max(p[k]);
-            }
-        }
-    }
-    (lo, hi)
-}
-
 impl Bvh {
     fn new(s: &Solid) -> Bvh {
         let mut b = Bvh {
@@ -51,11 +37,16 @@ impl Bvh {
         b.nodes.push(([0.0; 3], [0.0; 3], 0, 0));
         let mut stack = vec![(0usize, 0usize, s.tris.len())];
         while let Some((node, start, len)) = stack.pop() {
-            let ts: Vec<[P; 3]> = b.order[start..start + len]
-                .iter()
-                .map(|&t| tri(s, t))
-                .collect();
-            let (lo, hi) = bounds_of(&ts);
+            let mut lo = [f64::MAX; 3];
+            let mut hi = [f64::MIN; 3];
+            for &t in &b.order[start..start + len] {
+                for p in tri(s, t) {
+                    for k in 0..3 {
+                        lo[k] = lo[k].min(p[k]);
+                        hi[k] = hi[k].max(p[k]);
+                    }
+                }
+            }
             if len <= LEAF {
                 b.nodes[node] = (lo, hi, start as u32, len as u32);
                 continue;
@@ -185,26 +176,34 @@ pub fn meeting(solids: &[&Solid]) -> Vec<(usize, usize)> {
     if pairs.is_empty() {
         return pairs;
     }
+    // The trees of those in a pair, then the pairs, on threads of their own.
+    let mut used: Vec<usize> = pairs.iter().flat_map(|&(i, j)| [i, j]).collect();
+    used.sort_unstable();
+    used.dedup();
+    let built = crate::parallel(used.len(), |k| Bvh::new(solids[used[k]]));
     let mut trees: Vec<Option<Bvh>> = (0..solids.len()).map(|_| None).collect();
-    let mut out = Vec::new();
-    for (i, j) in pairs {
-        for k in [i, j] {
-            if trees[k].is_none() {
-                trees[k] = Some(Bvh::new(solids[k]));
-            }
-        }
-        let (Some(ti), Some(tj)) = (&trees[i], &trees[j]) else {
-            continue;
+    for (k, t) in used.into_iter().zip(built) {
+        trees[k] = Some(t);
+    }
+    // Only a solid whose box holds the other's can hold the other.
+    let holds =
+        |a: (P, P), b: (P, P)| (0..3).all(|k| a.0[k] <= b.0[k] + eps && b.1[k] <= a.1[k] + eps);
+    let meets = crate::parallel(pairs.len(), |k| {
+        let (i, j) = pairs[k];
+        let (Some(ti), Some(tj), Some(bi), Some(bj)) = (&trees[i], &trees[j], boxes[i], boxes[j])
+        else {
+            return false;
         };
         let (a, b) = (solids[i], solids[j]);
-        let meets = surfaces_meet(a, ti, b, tj, eps)
-            || b.points.first().is_some_and(|p| a.contains(*p))
-            || a.points.first().is_some_and(|p| b.contains(*p));
-        if meets {
-            out.push((i, j));
-        }
-    }
-    out
+        surfaces_meet(a, ti, b, tj, eps)
+            || holds(bi, bj) && b.points.first().is_some_and(|p| a.contains(*p))
+            || holds(bj, bi) && a.points.first().is_some_and(|p| b.contains(*p))
+    });
+    pairs
+        .into_iter()
+        .zip(meets)
+        .filter_map(|(p, m)| m.then_some(p))
+        .collect()
 }
 
 #[cfg(test)]

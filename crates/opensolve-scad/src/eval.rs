@@ -1347,6 +1347,14 @@ impl Interp {
                 ),
             }
         }
+        if !flat && !others.is_empty() {
+            // All at once where the kernel's library can, as OpenSCAD does.
+            let mut all: Vec<&opensolve_kernel::Solid> = vec![&acc];
+            all.extend(&others);
+            if let Some(Ok(s)) = opensolve_kernel::Solid::batch(&all, op, &mut self.geo.facets) {
+                return Ok(Some(Geom::D3(s)));
+            }
+        }
         if op == Op::Subtract {
             // All that is cut away at once: much faster than one by one;
             // where that fails, one by one.

@@ -88,11 +88,13 @@ pub fn even_odd_loops(paths: &[Vec<V2>]) -> Vec<Vec<V2>> {
             }
         }
     }
-    let edges: Vec<(usize, usize)> = count
+    let mut edges: Vec<(usize, usize)> = count
         .into_iter()
         .filter(|(_, n)| n % 2 == 1)
         .map(|(e, _)| e)
         .collect();
+    // In a fixed order, so that a file builds the same each time.
+    edges.sort_unstable();
     // Each border edge the way round with the inside on its left: a point
     // just left of its middle is inside if a ray from it crosses an odd
     // number of borders.

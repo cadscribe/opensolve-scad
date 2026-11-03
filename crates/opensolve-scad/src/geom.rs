@@ -248,6 +248,13 @@ impl Builder {
             .map(|l| clean(l))
             .filter(|l| l.len() >= 3 && area(l).abs() > 1e-18)
             .collect();
+        let edges: Vec<[V2; 2]> = loops
+            .iter()
+            .flat_map(|l| (0..l.len()).map(move |i| [l[i], l[(i + 1) % l.len()]]))
+            .collect();
+        if let Some(tris) = triangles_of(&loops) {
+            return Ok((!tris.is_empty()).then(|| self.slab(&tris, &edges)));
+        }
         let (outers, holes): (Vec<&Vec<V2>>, Vec<&Vec<V2>>) =
             loops.iter().partition(|l| area(l) > 0.0);
         let mut held: Vec<Vec<Vec<V2>>> = vec![Vec::new(); outers.len()];
@@ -276,10 +283,6 @@ impl Builder {
         if tris.is_empty() {
             return Ok(None);
         }
-        let edges: Vec<[V2; 2]> = loops
-            .iter()
-            .flat_map(|l| (0..l.len()).map(move |i| [l[i], l[(i + 1) % l.len()]]))
-            .collect();
         Ok(Some(self.slab(&tris, &edges)))
     }
 
@@ -295,8 +298,13 @@ impl Builder {
         if area(&poly).abs() < 1e-12 {
             return Ok(None);
         }
-        let ears = ear_clip(&poly).ok_or("polygon: a path crosses itself")?;
-        let tris: Vec<[V2; 3]> = ears.iter().map(|t| t.map(|i| poly[i])).collect();
+        let tris = match triangles_of(std::slice::from_ref(&poly)) {
+            Some(t) => t,
+            None => {
+                let ears = ear_clip(&poly).ok_or("polygon: a path crosses itself")?;
+                ears.iter().map(|t| t.map(|i| poly[i])).collect()
+            }
+        };
         let edges: Vec<[V2; 2]> = (0..poly.len())
             .map(|i| [poly[i], poly[(i + 1) % poly.len()]])
             .collect();
@@ -408,6 +416,9 @@ impl Builder {
 
     /// The solid mapped by `m`; a mirror turns its triangles round.
     pub fn transformed(&mut self, s: &Solid, m: &Matrix) -> Solid {
+        if let Some(moved) = s.mapped(&mut self.facets, m) {
+            return moved;
+        }
         let points = s.points.iter().map(|p| apply(m, *p)).collect();
         let flip = det(m) < 0.0;
         let tris = s
@@ -563,11 +574,24 @@ pub fn circle(r: f64, n: usize) -> Vec<V2> {
         .collect()
 }
 
-/// A ring closed by a fan from its first corner, seen from above if `up`.
+/// A convex ring closed by a strip zigzagging across it, seen from above
+/// if `up`, as Manifold triangulates a convex polygon. A fan from one
+/// corner would do, but its long triangles each reach over much of the
+/// disc, and a boolean tests every one of them against all that lies
+/// there.
 fn fan(tris: &mut Vec<[V3; 3]>, ring: &[V3], up: bool) {
-    for i in 1..ring.len().saturating_sub(1) {
-        let (a, b, c) = (ring[0], ring[i], ring[i + 1]);
+    let (mut i, mut k) = (0, ring.len().saturating_sub(1));
+    let mut right = true;
+    while i + 1 < k {
+        let j = if right { i + 1 } else { k - 1 };
+        let (a, b, c) = (ring[i], ring[j], ring[k]);
         tris.push(if up { [a, b, c] } else { [a, c, b] });
+        if right {
+            i = j;
+        } else {
+            k = j;
+        }
+        right = !right;
     }
 }
 
@@ -662,6 +686,19 @@ fn area(p: &[V2]) -> f64 {
         .map(|i| cross2([0.0, 0.0], p[i], p[(i + 1) % p.len()]))
         .sum::<f64>()
         / 2.0
+}
+
+/// The triangles of loops (outlines counter-clockwise, holes clockwise) by
+/// the kernel's triangulator, Manifold's, as OpenSCAD triangulates its
+/// polygons; `None` where there is none (in the browser).
+fn triangles_of(loops: &[Vec<V2>]) -> Option<Vec<[V2; 3]>> {
+    let corners: Vec<V2> = loops.iter().flatten().copied().collect();
+    let tris = opensolve_kernel::triangulate_loops(loops)?;
+    Some(
+        tris.iter()
+            .map(|t| t.map(|i| corners[i as usize]))
+            .collect(),
+    )
 }
 
 /// Ear clipping of a simple counter-clockwise polygon.
@@ -1093,6 +1130,11 @@ impl Builder {
     pub fn union_many(&mut self, list: Vec<Solid>, flat: bool) -> (Option<Solid>, Vec<String>) {
         if list.len() <= 1 {
             return (list.into_iter().next(), Vec::new());
+        }
+        // All at once where the kernel's library can, as OpenSCAD does.
+        let refs: Vec<&Solid> = list.iter().collect();
+        if let Some(Ok(s)) = Solid::batch(&refs, Op::Add, &mut self.facets) {
+            return ((!s.is_empty()).then_some(s), Vec::new());
         }
         let meeting = {
             let refs: Vec<&Solid> = list.iter().collect();

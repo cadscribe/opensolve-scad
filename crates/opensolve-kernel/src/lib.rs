@@ -6,13 +6,19 @@
 //! Booleans carry the facet index through as a value per triangle corner.
 
 use std::collections::HashMap;
-use std::ops::{Add, Mul};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
-use boolmesh::prelude::{Manifold, OpType, compute_boolean};
-
 mod apart;
+// The booleans: Manifold's C++ where it builds, boolmesh in the browser.
+#[cfg(target_arch = "wasm32")]
+mod by_boolmesh;
+#[cfg(not(target_arch = "wasm32"))]
+mod by_manifold;
+#[cfg(target_arch = "wasm32")]
+use by_boolmesh as engine;
+#[cfg(not(target_arch = "wasm32"))]
+use by_manifold as engine;
 mod export;
 mod raster;
 mod revolve;
@@ -29,6 +35,15 @@ pub use revolve::{revolve, revolve_radius};
 pub use stl::read_stl;
 
 pub use triangulate::triangulate;
+
+/// Triangles of loops in the plane: outlines counter-clockwise, holes
+/// clockwise, any of them nested; corners numbered through all loops in
+/// order. Manifold's triangulator (the sharpest ears first, robust on
+/// touching and nearly straight corners); `None` where there is none (in
+/// the browser) or it fails.
+pub fn triangulate_loops(loops: &[Vec<[f64; 2]>]) -> Option<Vec<[u32; 3]>> {
+    engine::triangulate_loops(loops)
+}
 
 /// The stable name of a face, chosen by the caller.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -100,16 +115,67 @@ fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
     ]
 }
 
+/// The hash of rustc's own tables (FxHash), for maps keyed by numbers: far
+/// quicker than the standard one, which guards against keys chosen to
+/// collide.
+#[derive(Clone, Copy, Debug, Default)]
+struct Fx;
+
+impl std::hash::BuildHasher for Fx {
+    type Hasher = FxHasher;
+    fn build_hasher(&self) -> FxHasher {
+        FxHasher(0)
+    }
+}
+
+#[derive(Debug)]
+struct FxHasher(u64);
+
+impl FxHasher {
+    fn add(&mut self, x: u64) {
+        self.0 = (self.0.rotate_left(5) ^ x).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+    }
+}
+
+impl std::hash::Hasher for FxHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks(8) {
+            let mut b = [0u8; 8];
+            b[..chunk.len()].copy_from_slice(chunk);
+            self.add(u64::from_le_bytes(b));
+        }
+    }
+
+    fn write_u32(&mut self, i: u32) {
+        self.add(u64::from(i));
+    }
+
+    fn write_u64(&mut self, i: u64) {
+        self.add(i);
+    }
+
+    fn write_i64(&mut self, i: i64) {
+        self.add(i as u64);
+    }
+
+    fn write_usize(&mut self, i: usize) {
+        self.add(i as u64);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
 /// A closed mesh; `facets[i]` names triangle `i`.
 #[derive(Clone, Default)]
 pub struct Solid {
     pub points: Vec<[f64; 3]>,
     pub tris: Vec<[u32; 3]>,
     pub facets: Vec<u32>,
-    /// The library's own mesh of a boolean's result. Reading a mesh in welds
-    /// vertices by position, which turns two parts touching along an edge
-    /// into a mesh it refuses, so results go on as they are.
-    mesh: Option<Arc<Manifold<Tag>>>,
+    /// The boolean library's own mesh of the solid, kept: a boolean's
+    /// result goes on to the next as the library made it.
+    mesh: Option<Arc<engine::Mesh>>,
 }
 
 impl std::fmt::Debug for Solid {
@@ -299,24 +365,6 @@ pub struct Crease {
     pub right: u32,
 }
 
-/// Value carried through a boolean: the facet, as a number.
-#[derive(Clone, Debug, Default, PartialEq)]
-struct Tag(f64);
-
-impl Add for Tag {
-    type Output = Tag;
-    fn add(self, o: Tag) -> Tag {
-        Tag(self.0 + o.0)
-    }
-}
-
-impl Mul<boolmesh::Real> for Tag {
-    type Output = Tag;
-    fn mul(self, k: boolmesh::Real) -> Tag {
-        Tag(self.0 * k)
-    }
-}
-
 impl Solid {
     fn push(&mut self, t: [u32; 3], facet: u32) {
         self.tris.push(t);
@@ -334,7 +382,7 @@ impl Solid {
         delta: [f64; 3],
         rename: impl Fn(FaceId) -> FaceId,
     ) -> Solid {
-        let mut map: HashMap<u32, u32> = HashMap::new();
+        let mut map: HashMap<u32, u32, Fx> = HashMap::default();
         let copied: Vec<u32> = self
             .facets
             .iter()
@@ -384,7 +432,7 @@ impl Solid {
             let d = dot(k, v) * (1.0 - c);
             std::array::from_fn(|i| v[i] * c + kv[i] * s + k[i] * d)
         };
-        let mut map: HashMap<u32, u32> = HashMap::new();
+        let mut map: HashMap<u32, u32, Fx> = HashMap::default();
         let points: Vec<[f64; 3]> = self
             .points
             .iter()
@@ -442,6 +490,52 @@ impl Solid {
         }))
     }
 
+    /// A copy mapped by the affine map `m` (three rows of a 4×4 matrix), a
+    /// mirror turned round, on facets of its own: each facet's plane mapped,
+    /// so that the triangles of a plane stay one facet (and the boolean
+    /// library joins them up again). `None` if the map flattens it.
+    pub fn mapped(&self, facets: &mut Facets, m: &[[f64; 4]; 3]) -> Option<Solid> {
+        let row = |i: usize| [m[i][0], m[i][1], m[i][2]];
+        let det = dot(row(0), cross(row(1), row(2)));
+        if !det.is_finite() || det.abs() < 1e-18 {
+            return None;
+        }
+        // Normals go by the inverse transpose: the cofactors over the
+        // determinant.
+        let cof = [
+            cross(row(1), row(2)),
+            cross(row(2), row(0)),
+            cross(row(0), row(1)),
+        ];
+        let at = |p: [f64; 3]| -> [f64; 3] {
+            std::array::from_fn(|i| m[i][0] * p[0] + m[i][1] * p[1] + m[i][2] * p[2] + m[i][3])
+        };
+        let mut moved: HashMap<u32, u32, Fx> = HashMap::default();
+        let facets_of = self
+            .facets
+            .iter()
+            .map(|&f| {
+                *moved.entry(f).or_insert_with(|| {
+                    let x = facets.get(f);
+                    let n: [f64; 3] = std::array::from_fn(|i| dot(cof[i], x.normal) / det);
+                    let on = at(x.normal.map(|k| k * x.offset));
+                    facets.add(x.face, normalized(n), on)
+                })
+            })
+            .collect();
+        let flip = det < 0.0;
+        Some(Solid {
+            points: self.points.iter().map(|p| at(*p).map(snap)).collect(),
+            tris: self
+                .tris
+                .iter()
+                .map(|t| if flip { [t[0], t[2], t[1]] } else { *t })
+                .collect(),
+            facets: facets_of,
+            mesh: None,
+        })
+    }
+
     /// A solid from its triangles, each with the face it belongs to; every
     /// triangle gets a facet of its own plane, its normal by its winding.
     /// The caller sees to it that the mesh is closed.
@@ -472,7 +566,7 @@ impl Solid {
     /// The solid with its facets, read from `from`, added to `into` anew:
     /// a solid kept from another build, in this one's facets.
     pub fn rehome(&self, from: &Facets, into: &mut Facets) -> Solid {
-        let mut moved: HashMap<u32, u32> = HashMap::new();
+        let mut moved: HashMap<u32, u32, Fx> = HashMap::default();
         let facets = self
             .facets
             .iter()
@@ -513,38 +607,18 @@ impl Solid {
         })
     }
 
-    fn manifold(&self) -> Result<Arc<Manifold<Tag>>, Error> {
+    fn manifold(&self) -> Result<Arc<engine::Mesh>, Error> {
         if let Some(m) = &self.mesh {
             return Ok(m.clone());
         }
-        // The library welds corners by their place: parts that touch
-        // along an edge would make an edge of four triangles, which it
-        // cannot take (it panics). Such parts are moved apart a hair.
-        let parted;
-        let me = match self.parted() {
-            Some(p) => {
-                parted = p;
-                &parted
-            }
-            None => self,
-        };
-        let pos: Vec<f64> = me.points.iter().flatten().copied().collect();
-        let idx: Vec<usize> = me.tris.iter().flatten().map(|&i| i as usize).collect();
-        let vals: Vec<Tag> = me
-            .facets
-            .iter()
-            .flat_map(|&f| std::iter::repeat_n(Tag(f64::from(f)), 3))
-            .collect();
-        Manifold::new_with_values(&pos, &idx, &vals)
-            .map(Arc::new)
-            .map_err(Error::Boolean)
+        engine::make(self).map(Arc::new)
     }
 
     /// The solid with the parts that meet along an edge moved apart, each
     /// shrunk towards its middle by a hair (a ten-millionth of a micrometre
     /// for a part of 10 mm); `None` if no edge has more than two
     /// triangles once corners at one place are one.
-    fn parted(&self) -> Option<Solid> {
+    pub(crate) fn parted(&self) -> Option<Solid> {
         let n = self.points.len();
         let mut weld: HashMap<[u64; 3], u32> = HashMap::with_capacity(n);
         let at: Vec<u32> = self
@@ -652,7 +726,7 @@ impl Solid {
         let at = |p: [f64; 3]| -> [f64; 3] {
             std::array::from_fn(|i| mid[i] + (p[i] - mid[i]) * (1.0 + k))
         };
-        let mut moved: HashMap<u32, u32> = HashMap::new();
+        let mut moved: HashMap<u32, u32, Fx> = HashMap::default();
         let facets_of = self
             .facets
             .iter()
@@ -723,11 +797,9 @@ impl Solid {
                 };
             }
             out[i] = Some(match result {
-                Err(e) | Ok(Err(e)) => Err(e),
-                Ok(Ok(Ok(m))) => Ok(Solid::from_manifold(m, facets)),
-                // Nothing is left: the library has no empty mesh.
-                Ok(Ok(Err(e))) if e.contains("empty") => Ok(Solid::default()),
-                Ok(Ok(Err(e))) => Err(Error::Boolean(e)),
+                Err(e) => Err(e),
+                Ok(Some(m)) => Ok(Solid::from_manifold(m, facets)),
+                Ok(None) => Ok(Solid::default()),
             });
         }
         out.into_iter()
@@ -735,104 +807,113 @@ impl Solid {
             .collect()
     }
 
-    fn from_manifold(mut m: Manifold<Tag>, facets: &mut Facets) -> Solid {
-        let points: Vec<[f64; 3]> = m.ps.iter().map(|p| [p.x, p.y, p.z]).collect();
-        let tris: Vec<[u32; 3]> =
-            m.hs.chunks(3)
-                .map(|h| [h[0].tail, h[1].tail, h[2].tail].map(|i| i as u32))
-                .collect();
+    /// Several solids by `op` at once, as OpenSCAD does it: all joined, the
+    /// first with the others cut away, or what all hold. The library sorts
+    /// out which meet (those apart are only put together) and joins the
+    /// small ones first. `None` where the library has no such batch (in the
+    /// browser): the caller then goes in pairs ([`Solid::booleans`]).
+    pub fn batch(list: &[&Solid], op: Op, facets: &mut Facets) -> Option<Result<Solid, Error>> {
+        let (first, rest) = list.split_first()?;
+        let mut keep: Vec<&Solid> = Vec::with_capacity(list.len());
+        match op {
+            Op::Add => keep.extend(list.iter().filter(|s| !s.is_empty())),
+            Op::Subtract if first.is_empty() => return Some(Ok(Solid::default())),
+            Op::Subtract => {
+                keep.push(first);
+                keep.extend(rest.iter().filter(|s| !s.is_empty()));
+            }
+            Op::Intersect if list.iter().any(|s| s.is_empty()) => {
+                return Some(Ok(Solid::default()));
+            }
+            Op::Intersect => keep.extend(list),
+        }
+        match keep.len() {
+            0 => return Some(Ok(Solid::default())),
+            1 => return Some(Ok(keep[0].clone())),
+            _ => {}
+        }
+        if !engine::BATCHES {
+            return None;
+        }
+        let made = parallel(keep.len(), |i| {
+            catch_unwind(AssertUnwindSafe(|| keep[i].manifold()))
+                .unwrap_or_else(|_| Err(Error::Boolean("the mesh library panicked".into())))
+        });
+        let meshes = match made.into_iter().collect::<Result<Vec<_>, _>>() {
+            Ok(m) => m,
+            Err(e) => return Some(Err(e)),
+        };
+        let refs: Vec<&engine::Mesh> = meshes.iter().map(|m| &**m).collect();
+        // Those that meet joined, each such group put together with the
+        // others as it is: a boolean of solids apart is wasted work.
+        let groups = |from: usize| -> Vec<Vec<&engine::Mesh>> {
+            let part = &keep[from..];
+            let mut parent: Vec<usize> = (0..part.len()).collect();
+            fn root(p: &mut [usize], mut i: usize) -> usize {
+                while p[i] != i {
+                    p[i] = p[p[i]];
+                    i = p[i];
+                }
+                i
+            }
+            for (a, b) in meeting(part) {
+                let (a, b) = (root(&mut parent, a), root(&mut parent, b));
+                parent[a.max(b)] = a.min(b);
+            }
+            let mut out: Vec<Vec<&engine::Mesh>> = Vec::new();
+            let mut slot: HashMap<usize, usize, Fx> = HashMap::default();
+            for i in 0..part.len() {
+                let r = root(&mut parent, i);
+                let k = *slot.entry(r).or_insert_with(|| {
+                    out.push(Vec::new());
+                    out.len() - 1
+                });
+                out[k].push(refs[from + i]);
+            }
+            out
+        };
+        let done = catch_unwind(AssertUnwindSafe(|| match op {
+            Op::Add => engine::union(&groups(0)),
+            Op::Intersect => engine::intersection(&refs),
+            Op::Subtract => match engine::union(&groups(1))? {
+                Some(cut) => engine::boolean(refs[0], &cut, op),
+                None => Ok(Some(refs[0].clone())),
+            },
+        }))
+        .unwrap_or_else(|_| Err(Error::Boolean("the mesh library panicked".into())));
+        Some(done.map(|m| match m {
+            Some(m) => Solid::from_manifold(m, facets),
+            None => Solid::default(),
+        }))
+    }
+
+    fn from_manifold(m: engine::Mesh, facets: &mut Facets) -> Solid {
+        let (points, tris, found) = engine::read(&m, facets);
         let at = |t: [u32; 3]| t.map(|i| points[i as usize]);
-        // Corners that share a vertex can blend the tags of two faces. A tag
-        // on a clean triangle has held in every test, so only the blended
-        // ones are repaired, by the plane their tag has to lie in.
-        let whole = |v: &Tag| (v.0 - v.0.round()).abs() < 1e-6 && v.0 >= 0.0;
-        let mut out: Vec<Option<u32>> = m
-            .vals
-            .chunks(3)
-            .zip(&tris)
-            .map(|(c, t)| {
-                let clean = c.iter().all(|v| whole(v) && (v.0 - c[0].0).abs() < 1e-6);
-                if clean {
-                    return Some(c[0].0.round() as u32);
-                }
-                c.iter()
-                    .filter(|v| whole(v))
-                    .map(|v| v.0.round() as u32)
-                    .find(|&f| (f as usize) < facets.all.len() && facets.fits(f, at(*t)))
-            })
-            .collect();
-        // What is left takes the facet of a neighbour in the same plane.
-        let mut edges: HashMap<(u32, u32), usize> = HashMap::new();
-        for (i, t) in tris.iter().enumerate() {
-            for k in 0..3 {
-                edges.insert((t[k], t[(k + 1) % 3]), i);
-            }
-        }
-        // Pass after pass while one finds more: a triangle none fits stops
-        // nothing.
-        loop {
-            let mut found_any = false;
-            for i in 0..tris.len() {
-                if out[i].is_some() {
-                    continue;
-                }
-                let t = tris[i];
-                let found = (0..3)
-                    .filter_map(|k| edges.get(&(t[(k + 1) % 3], t[k])).and_then(|&n| out[n]))
-                    .find(|&f| facets.fits(f, at(t)));
-                out[i] = found;
-                found_any |= found.is_some();
-            }
-            if !found_any {
-                break;
-            }
-        }
-        // The rest: the nearest of the facets its corners and neighbours
-        // name, else of all.
-        let near: Vec<Option<u32>> = (0..tris.len())
-            .map(|i| {
-                if out[i].is_some() {
-                    return None;
-                }
-                let t = tris[i];
-                let mut names: Vec<u32> = m.vals[3 * i..3 * i + 3]
-                    .iter()
-                    .filter(|v| whole(v))
-                    .map(|v| v.0.round() as u32)
-                    .filter(|&f| (f as usize) < facets.all.len())
-                    .collect();
-                names.extend(
-                    (0..3).filter_map(|k| edges.get(&(t[(k + 1) % 3], t[k])).and_then(|&n| out[n])),
-                );
-                let off = |f: u32| {
-                    let x = facets.get(f);
-                    at(t)
-                        .iter()
-                        .map(|p| (dot(x.normal, *p) - x.offset).abs())
-                        .sum::<f64>()
-                };
-                names
-                    .into_iter()
-                    .min_by(|&a, &b| off(a).total_cmp(&off(b)))
-                    .or_else(|| Some(nearest_facet(facets, at(t))))
-            })
-            .collect();
-        let mut turned: HashMap<u32, u32> = HashMap::new();
-        let facets_of: Vec<u32> = out
+        let mut turned: HashMap<u32, u32, Fx> = HashMap::default();
+        // A splinter's winding is noise: it goes with the rest of its facet,
+        // turned if that is (below), else as it is.
+        let splinter: Vec<bool> = tris
             .iter()
-            .zip(&tris)
-            .zip(&near)
-            .map(|((f, t), n)| {
-                let f = f.or(*n).unwrap_or(0);
+            .map(|t| {
                 let [p, q, r] = at(*t);
                 let n = cross(sub(q, p), sub(r, p));
-                let old = facets.get(f);
-                // A splinter's winding is noise: it keeps its facet.
                 let longest = [sub(q, p), sub(r, q), sub(p, r)]
                     .map(|e| dot(e, e))
                     .into_iter()
                     .fold(0.0, f64::max);
-                if dot(n, old.normal) >= 0.0 || dot(n, n) < 1e-12 * longest * longest {
+                dot(n, n) < 1e-12 * longest * longest
+            })
+            .collect();
+        let mut facets_of: Vec<u32> = found
+            .iter()
+            .zip(&tris)
+            .zip(&splinter)
+            .map(|((&f, t), &splinter)| {
+                let [p, q, r] = at(*t);
+                let n = cross(sub(q, p), sub(r, p));
+                let old = facets.get(f);
+                if splinter || dot(n, old.normal) >= 0.0 {
                     return f;
                 }
                 *turned.entry(f).or_insert_with(|| {
@@ -841,6 +922,11 @@ impl Solid {
                 })
             })
             .collect();
+        for (f, _) in facets_of.iter_mut().zip(&splinter).filter(|(_, s)| **s) {
+            if let Some(&t) = turned.get(f) {
+                *f = t;
+            }
+        }
         // One plane, one way round: one face, under the older name. A cut
         // that ends on a face (a fillet's end on a floor) must not rename
         // the floor.
@@ -849,7 +935,7 @@ impl Solid {
             let r = |v: f64| (v * 1e6).round() as i64;
             (x.normal.map(r), r(x.offset))
         };
-        let mut oldest: HashMap<([i64; 3], i64), u32> = HashMap::new();
+        let mut oldest: HashMap<([i64; 3], i64), u32, Fx> = HashMap::default();
         for &f in &facets_of {
             oldest
                 .entry(plane(f))
@@ -857,10 +943,7 @@ impl Solid {
                 .or_insert(f);
         }
         let facets_of: Vec<u32> = facets_of.iter().map(|&f| oldest[&plane(f)]).collect();
-        // The next boolean starts from the repaired names.
-        for (c, f) in m.vals.chunks_mut(3).zip(&facets_of) {
-            c.fill(Tag(f64::from(*f)));
-        }
+        let m = engine::retag(m, &facets_of);
         Solid {
             points,
             tris,
@@ -1044,7 +1127,7 @@ impl Solid {
 
     /// `true` if every edge has exactly one partner running the other way.
     pub fn is_closed(&self) -> bool {
-        let mut e: HashMap<(u32, u32), u32> = HashMap::new();
+        let mut e: HashMap<(u32, u32), u32, Fx> = HashMap::default();
         for t in &self.tris {
             for k in 0..3 {
                 *e.entry((t[k], t[(k + 1) % 3])).or_default() += 1;
@@ -1092,23 +1175,15 @@ impl Solid {
 
 /// Is `p`, in the triangle's plane, inside it? `normal` is the plane's, seen from
 /// the side the triangle's winding runs against.
-/// The library's boolean of two solids, its panic caught: the library can
-/// panic on an index, and a failed feature must not take the app with it.
-type Raw = Result<Result<Result<Manifold<Tag>, String>, Error>, Error>;
-
-fn run_boolean(a: &Solid, b: &Solid, op: Op) -> Raw {
-    let kind = match op {
-        Op::Add => OpType::Add,
-        Op::Subtract => OpType::Subtract,
-        Op::Intersect => OpType::Intersect,
-    };
-    catch_unwind(AssertUnwindSafe(
-        || -> Result<Result<Manifold<Tag>, String>, Error> {
-            let (a, b) = (a.manifold()?, b.manifold()?);
-            Ok(compute_boolean(&a, &b, kind))
-        },
-    ))
-    .map_err(|_| Error::Boolean("the mesh library panicked".to_string()))
+/// The library's boolean of two solids, `None` if nothing is left, its
+/// panic caught: a library can panic on an index, and a failed feature must
+/// not take the app with it.
+fn run_boolean(a: &Solid, b: &Solid, op: Op) -> Result<Option<engine::Mesh>, Error> {
+    catch_unwind(AssertUnwindSafe(|| {
+        let (a, b) = (a.manifold()?, b.manifold()?);
+        engine::boolean(&a, &b, op)
+    }))
+    .map_err(|_| Error::Boolean("the mesh library panicked".to_string()))?
 }
 
 /// `f` of `0..n`, on as many threads as the machine has.
@@ -1247,6 +1322,77 @@ mod tests {
             .unwrap();
         assert!(r.is_closed());
         assert!(r.volume() > 0.0 && r.volume() < 7500.0);
+    }
+
+    #[test]
+    fn a_batch_joins_what_meets_and_cuts_all_at_once() {
+        let mut f = Facets::default();
+        // Two blocks that overlap, one apart, one inside another.
+        let parts = [
+            block(&mut f, rect(0.0, 0.0, 10.0, 10.0), 0.0, 10.0, 0),
+            block(&mut f, rect(5.0, 0.0, 15.0, 10.0), 0.0, 10.0, 2000),
+            block(&mut f, rect(20.0, 0.0, 30.0, 10.0), 0.0, 10.0, 4000),
+            block(&mut f, rect(1.0, 1.0, 2.0, 2.0), 1.0, 2.0, 6000),
+        ];
+        let refs: Vec<&Solid> = parts.iter().collect();
+        if let Some(u) = Solid::batch(&refs, Op::Add, &mut f) {
+            let u = u.unwrap();
+            assert!(u.is_closed());
+            assert!((u.volume() - 2500.0).abs() < 1e-6, "{}", u.volume());
+        }
+        let holes: Vec<Solid> = (0..4)
+            .map(|i| {
+                let x = 2.0 + 7.0 * i as f64;
+                block(
+                    &mut f,
+                    rect(x, 4.0, x + 2.0, 6.0),
+                    -1.0,
+                    11.0,
+                    8000 + 2000 * i,
+                )
+            })
+            .collect();
+        let mut all = vec![&parts[0]];
+        all.extend(&holes);
+        if let Some(d) = Solid::batch(&all, Op::Subtract, &mut f) {
+            let d = d.unwrap();
+            assert!(d.is_closed());
+            // A hole through the block, one through its edge, two beside it.
+            assert!(
+                (d.volume() - (1000.0 - 40.0 - 20.0)).abs() < 1e-6,
+                "{}",
+                d.volume()
+            );
+            assert!(d.facets.iter().all(|&k| (k as usize) < f.len()));
+        }
+    }
+
+    #[test]
+    fn a_mirrored_copy_keeps_one_facet_a_plane() {
+        let mut f = Facets::default();
+        let a = block(&mut f, rect(0.0, 0.0, 10.0, 5.0), 0.0, 2.0, 0);
+        let m = [
+            [-1.0, 0.0, 0.0, 3.0],
+            [0.0, 2.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 1.0],
+        ];
+        let b = a.mapped(&mut f, &m).unwrap();
+        assert!(b.is_closed());
+        assert!((b.volume() - 200.0).abs() < 1e-9, "{}", b.volume());
+        let mut planes: Vec<u32> = b.facets.clone();
+        planes.sort_unstable();
+        planes.dedup();
+        assert_eq!(planes.len(), 6);
+        // Each triangle lies in its facet's plane, its normal outward.
+        for (t, &k) in b.tris.iter().zip(&b.facets) {
+            let [p, q, r] = t.map(|i| b.points[i as usize]);
+            assert!(f.fits(k, [p, q, r]));
+            assert!(dot(cross(sub(q, p), sub(r, p)), f.get(k).normal) > 0.0);
+        }
+        assert!(
+            a.mapped(&mut f, &[[1.0, 0.0, 0.0, 0.0], [0.0; 4], [0.0; 4]])
+                .is_none()
+        );
     }
 
     /// Rotated random cuts blend corner tags; every triangle must still end

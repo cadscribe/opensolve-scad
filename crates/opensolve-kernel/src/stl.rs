@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::{FaceId, Facets, Solid, cross, dot, snap, sub};
+use crate::{FaceId, Facets, Fx, Solid, cross, dot, snap, sub};
 
 /// The triangles of an STL file, binary or text; `None` when it is neither.
 #[must_use]
@@ -53,8 +53,8 @@ impl Solid {
     ) -> Solid {
         // Welded on a grid finer than a print and coarser than f32 noise.
         let key = |p: [f64; 3]| p.map(|x| (x * 1e5).round() as i64);
-        let mut at: HashMap<[i64; 3], u32> = HashMap::new();
-        let mut planes: HashMap<([i64; 3], i64), u32> = HashMap::new();
+        let mut at: HashMap<[i64; 3], u32, Fx> = HashMap::default();
+        let mut planes: HashMap<([i64; 3], i64), u32, Fx> = HashMap::default();
         let mut s = Solid::default();
         for t in tris {
             let ids = t.map(|p| {
