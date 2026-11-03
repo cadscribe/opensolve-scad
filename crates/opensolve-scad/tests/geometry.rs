@@ -376,6 +376,33 @@ fn text_has_letters_about_openscads_size() {
     assert!(o < 0.7 * filled, "{o} {filled}");
 }
 
+#[test]
+fn text_is_where_openscad_puts_it() {
+    // OpenSCAD 2026.10's corners to the micrometre: FreeType's em of 2170
+    // whole pixels for the outlines, HarfBuzz's of 2170.14 for the
+    // advances, the box of the ink fitted to whole pixels for valign.
+    let bounds = |t: &str| {
+        solid(&format!("linear_extrude(1) text({t});"))
+            .solid
+            .bounds()
+            .unwrap()
+    };
+    let close = |a: [f64; 3], b: [f64; 2]| (a[0] - b[0]).abs() < 2e-4 && (a[1] - b[1]).abs() < 2e-4;
+    let bold = "font = \"Liberation Sans:style=Bold\"";
+    let (lo, hi) = bounds(&format!("\"HH\", size = 100, {bold}"));
+    assert!(
+        close(lo, [9.29, 0.0]) && close(hi, [191.238, 95.548]),
+        "{lo:?} {hi:?}"
+    );
+    let (lo, hi) = bounds(&format!(
+        "\"AG13,LR44\", size = 5, halign = \"center\", valign = \"center\", {bold}"
+    ));
+    assert!(
+        close(lo, [-18.35292, -2.96285]) && close(hi, [18.48833, 2.9606]),
+        "{lo:?} {hi:?}"
+    );
+}
+
 /// Minkowski sums and offsets, their volumes as OpenSCAD makes them.
 #[test]
 fn minkowski_sums() {

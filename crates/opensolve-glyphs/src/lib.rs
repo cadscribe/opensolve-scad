@@ -11,6 +11,8 @@
 
 use ttf_parser::{Face, GlyphId, OutlineBuilder};
 
+pub mod openscad;
+
 /// How the curves of a letter are cut into chords.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Chords {

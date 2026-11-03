@@ -1579,56 +1579,40 @@ impl Interp {
         // Each curve in as many chords as OpenSCAD cuts it into: an eighth
         // of the pieces of a circle of the size, plus one, at least two.
         let steps = (self.fragments(a, f, size, pos) / 8 + 1).max(2);
-        let outlines = opensolve_glyphs::outlines(
-            &words,
-            data,
-            index,
-            opensolve_glyphs::Chords::Steps(steps),
-            true,
-        );
-        if outlines.is_empty() {
+        let laid = opensolve_glyphs::openscad::lay_out(&words, data, index, steps, spacing)?;
+        if laid.outlines.is_empty() {
             return None;
         }
-        let cap = opensolve_glyphs::cap_per_em(data, index);
-        let k = size / 0.72 * cap;
-        let width = opensolve_glyphs::width(&words, data, index, true) * k;
-        let mut paths: Vec<Vec<V2>> = outlines
-            .into_iter()
-            .map(|o| {
-                o.into_iter()
-                    .map(|p| [p[0] * k * spacing, p[1] * k])
-                    .collect()
-            })
-            .collect();
-        let (lo, hi) =
-            paths
-                .iter()
-                .flatten()
-                .fold(([f64::MAX; 2], [f64::MIN; 2]), |(lo, hi), p| {
-                    (
-                        [lo[0].min(p[0]), lo[1].min(p[1])],
-                        [hi[0].max(p[0]), hi[1].max(p[1])],
-                    )
-                });
         let str_of = |n: &str, at: usize| match a.get(n, at) {
             Some(Value::Str(s)) => s.to_string(),
             _ => String::new(),
         };
-        let dx = match str_of("halign", usize::MAX).as_str() {
-            "center" => -width * spacing / 2.0,
-            "right" => -width * spacing,
-            _ => 0.0,
+        // OpenSCAD's offsets: by the advances and the ink's pixel box.
+        let (dx, dy) = match laid.ink {
+            None => (0.0, 0.0),
+            Some((ascent, descent)) => (
+                match str_of("halign", usize::MAX).as_str() {
+                    "center" => -laid.advance / 2.0,
+                    "right" => -laid.advance,
+                    _ => 0.0,
+                },
+                match str_of("valign", usize::MAX).as_str() {
+                    "top" => -ascent,
+                    "center" => -(ascent - descent) / 2.0 - descent,
+                    "bottom" => -descent,
+                    _ => 0.0,
+                },
+            ),
         };
-        let dy = match str_of("valign", usize::MAX).as_str() {
-            "top" => -hi[1],
-            "center" => -(lo[1] + hi[1]) / 2.0,
-            "bottom" => -lo[1],
-            _ => 0.0,
-        };
-        for p in paths.iter_mut().flatten() {
-            p[0] += dx;
-            p[1] += dy;
-        }
+        let paths: Vec<Vec<V2>> = laid
+            .outlines
+            .into_iter()
+            .map(|o| {
+                o.into_iter()
+                    .map(|p| [size * (p[0] + dx), size * (p[1] + dy)])
+                    .collect()
+            })
+            .collect();
         self.geo.polygon(&paths).map(Geom::D2)
     }
 
