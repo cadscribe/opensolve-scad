@@ -56,13 +56,27 @@ void solid_bounds(const Solid& s, rust::Slice<double> out);
 // Manifold's error, as its number (0 none); computes what is pending.
 int32_t solid_status(const Solid& s);
 
-// The mesh: corners, triangles and the number of each triangle; and its
-// runs: the first triangle of each (and one past the last), and the map
-// (3x4, by rows) that took the mesh the run comes from to where it is.
-void solid_mesh(const Solid& s, rust::Vec<double>& points,
-                rust::Vec<uint32_t>& tris, rust::Vec<uint64_t>& faces,
-                rust::Vec<uint32_t>& run_start,
-                rust::Vec<double>& run_transform);
+// The mesh of a solid as Manifold gives it out, read by the functions
+// below: whole arrays at once, not a call into Rust for each number.
+struct MeshOut {
+  manifold::MeshGL64 mesh;
+};
+
+std::unique_ptr<MeshOut> solid_mesh(const Solid& s);
+// The numbers of each corner: x, y, z first.
+size_t mesh_num_prop(const MeshOut& m);
+rust::Slice<const double> mesh_vert_properties(const MeshOut& m);
+// Three corners a triangle.
+rust::Slice<const uint64_t> mesh_tri_verts(const MeshOut& m);
+// The number of each triangle.
+rust::Slice<const uint64_t> mesh_face_id(const MeshOut& m);
+// Where each run of triangles from one mesh begins, as an index into the
+// corners of the triangles (three a triangle); as many as there are runs,
+// or fewer.
+rust::Slice<const uint64_t> mesh_run_index(const MeshOut& m);
+size_t mesh_runs(const MeshOut& m);
+// The map (3x4, by rows) that took the mesh of run `r` to where it is.
+void mesh_run_transform(const MeshOut& m, size_t r, rust::Slice<double> out);
 
 // Triangles (three corners each) of loops given as their corners (flat xy)
 // and the number of corners of each: outlines counter-clockwise, holes

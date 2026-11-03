@@ -27,14 +27,15 @@ mod ffi {
         fn solid_num_tri(s: &Solid) -> usize;
         fn solid_bounds(s: &Solid, out: &mut [f64]);
         fn solid_status(s: &Solid) -> Result<i32>;
-        fn solid_mesh(
-            s: &Solid,
-            points: &mut Vec<f64>,
-            tris: &mut Vec<u32>,
-            faces: &mut Vec<u64>,
-            run_start: &mut Vec<u32>,
-            run_transform: &mut Vec<f64>,
-        ) -> Result<()>;
+        type MeshOut;
+        fn solid_mesh(s: &Solid) -> Result<UniquePtr<MeshOut>>;
+        fn mesh_num_prop(m: &MeshOut) -> usize;
+        fn mesh_vert_properties(m: &MeshOut) -> &[f64];
+        fn mesh_tri_verts(m: &MeshOut) -> &[u64];
+        fn mesh_face_id(m: &MeshOut) -> &[u64];
+        fn mesh_run_index(m: &MeshOut) -> &[u64];
+        fn mesh_runs(m: &MeshOut) -> usize;
+        fn mesh_run_transform(m: &MeshOut, r: usize, out: &mut [f64]);
         fn triangulate(points: &[f64], sizes: &[u32]) -> Result<Vec<u32>>;
     }
 }
@@ -183,22 +184,41 @@ impl Solid {
     }
 
     pub fn mesh(&self) -> Result<Mesh, Error> {
-        let mut m = Mesh::default();
-        let mut flat = Vec::new();
-        ffi::solid_mesh(
-            &self.0,
-            &mut m.points,
-            &mut m.tris,
-            &mut m.faces,
-            &mut m.run_start,
-            &mut flat,
-        )
-        .map_err(thrown)?;
-        m.run_transform = flat
-            .chunks_exact(12)
-            .map(|t| std::array::from_fn(|r| std::array::from_fn(|c| t[r * 4 + c])))
+        let out = ffi::solid_mesh(&self.0).map_err(thrown)?;
+        let props = ffi::mesh_num_prop(&out).max(1);
+        let verts = ffi::mesh_vert_properties(&out);
+        let points = if props == 3 {
+            verts.to_vec()
+        } else {
+            verts
+                .chunks_exact(props)
+                .flat_map(|v| v.iter().take(3).copied())
+                .collect()
+        };
+        let tri_verts = ffi::mesh_tri_verts(&out);
+        let tris = tri_verts.iter().map(|&i| i as u32).collect();
+        let runs = ffi::mesh_runs(&out);
+        let run_index = ffi::mesh_run_index(&out);
+        let mut run_start: Vec<u32> = run_index
+            .iter()
+            .take(runs)
+            .map(|&i| (i / 3) as u32)
             .collect();
-        Ok(m)
+        run_start.push((tri_verts.len() / 3) as u32);
+        let run_transform = (0..runs)
+            .map(|r| {
+                let mut t = [0.0; 12];
+                ffi::mesh_run_transform(&out, r, &mut t);
+                std::array::from_fn(|row| std::array::from_fn(|col| t[row * 4 + col]))
+            })
+            .collect();
+        Ok(Mesh {
+            points,
+            tris,
+            faces: ffi::mesh_face_id(&out).to_vec(),
+            run_start,
+            run_transform,
+        })
     }
 }
 

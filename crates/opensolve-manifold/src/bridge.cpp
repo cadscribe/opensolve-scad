@@ -81,37 +81,35 @@ int32_t solid_status(const Solid& s) {
   return static_cast<int32_t>(s.m.Status());
 }
 
-void solid_mesh(const Solid& s, rust::Vec<double>& points,
-                rust::Vec<uint32_t>& tris, rust::Vec<uint64_t>& faces,
-                rust::Vec<uint32_t>& run_start,
-                rust::Vec<double>& run_transform) {
-  const manifold::MeshGL64 mesh = s.m.GetMeshGL64();
-  const size_t n = mesh.NumVert();
-  points.reserve(3 * n);
-  for (size_t v = 0; v < n; ++v) {
-    for (size_t k = 0; k < 3; ++k) {
-      points.push_back(mesh.vertProperties[v * mesh.numProp + k]);
-    }
-  }
-  tris.reserve(mesh.triVerts.size());
-  for (uint64_t i : mesh.triVerts) {
-    tris.push_back(static_cast<uint32_t>(i));
-  }
-  faces.reserve(mesh.faceID.size());
-  for (uint64_t f : mesh.faceID) {
-    faces.push_back(f);
-  }
-  const size_t runs = mesh.runOriginalID.size();
-  for (size_t r = 0; r < runs && r < mesh.runIndex.size(); ++r) {
-    run_start.push_back(static_cast<uint32_t>(mesh.runIndex[r] / 3));
-  }
-  run_start.push_back(static_cast<uint32_t>(mesh.triVerts.size() / 3));
-  for (size_t r = 0; r < runs; ++r) {
-    const manifold::mat3x4 t = mesh.GetRunTransform(r);
-    for (size_t row = 0; row < 3; ++row) {
-      for (size_t col = 0; col < 4; ++col) {
-        run_transform.push_back(t[col][row]);
-      }
+std::unique_ptr<MeshOut> solid_mesh(const Solid& s) {
+  return std::make_unique<MeshOut>(MeshOut{s.m.GetMeshGL64()});
+}
+
+size_t mesh_num_prop(const MeshOut& m) { return m.mesh.numProp; }
+
+rust::Slice<const double> mesh_vert_properties(const MeshOut& m) {
+  return {m.mesh.vertProperties.data(), m.mesh.vertProperties.size()};
+}
+
+rust::Slice<const uint64_t> mesh_tri_verts(const MeshOut& m) {
+  return {m.mesh.triVerts.data(), m.mesh.triVerts.size()};
+}
+
+rust::Slice<const uint64_t> mesh_face_id(const MeshOut& m) {
+  return {m.mesh.faceID.data(), m.mesh.faceID.size()};
+}
+
+rust::Slice<const uint64_t> mesh_run_index(const MeshOut& m) {
+  return {m.mesh.runIndex.data(), m.mesh.runIndex.size()};
+}
+
+size_t mesh_runs(const MeshOut& m) { return m.mesh.runOriginalID.size(); }
+
+void mesh_run_transform(const MeshOut& m, size_t r, rust::Slice<double> out) {
+  const manifold::mat3x4 t = m.mesh.GetRunTransform(r);
+  for (size_t row = 0; row < 3; ++row) {
+    for (size_t col = 0; col < 4; ++col) {
+      if (row * 4 + col < out.size()) out[row * 4 + col] = t[col][row];
     }
   }
 }
