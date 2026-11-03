@@ -1245,9 +1245,10 @@ fn run_boolean(a: &Solid, b: &Solid, op: Op) -> Result<Option<engine::Mesh>, Err
     .map_err(|_| Error::Boolean("the mesh library panicked".to_string()))?
 }
 
-/// `f` of `0..n`, on as many threads as the machine has.
+/// `f` of `0..n`, on as many threads as the machine has (in the browser
+/// one after the other).
 #[cfg(not(target_arch = "wasm32"))]
-fn parallel<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
+pub fn parallel<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     let threads = std::thread::available_parallelism()
@@ -1286,7 +1287,7 @@ fn parallel<T: Send>(n: usize, f: impl Fn(usize) -> T + Sync) -> Vec<T> {
 }
 
 #[cfg(target_arch = "wasm32")]
-fn parallel<T>(n: usize, f: impl Fn(usize) -> T) -> Vec<T> {
+pub fn parallel<T>(n: usize, f: impl Fn(usize) -> T) -> Vec<T> {
     (0..n).map(f).collect()
 }
 

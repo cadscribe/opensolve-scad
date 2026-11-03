@@ -1215,14 +1215,12 @@ impl Builder {
                 small_pieces.len()
             ));
         }
-        let mut parts = Vec::new();
-        for p in &big_pieces {
-            for q in &small_pieces {
-                if let Some(h) = self.hull(&sums(p, q)) {
-                    parts.push(h);
-                }
-            }
-        }
+        // The hulls of the pairs on threads, made solids here.
+        let n = small_pieces.len();
+        let hulls = opensolve_kernel::parallel(big_pieces.len() * n, |k| {
+            hull3(&sums(&big_pieces[k / n], &small_pieces[k % n]))
+        });
+        let mut parts: Vec<Solid> = hulls.iter().flatten().map(|t| self.solid(t)).collect();
         // The insides: each moved by a corner of the other.
         let shift = |m: &mut Self, s: &Solid, by: V3| {
             m.transformed(
