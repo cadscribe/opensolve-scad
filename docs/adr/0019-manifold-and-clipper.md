@@ -5,12 +5,18 @@
 
 ## Result
 
-On the user's 216 timed OpenSCAD files: OpenSCAD 2026.10.11 73.6 s in all,
-OpenSolve now 33.1 s (before this ADR 273.2 s). 214 files as fast as
-OpenSCAD or faster, two a little slower (`gridfinity-rebuilt-lite` 0.55 s
-against 0.46 s, `logo_full` 1.78 s against 1.73 s). Against OpenSCAD's
-results 208 identical, 1 close, 1 differs, none fails. Details under
-Corpus below; the numbers in Context are those before.
+On the user's 216 timed OpenSCAD files, against OpenSCAD 2026.10.11: all
+210 that both build come out identical (symmetric difference under 0.1 %
+of the volume; before scad-parity 208, 1 close, 1 differs), none fails.
+Timed with other builds running on the machine (load 19 to 38), the
+fastest of five runs: OpenSCAD 100.6 s in all, OpenSolve before
+scad-parity 44.5 s, now 40.7 s; 215 files faster than OpenSCAD, one by
+the load's noise slower (`connector-server-room-male`, 0.42 s against
+0.34 s; 0.17 s against 0.24 s run again). `gridfinity-rebuilt-lite` and
+`logo_full`, slower before, are now as fast as OpenSCAD. On a quiet
+machine before scad-parity: OpenSCAD 73.6 s, OpenSolve 33.1 s (before
+this ADR 273.2 s). Details under Corpus below; the numbers in Context
+are those before.
 
 ## Context
 
@@ -119,6 +125,15 @@ main 14 s; Manifold on one thread, batched, 6.0 s; on TBB 2.6 s (OpenSCAD
   sound. Snapped at 1e-9, 1e-10 or 1e-11, or only after turns that are not
   quarters, it failed on the same house or its sister; at 0.1 µm, as main
   has it, both are right.
+- **A boolean's result is moved by Manifold** (scad-parity), as OpenSCAD
+  has it moved: `mapped` of a solid that has Manifold's mesh calls
+  Manifold's `Transform` (composed with those before, applied to the
+  corners once), and only primitives still go to the grid when moved. The
+  house above was not about the grid: its roof, a union, was moved by
+  `translate([0, 0, 0])`, and the mesh of a union read into Manifold again
+  (even Manifold's own mesh, unchanged) lost the roof in the next union;
+  the grid had only hidden that. The facets follow by Manifold's runs: each
+  run says which transform took its triangles where they are.
 - **Letters are cut as OpenSCAD cuts them**: every curve of a glyph into an
   eighth of the pieces of a circle of the text's size, plus one (it was a
   chord tolerance, ten times the points); the text files of the corpus come
@@ -133,10 +148,13 @@ main 14 s; Manifold on one thread, batched, 6.0 s; on TBB 2.6 s (OpenSCAD
   Windows (MSVC and MinGW) follow the two projects' CMake files but have
   not been tried.
 - A file builds the same each time: the even-odd edges are sorted, and the
-  booleans no longer depend on thread timing.
+  booleans no longer depend on thread timing. (Not quite: Station.scad of
+  the tamper station, a Minkowski sum, writes its triangles in another
+  order from run to run, the same volume and count; so did main.)
 - Manifold's results are triangulated differently from `boolmesh`'s; the
   Raspberry case builds to the same volume (24 623.05 mm³) in 0.11 s
-  instead of 0.19 s; the blend tests pass.
+  instead of 0.19 s; the blend tests pass. With scad-parity it builds to
+  the very same STL, in the same time.
 - Manifold's tolerance stays its own (from the size of the box): set to
   the kernel's grid (0.1 µm) it moved a large model (a doll's house of a
   metre) by 2 % of its volume. Splinters that a boolean leaves between a
@@ -145,32 +163,70 @@ main 14 s; Manifold on one thread, batched, 6.0 s; on TBB 2.6 s (OpenSCAD
 
 ## Corpus
 
-The same 216 files timed as before, one process at a time, OpenSCAD, main
-and this branch back to back per file, the median of three under 5 s: in
-all OpenSCAD 73.6 s, before 273.2 s, now 33.1 s. 214 files are as fast as
-OpenSCAD or faster, two slower: `gridfinity-rebuilt-lite` (0.55 s against
-0.46 s; its rounded corners are slanted planes the grid bends, 132 000
-triangles against OpenSCAD's 82 000) and `logo_full` (1.78 s against
-1.73 s; Manifold's ear clipping takes 0.2 s on one outline of the logo
-with 9 500 corners). Against OpenSCAD's results: 208 identical (204
-before), 1 close (4), 1 differs (2, the same sampled estimate as before),
-none fails.
+The same 216 files, one process at a time, OpenSCAD, OpenSolve before
+scad-parity and with it back to back per file, the fastest of five runs
+under 5 s (`run_parity.py`, `report_parity.html` in the corpus folder).
+Other builds ran on the machine the whole time (load 19 to 38): OpenSCAD
+100.6 s in all, before 44.5 s, now 40.7 s; 215 faster than OpenSCAD, one
+slower by noise (above). Against OpenSCAD's results 210 identical (208
+before), none close (1), none differs (1), none fails.
+
+What scad-parity changed:
+
+- `RuggedBoxV1` differed (3 % by sampling) for real: `rotate_extrude` of
+  a profile left of the axis turned its mirror image, where OpenSCAD 2026
+  turns the profile as it lies (x · sin a, x · cos a), so a part turn
+  lands on the other side of the axis. The four corners of the box stood
+  in the wrong quadrant. Now identical.
+- `batteries` (close, 0.16 %): letters a micrometre off. OpenSCAD asks
+  FreeType for an em of 10⁵ 26.6 units at 100 dpi; for a TrueType font
+  whose head asks for whole pixels, FreeType makes that 2170 pixels, not
+  2170.14, and puts every point on its 26.6 grid; HarfBuzz's advances keep
+  the unrounded em; valign goes by the ink's box fitted to whole pixels.
+  `text()` now does all that (`opensolve_glyphs::openscad`): 0.0004 %.
+- `gridfinity-rebuilt-lite` (0.55 s against OpenSCAD's 0.46 s before):
+  97 % of its time was Manifold's booleans, on 132 000 triangles against
+  OpenSCAD's 82 000. The results of booleans are now moved by Manifold
+  (see Decision): 103 000 triangles, the CPU time 2.61 s now 1.98 s
+  (OpenSCAD 1.85 s), the wall time 0.62 s now 0.52 s (OpenSCAD 0.52 s),
+  measured back to back.
+- `logo_full` and `logo_full_chip`: since the colours of the extracted
+  crate, `logo()`, cut from the base and then shown in a colour, was made
+  twice (the SVG read, extruded and cut again): a module's result is now
+  kept across a colour when all colours are made. What is left is 97 %
+  Manifold: the union of the base with the logo, whose walls meet the
+  base's along the whole outline (81 %), and the cut of the logo from the
+  base (15 %), the same two booleans OpenSCAD makes, in the same CPU time
+  (9.6 to 9.8 s): 1.99 s against OpenSCAD's 1.93 s, back to back.
+- `Station` (tamper station): the hulls of a Minkowski sum of a solid that
+  is not convex on threads (29 % of its time, one after the other).
+- The comparison itself: OpenSCAD writes parts that touch along an edge
+  as an STL that is not closed, and Manifold's booleans of such a mesh
+  came out as anything (3.4 % apart for two identical meshes of the doll's
+  house); `scad_corpus compare` samples such pairs now.
+- `Solid::feature_edges` (the edges OpenSolve's view draws) by buckets of
+  corners instead of a map: 460 ms for render_baskets' 2.4 million
+  triangles, now 130 ms.
 
 | file | OpenSCAD | before | now |
 |---|---:|---:|---:|
-| render_baskets | 26.55 s | 102.80 s | 10.98 s |
-| logo_full | 1.73 s | 74.12 s | 1.78 s |
-| tamper-station | 6.78 s | 14.02 s | 2.45 s |
-| logo_full_chip | 0.55 s | 13.58 s | 0.49 s |
-| render_modules (2D) | 2.01 s | 10.67 s | 1.52 s |
-| voronoi_test (2D) | 1.08 s | 5.87 s | 0.32 s |
-| circular_woven_basket | 0.53 s | 4.96 s | 0.49 s |
-| gridfinity-rebuilt-lite | 0.46 s | 4.18 s | 0.55 s |
-| rectangular_woven_basket | 0.70 s | 3.92 s | 0.54 s |
-| connector-smoke-ventilation-pipes | 0.31 s | 1.91 s | 0.28 s |
+| render_baskets | 47.10 s | 19.61 s | 17.04 s |
+| tamper-station | 8.36 s | 2.74 s | 2.68 s |
+| logo_full | 1.93 s | 1.96 s | 1.99 s |
+| gridfinity-rebuilt-lite | 0.52 s | 0.62 s | 0.52 s |
+| logo_full_chip | 0.58 s | 0.53 s | 0.53 s |
+| Station | 0.51 s | 0.51 s | 0.47 s |
+| circular_woven_basket | 0.52 s | 0.50 s | 0.42 s |
+| connector-smoke-ventilation-pipes | 0.49 s | 0.35 s | 0.30 s |
+| RuggedBoxV1 | 0.38 s | 0.30 s | 0.28 s |
 
-Open: the two files above. A triangulator that does not stall on long
-outlines (a constrained Delaunay one, as CGAL's) would take the logo
-under OpenSCAD; for the gridfinity bin, transforms composed and applied
-once as OpenSCAD's Manifold does, rather than one after the other, might
-let corners meet without the grid.
+(The corpus run; `logo_full` and `gridfinity-rebuilt-lite` back to back,
+nine runs each, as the corpus run had OpenSCAD's logo at 5 s.)
+
+Open: `logo_full` and `gridfinity-rebuilt-lite` are as fast as OpenSCAD,
+not faster. The logo's time is Manifold's two booleans, as OpenSCAD's.
+The bin still has 103 000 triangles where OpenSCAD has 82 000: primitives
+moved still go to the grid (moved by Manifold unsnapped they gave
+OpenSCAD's count, but 3.7 mm³ less volume than OpenSCAD's and half the
+triangles of the vehub chip, which its comparison could not cut). The
+timing wants a quiet machine.
