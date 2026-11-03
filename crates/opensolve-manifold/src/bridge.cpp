@@ -52,6 +52,17 @@ std::unique_ptr<Solid> batch_boolean(const Batch& batch, uint8_t op) {
       Solid{manifold::Manifold::BatchBoolean(batch.list, op_of(op))});
 }
 
+std::unique_ptr<Solid> solid_transform(const Solid& s,
+                                       rust::Slice<const double> m) {
+  manifold::mat3x4 t;
+  for (size_t col = 0; col < 4; ++col) {
+    for (size_t row = 0; row < 3; ++row) {
+      t[col][row] = m[row * 4 + col];
+    }
+  }
+  return std::make_unique<Solid>(Solid{s.m.Transform(t)});
+}
+
 std::unique_ptr<Solid> solid_copy(const Solid& s) {
   return std::make_unique<Solid>(Solid{s.m});
 }
@@ -71,7 +82,9 @@ int32_t solid_status(const Solid& s) {
 }
 
 void solid_mesh(const Solid& s, rust::Vec<double>& points,
-                rust::Vec<uint32_t>& tris, rust::Vec<uint64_t>& faces) {
+                rust::Vec<uint32_t>& tris, rust::Vec<uint64_t>& faces,
+                rust::Vec<uint32_t>& run_start,
+                rust::Vec<double>& run_transform) {
   const manifold::MeshGL64 mesh = s.m.GetMeshGL64();
   const size_t n = mesh.NumVert();
   points.reserve(3 * n);
@@ -87,6 +100,19 @@ void solid_mesh(const Solid& s, rust::Vec<double>& points,
   faces.reserve(mesh.faceID.size());
   for (uint64_t f : mesh.faceID) {
     faces.push_back(f);
+  }
+  const size_t runs = mesh.runOriginalID.size();
+  for (size_t r = 0; r < runs && r < mesh.runIndex.size(); ++r) {
+    run_start.push_back(static_cast<uint32_t>(mesh.runIndex[r] / 3));
+  }
+  run_start.push_back(static_cast<uint32_t>(mesh.triVerts.size() / 3));
+  for (size_t r = 0; r < runs; ++r) {
+    const manifold::mat3x4 t = mesh.GetRunTransform(r);
+    for (size_t row = 0; row < 3; ++row) {
+      for (size_t col = 0; col < 4; ++col) {
+        run_transform.push_back(t[col][row]);
+      }
+    }
   }
 }
 

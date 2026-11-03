@@ -40,6 +40,11 @@ void batch_push(Batch& batch, const Solid& s);
 // The first and the others by `op`, at once.
 std::unique_ptr<Solid> batch_boolean(const Batch& batch, uint8_t op);
 
+// The solid moved by an affine map, its 3x4 matrix given by rows; Manifold
+// applies it with the maps before it, at once.
+std::unique_ptr<Solid> solid_transform(const Solid& s,
+                                       rust::Slice<const double> m);
+
 // The same solid: Manifold shares the mesh.
 std::unique_ptr<Solid> solid_copy(const Solid& s);
 
@@ -51,9 +56,13 @@ void solid_bounds(const Solid& s, rust::Slice<double> out);
 // Manifold's error, as its number (0 none); computes what is pending.
 int32_t solid_status(const Solid& s);
 
-// The mesh: corners, triangles and the number of each triangle.
+// The mesh: corners, triangles and the number of each triangle; and its
+// runs: the first triangle of each (and one past the last), and the map
+// (3x4, by rows) that took the mesh the run comes from to where it is.
 void solid_mesh(const Solid& s, rust::Vec<double>& points,
-                rust::Vec<uint32_t>& tris, rust::Vec<uint64_t>& faces);
+                rust::Vec<uint32_t>& tris, rust::Vec<uint64_t>& faces,
+                rust::Vec<uint32_t>& run_start,
+                rust::Vec<double>& run_transform);
 
 // Triangles (three corners each) of loops given as their corners (flat xy)
 // and the number of corners of each: outlines counter-clockwise, holes

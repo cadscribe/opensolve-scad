@@ -356,6 +356,45 @@ pub fn extrude(
     Ok(s)
 }
 
+/// An affine map (three rows of a 4×4 matrix) that does not flatten, and
+/// what moves planes by it.
+pub(crate) struct Affine {
+    m: [[f64; 4]; 3],
+    /// Normals go by the inverse transpose: the cofactors over the
+    /// determinant.
+    cof: [[f64; 3]; 3],
+    det: f64,
+}
+
+impl Affine {
+    pub(crate) fn new(m: &[[f64; 4]; 3]) -> Option<Affine> {
+        let row = |i: usize| [m[i][0], m[i][1], m[i][2]];
+        let det = dot(row(0), cross(row(1), row(2)));
+        if !det.is_finite() || det.abs() < 1e-18 {
+            return None;
+        }
+        let cof = [
+            cross(row(1), row(2)),
+            cross(row(2), row(0)),
+            cross(row(0), row(1)),
+        ];
+        Some(Affine { m: *m, cof, det })
+    }
+
+    fn at(&self, p: [f64; 3]) -> [f64; 3] {
+        let m = &self.m;
+        std::array::from_fn(|i| m[i][0] * p[0] + m[i][1] * p[1] + m[i][2] * p[2] + m[i][3])
+    }
+
+    /// A new facet: facet `f` moved, of the same face.
+    pub(crate) fn facet(&self, facets: &mut Facets, f: u32) -> u32 {
+        let x = facets.get(f);
+        let n: [f64; 3] = std::array::from_fn(|i| dot(self.cof[i], x.normal) / self.det);
+        let on = self.at(x.normal.map(|k| k * x.offset));
+        facets.add(x.face, normalized(n), on)
+    }
+}
+
 /// An edge where two facets meet at an angle.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Crease {
@@ -499,42 +538,36 @@ impl Solid {
     /// where the last bits of a turn would part them and the booleans take
     /// that literally. `None` if the map flattens it.
     pub fn mapped(&self, facets: &mut Facets, m: &[[f64; 4]; 3]) -> Option<Solid> {
-        let row = |i: usize| [m[i][0], m[i][1], m[i][2]];
-        let det = dot(row(0), cross(row(1), row(2)));
-        if !det.is_finite() || det.abs() < 1e-18 {
-            return None;
-        }
-        // Normals go by the inverse transpose: the cofactors over the
-        // determinant.
-        let cof = [
-            cross(row(1), row(2)),
-            cross(row(2), row(0)),
-            cross(row(0), row(1)),
-        ];
-        let at = |p: [f64; 3]| -> [f64; 3] {
-            std::array::from_fn(|i| m[i][0] * p[0] + m[i][1] * p[1] + m[i][2] * p[2] + m[i][3])
-        };
+        let a = Affine::new(m)?;
         let mut moved: HashMap<u32, u32, Fx> = HashMap::default();
         let facets_of = self
             .facets
             .iter()
-            .map(|&f| {
-                *moved.entry(f).or_insert_with(|| {
-                    let x = facets.get(f);
-                    let n: [f64; 3] = std::array::from_fn(|i| dot(cof[i], x.normal) / det);
-                    let on = at(x.normal.map(|k| k * x.offset));
-                    facets.add(x.face, normalized(n), on)
-                })
-            })
+            .map(|&f| *moved.entry(f).or_insert_with(|| a.facet(facets, f)))
             .collect();
-        let flip = det < 0.0;
+        let flip = a.det < 0.0;
+        let tris = self
+            .tris
+            .iter()
+            .map(|t| if flip { [t[0], t[2], t[1]] } else { *t })
+            .collect();
+        // A boolean's result the library moves itself, as OpenSCAD has it
+        // moved: its corners where the map puts them, the maps before
+        // composed with this one. Snapped, the corners a boolean computed on
+        // a slanted face bend it (and the library then cuts each of its
+        // triangles on its own); read in again, a result with parts that
+        // nearly touch can lose one of them in the next boolean.
+        if let Some(mesh) = self.mesh.as_ref().and_then(|x| engine::transformed(x, m)) {
+            return Some(Solid {
+                points: self.points.iter().map(|p| a.at(*p)).collect(),
+                tris,
+                facets: facets_of,
+                mesh: Some(Arc::new(mesh)),
+            });
+        }
         Some(Solid {
-            points: self.points.iter().map(|p| at(*p).map(snap)).collect(),
-            tris: self
-                .tris
-                .iter()
-                .map(|t| if flip { [t[0], t[2], t[1]] } else { *t })
-                .collect(),
+            points: self.points.iter().map(|p| a.at(*p).map(snap)).collect(),
+            tris,
             facets: facets_of,
             mesh: None,
         })
@@ -1419,6 +1452,31 @@ mod tests {
             a.mapped(&mut f, &[[1.0, 0.0, 0.0, 0.0], [0.0; 4], [0.0; 4]])
                 .is_none()
         );
+    }
+
+    /// A boolean's result moved (by the library, where it moves it), cut
+    /// again: each triangle on a facet whose plane it lies in, its normal
+    /// outward, the moved copy's facets not the unmoved one's.
+    #[test]
+    fn a_moved_result_keeps_its_facets_through_the_next_cut() {
+        let mut f = Facets::default();
+        let a = block(&mut f, rect(0.0, 0.0, 10.0, 10.0), 0.0, 10.0, 0);
+        let c = block(&mut f, circle(5.0, 5.0, 2.0, 24), 0.0, 10.0, 2000);
+        let holed = a.boolean(&c, Op::Subtract, &mut f).unwrap();
+        // Turned about z, mirrored in x, moved.
+        let (s, k) = 1.2f64.sin_cos();
+        let m = [[-k, s, 0.0, 30.0], [s, k, 0.0, 1.0], [0.0, 0.0, 1.0, 2.0]];
+        let moved = holed.mapped(&mut f, &m).unwrap();
+        let cut = block(&mut f, rect(-50.0, -50.0, 50.0, 50.0), 4.0, 5.0, 4000);
+        let r = moved.boolean(&cut, Op::Subtract, &mut f).unwrap();
+        assert!(r.is_closed());
+        let want = holed.volume() * 0.9;
+        assert!((r.volume() - want).abs() < 1e-6, "{} {}", r.volume(), want);
+        for (t, &k) in r.tris.iter().zip(&r.facets) {
+            let [p, q, w] = t.map(|i| r.points[i as usize]);
+            assert!(f.fits(k, [p, q, w]), "{:?}", f.get(k));
+            assert!(dot(cross(sub(q, p), sub(w, p)), f.get(k).normal) > 0.0);
+        }
     }
 
     /// Rotated random cuts blend corner tags; every triangle must still end

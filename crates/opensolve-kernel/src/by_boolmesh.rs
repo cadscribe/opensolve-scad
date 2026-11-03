@@ -77,8 +77,13 @@ pub(crate) fn intersection(_: &[&Mesh]) -> Result<Option<Mesh>, Error> {
     Err(Error::Boolean("no batch booleans".into()))
 }
 
+/// No moves of its own here: the caller moves the corners.
+pub(crate) fn transformed(_: &Mesh, _: &[[f64; 4]; 3]) -> Option<Mesh> {
+    None
+}
+
 /// The corners, triangles and each triangle's facet of a result.
-pub(crate) fn read(m: &Mesh, facets: &Facets) -> (Vec<[f64; 3]>, Vec<[u32; 3]>, Vec<u32>) {
+pub(crate) fn read(m: &Mesh, facets: &mut Facets) -> (Vec<[f64; 3]>, Vec<[u32; 3]>, Vec<u32>) {
     let points: Vec<[f64; 3]> = m.ps.iter().map(|p| [p.x, p.y, p.z]).collect();
     let tris: Vec<[u32; 3]> =
         m.hs.chunks(3)

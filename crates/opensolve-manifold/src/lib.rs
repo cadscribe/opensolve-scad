@@ -22,6 +22,7 @@ mod ffi {
         fn batch_new() -> UniquePtr<Batch>;
         fn batch_push(batch: Pin<&mut Batch>, s: &Solid);
         fn batch_boolean(batch: &Batch, op: u8) -> Result<UniquePtr<Solid>>;
+        fn solid_transform(s: &Solid, m: &[f64]) -> Result<UniquePtr<Solid>>;
         fn solid_copy(s: &Solid) -> UniquePtr<Solid>;
         fn solid_num_tri(s: &Solid) -> usize;
         fn solid_bounds(s: &Solid, out: &mut [f64]);
@@ -31,6 +32,8 @@ mod ffi {
             points: &mut Vec<f64>,
             tris: &mut Vec<u32>,
             faces: &mut Vec<u64>,
+            run_start: &mut Vec<u32>,
+            run_transform: &mut Vec<f64>,
         ) -> Result<()>;
         fn triangulate(points: &[f64], sizes: &[u32]) -> Result<Vec<u32>>;
     }
@@ -125,6 +128,13 @@ pub struct Mesh {
     pub points: Vec<f64>,
     pub tris: Vec<u32>,
     pub faces: Vec<u64>,
+    /// Runs of triangles that come from one mesh made by [`Solid::new`]:
+    /// the first triangle of each, and one past the last of all.
+    pub run_start: Vec<u32>,
+    /// Each run's map from that mesh to where its triangles are now (three
+    /// rows of a 4×4 matrix): the transforms ([`Solid::transformed`]) that
+    /// moved it.
+    pub run_transform: Vec<[[f64; 4]; 3]>,
 }
 
 impl Solid {
@@ -149,6 +159,14 @@ impl Solid {
         checked(ffi::batch_boolean(&batch, op.code()))
     }
 
+    /// The solid moved by the affine map `m` (three rows of a 4×4 matrix),
+    /// as Manifold moves it: the map applied to its corners in one go,
+    /// composed with those before it.
+    pub fn transformed(&self, m: &[[f64; 4]; 3]) -> Result<Solid, Error> {
+        let flat: Vec<f64> = m.iter().flatten().copied().collect();
+        checked(ffi::solid_transform(&self.0, &flat))
+    }
+
     pub fn is_empty(&self) -> bool {
         self.num_tri() == 0
     }
@@ -166,7 +184,20 @@ impl Solid {
 
     pub fn mesh(&self) -> Result<Mesh, Error> {
         let mut m = Mesh::default();
-        ffi::solid_mesh(&self.0, &mut m.points, &mut m.tris, &mut m.faces).map_err(thrown)?;
+        let mut flat = Vec::new();
+        ffi::solid_mesh(
+            &self.0,
+            &mut m.points,
+            &mut m.tris,
+            &mut m.faces,
+            &mut m.run_start,
+            &mut flat,
+        )
+        .map_err(thrown)?;
+        m.run_transform = flat
+            .chunks_exact(12)
+            .map(|t| std::array::from_fn(|r| std::array::from_fn(|c| t[r * 4 + c])))
+            .collect();
         Ok(m)
     }
 }
@@ -257,6 +288,42 @@ mod tests {
         let refs: Vec<&Solid> = list.iter().collect();
         let m = Solid::batch(&refs, Op::Add).unwrap().mesh().unwrap();
         assert!((volume(&m) - 2.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_moved_solid_tells_how_it_was_moved() {
+        let turn = [
+            [0.0, -1.0, 0.0, 5.0],
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+        ];
+        let a = cube([0.0; 3], [1.0; 3], 0).transformed(&turn).unwrap();
+        let shift = [
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 2.0],
+        ];
+        let b = cube([3.0, 0.0, 0.0], [4.0, 1.0, 1.0], 10);
+        let m = a
+            .boolean(&b, Op::Add)
+            .unwrap()
+            .transformed(&shift)
+            .unwrap()
+            .mesh()
+            .unwrap();
+        assert!((volume(&m) - 2.0).abs() < 1e-9);
+        assert_eq!(m.run_start.len(), m.run_transform.len() + 1);
+        assert_eq!(*m.run_start.last().unwrap() as usize, m.tris.len() / 3);
+        // The turned cube's run: turned, then shifted; the other shifted.
+        let both = [
+            [0.0, -1.0, 0.0, 5.0],
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 2.0],
+        ];
+        for (r, t) in m.run_transform.iter().enumerate() {
+            let first = m.faces[m.run_start[r] as usize];
+            assert_eq!(*t, if first < 6 { both } else { shift }, "run {r}");
+        }
     }
 
     #[test]

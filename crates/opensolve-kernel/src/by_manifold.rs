@@ -4,7 +4,9 @@
 
 use opensolve_manifold::Error as Refused;
 
-use crate::{Error, Facets, Op, Solid, nearest_facet};
+use std::collections::HashMap;
+
+use crate::{Affine, Error, Facets, Fx, Op, Solid, nearest_facet};
 
 pub(crate) type Mesh = opensolve_manifold::Solid;
 
@@ -44,6 +46,12 @@ fn kind(op: Op) -> opensolve_manifold::Op {
 pub(crate) fn boolean(a: &Mesh, b: &Mesh, op: Op) -> Result<Option<Mesh>, Error> {
     let m = a.boolean(b, kind(op)).map_err(refused)?;
     Ok((!m.is_empty()).then_some(m))
+}
+
+/// The solid moved by Manifold: the map composed with those before it and
+/// applied to the corners of the meshes it was made of at once.
+pub(crate) fn transformed(m: &Mesh, map: &[[f64; 4]; 3]) -> Option<Mesh> {
+    m.transformed(map).ok()
 }
 
 /// Manifold takes many solids at once ([`union`], [`intersection`]).
@@ -134,8 +142,11 @@ fn rounds(levels: &mut [Vec<Item<'_>>], op: Op) -> Result<(), Error> {
     }
 }
 
-/// The corners, triangles and each triangle's facet of a result.
-pub(crate) fn read(m: &Mesh, facets: &Facets) -> (Vec<[f64; 3]>, Vec<[u32; 3]>, Vec<u32>) {
+/// The corners, triangles and each triangle's facet of a result. A
+/// triangle's number is the facet it had in the mesh it comes from; where
+/// that mesh was moved since ([`transformed`]), the facet moved as well,
+/// once for each facet and run.
+pub(crate) fn read(m: &Mesh, facets: &mut Facets) -> (Vec<[f64; 3]>, Vec<[u32; 3]>, Vec<u32>) {
     let mesh = m.mesh().unwrap_or_default();
     let points: Vec<[f64; 3]> = mesh
         .points
@@ -147,12 +158,37 @@ pub(crate) fn read(m: &Mesh, facets: &Facets) -> (Vec<[f64; 3]>, Vec<[u32; 3]>, 
         .chunks_exact(3)
         .map(|t| [t[0], t[1], t[2]])
         .collect();
+    const SAME: [[f64; 4]; 3] = [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+    ];
+    // Each run's map, unless it is none; the run of each triangle.
+    let maps: Vec<Option<Affine>> = (0..mesh.run_start.len().saturating_sub(1))
+        .map(|r| {
+            mesh.run_transform
+                .get(r)
+                .filter(|t| **t != SAME)
+                .and_then(Affine::new)
+        })
+        .collect();
+    let mut run_of = vec![usize::MAX; tris.len()];
+    for (r, w) in mesh.run_start.windows(2).enumerate() {
+        let (lo, hi) = (w[0] as usize, (w[1] as usize).min(tris.len()));
+        run_of[lo.min(hi)..hi].fill(r);
+    }
+    let mut moved: HashMap<(u32, usize), u32, Fx> = HashMap::default();
+    let known = facets.len();
     let found = mesh
         .faces
         .iter()
         .zip(&tris)
-        .map(|(&f, t)| match u32::try_from(f) {
-            Ok(f) if (f as usize) < facets.len() => f,
+        .zip(run_of)
+        .map(|((&f, t), r)| match u32::try_from(f) {
+            Ok(f) if (f as usize) < known => match maps.get(r).and_then(Option::as_ref) {
+                None => f,
+                Some(a) => *moved.entry((f, r)).or_insert_with(|| a.facet(facets, f)),
+            },
             _ => nearest_facet(facets, t.map(|i| points[i as usize])),
         })
         .collect();
