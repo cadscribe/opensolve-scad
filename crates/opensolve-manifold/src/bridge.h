@@ -26,11 +26,10 @@ struct Batch {
 // counter-clockwise from outside) and a number for each triangle that its
 // pieces keep through booleans. If it is not closed, corners at one place
 // on edges that are open are joined, and it is tried again. Check it with
-// `status`. Edges shorter than `tolerance` may be collapsed in results.
+// `status`.
 std::unique_ptr<Solid> solid_new(rust::Slice<const double> points,
                                  rust::Slice<const uint32_t> tris,
-                                 rust::Slice<const uint64_t> faces,
-                                 double tolerance);
+                                 rust::Slice<const uint64_t> faces);
 
 // 0 union, 1 difference, 2 intersection.
 std::unique_ptr<Solid> solid_boolean(const Solid& a, const Solid& b,

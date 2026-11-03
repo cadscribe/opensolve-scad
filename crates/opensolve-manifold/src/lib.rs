@@ -17,12 +17,7 @@ mod ffi {
         type Solid;
         type Batch;
 
-        fn solid_new(
-            points: &[f64],
-            tris: &[u32],
-            faces: &[u64],
-            tolerance: f64,
-        ) -> Result<UniquePtr<Solid>>;
+        fn solid_new(points: &[f64], tris: &[u32], faces: &[u64]) -> Result<UniquePtr<Solid>>;
         fn solid_boolean(a: &Solid, b: &Solid, op: u8) -> Result<UniquePtr<Solid>>;
         fn batch_new() -> UniquePtr<Batch>;
         fn batch_push(batch: Pin<&mut Batch>, s: &Solid);
@@ -135,16 +130,9 @@ pub struct Mesh {
 
 impl Solid {
     /// The solid of a closed mesh; each triangle's number goes to the pieces
-    /// of it in results. Edges shorter than `tolerance`, and slivers thinner,
-    /// may be collapsed in results (Manifold's own baseline, from the size of
-    /// the box, at the least).
-    pub fn new(
-        points: &[f64],
-        tris: &[u32],
-        faces: &[u64],
-        tolerance: f64,
-    ) -> Result<Solid, Error> {
-        checked(ffi::solid_new(points, tris, faces, tolerance))
+    /// of it in results.
+    pub fn new(points: &[f64], tris: &[u32], faces: &[u64]) -> Result<Solid, Error> {
+        checked(ffi::solid_new(points, tris, faces))
     }
 
     pub fn boolean(&self, other: &Solid, op: Op) -> Result<Solid, Error> {
@@ -237,7 +225,7 @@ mod tests {
             tris.extend([q[0], q[1], q[2], q[0], q[2], q[3]]);
             faces.extend([first + k as u64; 2]);
         }
-        Solid::new(&points, &tris, &faces, 0.0).unwrap()
+        Solid::new(&points, &tris, &faces).unwrap()
     }
 
     fn volume(m: &Mesh) -> f64 {
@@ -286,7 +274,7 @@ mod tests {
     fn an_open_mesh_is_refused() {
         let points = [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0];
         assert_eq!(
-            Solid::new(&points, &[0, 1, 2], &[0], 0.0).unwrap_err(),
+            Solid::new(&points, &[0, 1, 2], &[0]).unwrap_err(),
             Error::NotManifold
         );
     }

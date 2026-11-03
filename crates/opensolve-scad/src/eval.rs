@@ -15,6 +15,7 @@ use crate::Error;
 use crate::ast::{Arg, Elem, Expr, Func, Modifier, Module, Pos, Stmt};
 use crate::builtins;
 use crate::cache::Parsed;
+use crate::flat::{self, Region};
 use crate::geom::{self, Builder, Geom, IDENTITY, Matrix, V2, V3, cos_deg, fragments, sin_deg};
 use crate::value::{self, MOST, Value, item, repr};
 
@@ -916,13 +917,7 @@ impl Interp {
                         .collect(),
                     None => vec![points],
                 };
-                match self.geo.polygon(&paths) {
-                    Ok(s) => s.map(Geom::D2),
-                    Err(e) => {
-                        self.note(Some(pos), e);
-                        None
-                    }
-                }
+                self.geo.polygon(&paths).map(Geom::D2)
             }
             "translate" | "rotate" | "scale" | "mirror" | "multmatrix" => {
                 let m = matrix(name, &a);
@@ -1264,15 +1259,25 @@ impl Interp {
                 format!("2D and 3D shapes together: the {left} ones are left out"),
             );
         }
+        if is_flat {
+            let shapes: Vec<&Region> = list
+                .iter()
+                .filter_map(|g| match g {
+                    Geom::D2(r) => Some(r),
+                    Geom::D3(_) => None,
+                })
+                .collect();
+            let r = flat::boolean(&shapes, Op::Add);
+            return Ok((!r.is_empty()).then_some(Geom::D2(r)));
+        }
         let solids = list
             .into_iter()
-            .map(|g| {
-                let (Geom::D2(s) | Geom::D3(s)) = g;
-                s
+            .filter_map(|g| match g {
+                Geom::D3(s) => Some(s),
+                Geom::D2(_) => None,
             })
             .collect();
-        let out = self.join(solids, is_flat, pos)?;
-        Ok(out.map(|s| if is_flat { Geom::D2(s) } else { Geom::D3(s) }))
+        Ok(self.join(solids, pos)?.map(Geom::D3))
     }
 
     /// Solids joined in pairs, the pairs again, and so on: the meshes the
@@ -1282,10 +1287,9 @@ impl Interp {
     fn join(
         &mut self,
         list: Vec<opensolve_kernel::Solid>,
-        flat: bool,
         pos: Option<Pos>,
     ) -> R<Option<opensolve_kernel::Solid>> {
-        let (out, errors) = self.geo.union_many(list, flat);
+        let (out, errors) = self.geo.union_many(list);
         for e in errors {
             self.note(
                 pos,
@@ -1300,10 +1304,9 @@ impl Interp {
         a: &opensolve_kernel::Solid,
         b: &opensolve_kernel::Solid,
         op: Op,
-        flat: bool,
         pos: Option<Pos>,
     ) -> R<opensolve_kernel::Solid> {
-        match self.geo.boolean(a, b, op, flat) {
+        match self.geo.boolean(a, b, op) {
             Ok(s) => Ok(s),
             // A union that fails, of shapes that are not closed or meet
             // badly (as BOSL2's open surfaces and strokes), is both shapes
@@ -1331,63 +1334,81 @@ impl Interp {
     /// The first shape and the others by `op`, those of the other dimension
     /// left out.
     fn fold(&mut self, made: Vec<Geom>, op: Op, pos: Pos) -> R<Option<Geom>> {
-        let mut it = made.into_iter();
-        let Some(first) = it.next() else {
+        let Some(first) = made.first() else {
             return Ok(None);
         };
-        let flat = matches!(first, Geom::D2(_));
-        let (Geom::D2(mut acc) | Geom::D3(mut acc)) = first;
+        if matches!(first, Geom::D2(_)) {
+            let mut shapes: Vec<&Region> = Vec::with_capacity(made.len());
+            let mut others = false;
+            for g in &made {
+                match g {
+                    Geom::D2(r) => shapes.push(r),
+                    Geom::D3(_) => others = true,
+                }
+            }
+            if others {
+                self.note(
+                    Some(pos),
+                    "2D and 3D shapes together: the others are left out",
+                );
+            }
+            let r = flat::boolean(&shapes, op);
+            return Ok((!r.is_empty()).then_some(Geom::D2(r)));
+        }
+        let mut it = made.into_iter();
+        let Some(Geom::D3(mut acc)) = it.next() else {
+            return Ok(None);
+        };
         let mut others = Vec::new();
         for g in it {
-            match (g, flat) {
-                (Geom::D2(s), true) | (Geom::D3(s), false) => others.push(s),
-                _ => self.note(
+            match g {
+                Geom::D3(s) => others.push(s),
+                Geom::D2(_) => self.note(
                     Some(pos),
                     "2D and 3D shapes together: the others are left out",
                 ),
             }
         }
-        if !flat && !others.is_empty() {
+        if !others.is_empty() {
             // All at once where the kernel's library can, as OpenSCAD does.
             let mut all: Vec<&opensolve_kernel::Solid> = vec![&acc];
             all.extend(&others);
-            if let Some(Ok(s)) = opensolve_kernel::Solid::batch(&all, op, &mut self.geo.facets) {
+            if let Some(Ok(s)) = self.geo.batch(&all, op) {
                 return Ok(Some(Geom::D3(s)));
             }
         }
         if op == Op::Subtract {
             // All that is cut away at once: much faster than one by one;
             // where that fails, one by one.
-            if let Some(cut) = self.join(others.clone(), flat, Some(pos))? {
-                match self.geo.boolean(&acc, &cut, op, flat) {
+            if let Some(cut) = self.join(others.clone(), Some(pos))? {
+                match self.geo.boolean(&acc, &cut, op) {
                     Ok(s) => acc = s,
                     Err(_) => {
                         for s in &others {
-                            acc = self.boolean(&acc, s, op, flat, Some(pos))?;
+                            acc = self.boolean(&acc, s, op, Some(pos))?;
                         }
                     }
                 }
             }
         } else {
             for s in &others {
-                acc = self.boolean(&acc, s, op, flat, Some(pos))?;
+                acc = self.boolean(&acc, s, op, Some(pos))?;
             }
         }
-        Ok(Some(if flat { Geom::D2(acc) } else { Geom::D3(acc) }))
+        Ok(Some(Geom::D3(acc)))
     }
 
     fn transform(&mut self, g: Geom, m: &Matrix) -> Geom {
         match g {
             Geom::D3(s) => Geom::D3(self.geo.transformed(&s, m)),
-            Geom::D2(s) => Geom::D2(self.geo.transformed_2d(&s, m)),
+            Geom::D2(r) => Geom::D2(self.geo.transformed_2d(&r, m)),
         }
     }
 
     /// `resize(newsize, auto)`: scaled to the size asked, a 0 kept or, with
     /// `auto`, scaled as the others.
     fn resize(&mut self, g: Geom, a: &Args) -> Geom {
-        let (Geom::D2(s) | Geom::D3(s)) = &g;
-        let Some((lo, hi)) = s.bounds() else {
+        let Some((lo, hi)) = bounds(&g) else {
             return g;
         };
         let want = a
@@ -1496,13 +1517,7 @@ impl Interp {
             p[0] += dx;
             p[1] += dy;
         }
-        match self.geo.polygon(&paths) {
-            Ok(s) => s.map(Geom::D2),
-            Err(e) => {
-                self.note(Some(pos), format!("text: {e}"));
-                None
-            }
-        }
+        self.geo.polygon(&paths).map(Geom::D2)
     }
 
     /// `import(file, layer, convexity, origin, scale, center, dpi, id)`:
@@ -1568,8 +1583,7 @@ impl Interp {
             fn_,
         };
         let centered = |me: &mut Self, g: Geom| {
-            let (Geom::D2(s) | Geom::D3(s)) = &g;
-            let Some((lo, hi)) = s.bounds() else {
+            let Some((lo, hi)) = bounds(&g) else {
                 return g;
             };
             let flat = matches!(g, Geom::D2(_));
@@ -1602,10 +1616,7 @@ impl Interp {
                 };
                 let mut made = Vec::new();
                 for paths in shapes {
-                    match self.geo.polygon(&paths) {
-                        Ok(s) => made.extend(s.map(Geom::D2)),
-                        Err(e) => self.note(Some(pos), format!("import: {name}: {e}")),
-                    }
+                    made.extend(self.geo.polygon(&paths).map(Geom::D2));
                 }
                 match self.union(made, Some(pos)) {
                     Ok(g) => g,
@@ -1617,16 +1628,8 @@ impl Interp {
             }
             "dxf" => {
                 let paths = crate::import::dxf(&String::from_utf8_lossy(&bytes), &o);
-                match self.geo.polygon(&paths) {
-                    Ok(g) => {
-                        let g = g.map(Geom::D2)?;
-                        Some(if center { centered(self, g) } else { g })
-                    }
-                    Err(e) => {
-                        self.note(Some(pos), format!("import: {name}: {e}"));
-                        None
-                    }
-                }
+                let g = self.geo.polygon(&paths).map(Geom::D2)?;
+                Some(if center { centered(self, g) } else { g })
             }
             _ => {
                 self.note(
@@ -1647,7 +1650,7 @@ impl Interp {
         for g in it {
             let sum = match (&acc, &g) {
                 (Geom::D3(a), Geom::D3(b)) => self.geo.minkowski(a, b).map(|s| s.map(Geom::D3)),
-                (Geom::D2(a), Geom::D2(b)) => self.geo.minkowski_2d(a, b).map(|s| s.map(Geom::D2)),
+                (Geom::D2(a), Geom::D2(b)) => Ok(self.geo.minkowski_2d(a, b).map(Geom::D2)),
                 _ => {
                     self.note(Some(pos), "minkowski: 2D and 3D shapes together");
                     continue;
@@ -1670,27 +1673,30 @@ impl Interp {
         f: &Rc<Frame>,
         pos: Pos,
     ) -> R<Option<Geom>> {
-        let slab = match shape {
+        let shape = match shape {
             None => return Ok(None),
             Some(Geom::D3(_)) => {
                 self.note(Some(pos), "offset: needs a 2D shape");
                 return Ok(None);
             }
-            Some(Geom::D2(s)) => s,
+            Some(Geom::D2(r)) => r,
         };
         let (d, join) = match (a.num("r", 0), a.num("delta", usize::MAX)) {
             (Some(r), _) => {
-                let n = self.fragments(a, f, r.abs(), pos);
-                (r, geom::Join::Round(n))
+                // As OpenSCAD: the arc within what a circle of `r` cut into
+                // its pieces deviates.
+                let n = self.fragments(a, f, r.abs(), pos) as f64;
+                (r, flat::Join::Round(r.abs() * (1.0 - cos_deg(180.0 / n))))
             }
-            (None, Some(d)) if a.bool("chamfer", usize::MAX) => (d, geom::Join::Chamfer),
-            (None, Some(d)) => (d, geom::Join::Miter),
-            (None, None) => (1.0, geom::Join::Miter),
+            (None, Some(d)) if a.bool("chamfer", usize::MAX) => (d, flat::Join::Chamfer),
+            (None, Some(d)) => (d, flat::Join::Miter),
+            (None, None) => (1.0, flat::Join::Round(1.0 - cos_deg(180.0 / 5.0))),
         };
-        match self.geo.offset(&slab, d, join) {
-            Ok(s) => Ok(s.map(Geom::D2)),
-            Err(e) => Err(self.error(pos, e)),
+        if d == 0.0 || !d.is_finite() {
+            return Ok(Some(Geom::D2(shape)));
         }
+        let r = flat::offset(&shape, d, join);
+        Ok((!r.is_empty()).then_some(Geom::D2(r)))
     }
 
     fn hull(&mut self, made: Vec<Geom>, pos: Pos) -> Option<Geom> {
@@ -1699,7 +1705,9 @@ impl Interp {
         for g in &made {
             match (g, solid) {
                 (Geom::D3(s), true) => points.extend(&s.points),
-                (Geom::D2(s), false) => points.extend(s.points.iter().filter(|p| p[2] > 0.5)),
+                (Geom::D2(r), false) => {
+                    points.extend(r.loops.iter().flatten().map(|p| [p[0], p[1], 0.0]));
+                }
                 _ => self.note(Some(pos), "hull: 2D and 3D shapes together"),
             }
         }
@@ -1719,17 +1727,18 @@ impl Interp {
         f: &Rc<Frame>,
         pos: Pos,
     ) -> R<Option<Geom>> {
-        let slab = match shape {
+        let shape = match shape {
             None => return Ok(None),
             Some(Geom::D3(_)) => {
                 self.note(Some(pos), format!("{name}: needs a 2D shape"));
                 return Ok(None);
             }
-            Some(Geom::D2(s)) => s,
+            Some(Geom::D2(r)) => r,
         };
-        let far = slab
-            .points
+        let far = shape
+            .loops
             .iter()
+            .flatten()
             .map(|p| p[0].hypot(p[1]))
             .fold(0.0, f64::max);
         if name == "rotate_extrude" {
@@ -1737,10 +1746,15 @@ impl Interp {
             if angle == 0.0 {
                 return Ok(None);
             }
-            let max_x = slab.points.iter().map(|p| p[0].abs()).fold(0.0, f64::max);
+            let max_x = shape
+                .loops
+                .iter()
+                .flatten()
+                .map(|p| p[0].abs())
+                .fold(0.0, f64::max);
             let n = self.fragments(a, f, max_x, pos) as f64 * angle.abs() / 360.0;
             let n = n.ceil().max(1.0) as usize;
-            return match self.geo.rotate_extrude(&slab, angle, n) {
+            return match self.geo.rotate_extrude(&shape, angle, n) {
                 Ok(s) => Ok(s.map(Geom::D3)),
                 Err(e) => {
                     self.note(Some(pos), e);
@@ -1768,7 +1782,7 @@ impl Interp {
         let center = a.bool("center", 1);
         Ok(self
             .geo
-            .linear_extrude(&slab, height, center, twist, slices.min(10_000), scale)
+            .linear_extrude(&shape, height, center, twist, slices.min(10_000), scale)
             .map(Geom::D3))
     }
 
@@ -2178,6 +2192,16 @@ fn read_file(path: &std::path::Path) -> Result<Vec<u8>, String> {
 #[cfg(target_arch = "wasm32")]
 fn read_file(_: &std::path::Path) -> Result<Vec<u8>, String> {
     Err("not read here".to_string())
+}
+
+/// The box of a shape; a 2D one's at z = 0.
+fn bounds(g: &Geom) -> Option<(V3, V3)> {
+    match g {
+        Geom::D3(s) => s.bounds(),
+        Geom::D2(r) => r
+            .bounds()
+            .map(|(lo, hi)| ([lo[0], lo[1], 0.0], [hi[0], hi[1], 0.0])),
+    }
 }
 
 fn is_instance(s: &Stmt) -> bool {

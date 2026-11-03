@@ -12,10 +12,7 @@ fn refused(e: Refused) -> Error {
     Error::Boolean(e.to_string())
 }
 
-/// Manifold's mesh of a solid, what is finer than the kernel's grid of
-/// positions collapsed in results (a splinter between a corner on the grid
-/// and one that a boolean computed next to it, say). Its corners are taken
-/// as they are: parts
+/// Manifold's mesh of a solid. Its corners are taken as they are: parts
 /// that touch along an edge with corners of their own are two parts. Parts
 /// that share the corners of such an edge, which Manifold refuses, are
 /// given corners of their own (and moved apart a hair).
@@ -24,7 +21,7 @@ pub(crate) fn make(s: &Solid) -> Result<Mesh, Error> {
         let points: Vec<f64> = s.points.iter().flatten().copied().collect();
         let tris: Vec<u32> = s.tris.iter().flatten().copied().collect();
         let faces: Vec<u64> = s.facets.iter().map(|&f| u64::from(f)).collect();
-        Mesh::new(&points, &tris, &faces, crate::GRID)
+        Mesh::new(&points, &tris, &faces)
     };
     match of(s) {
         Err(Refused::NotManifold) => match s.parted() {

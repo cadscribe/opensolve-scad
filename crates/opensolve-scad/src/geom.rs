@@ -1,14 +1,15 @@
 //! OpenSCAD's shapes on the mesh kernel. Circles, spheres and cylinders are
 //! cut into as many pieces as OpenSCAD cuts them, at the same places, so a
-//! part comes out as OpenSCAD makes it. A 2D shape is kept as a slab one
-//! unit thick (z from 0 to 1): its booleans are the kernel's, and its top
-//! is the shape.
+//! part comes out as OpenSCAD makes it. A 2D shape is a polygon with holes
+//! until it is extruded, its booleans and offsets Clipper's, as in OpenSCAD
+//! (see [`crate::flat`]).
 
 use std::collections::{HashMap, HashSet};
 
 use opensolve_kernel::{FaceId, Facets, Op, Solid};
 
 use crate::eval::Fx;
+use crate::flat::{self, Region};
 
 pub type V3 = [f64; 3];
 pub type V2 = [f64; 2];
@@ -23,8 +24,8 @@ pub const IDENTITY: Matrix = [
 
 #[derive(Clone, Debug)]
 pub enum Geom {
-    /// A slab from z 0 to 1, its top the shape.
-    D2(Solid),
+    /// A 2D shape.
+    D2(Region),
     D3(Solid),
 }
 
@@ -102,9 +103,59 @@ fn det(m: &Matrix) -> f64 {
 pub struct Builder {
     pub facets: Facets,
     next_face: u64,
+    /// Results of batches by what went in (see [`Builder::batch`]).
+    made: HashMap<(u64, u64), Solid, Fx>,
+    /// Their triangles, all told.
+    made_size: usize,
+}
+
+/// Results kept, at most, in triangles: a few hundred megabytes.
+const MOST_KEPT: usize = 4_000_000;
+
+/// Two hashes of solids' corners and triangles in order, with `op`: as
+/// good as their contents for a key.
+fn content_key(list: &[&Solid], op: Op) -> (u64, u64) {
+    let (mut a, mut b) = (op as u64, 0x9e37_79b9_7f4a_7c15u64 ^ op as u64);
+    let mut add = |x: u64| {
+        a = (a.rotate_left(5) ^ x).wrapping_mul(0x51_7c_c1_b7_27_22_0a_95);
+        b = (b ^ x).wrapping_mul(0x0000_0100_0000_01b3).rotate_left(23);
+    };
+    for s in list {
+        add(s.points.len() as u64);
+        for p in &s.points {
+            for x in p {
+                add(x.to_bits());
+            }
+        }
+        add(s.tris.len() as u64);
+        for t in &s.tris {
+            add(u64::from(t[0]) | u64::from(t[1]) << 21 | u64::from(t[2]) << 42);
+        }
+    }
+    (a, b)
 }
 
 impl Builder {
+    /// [`Solid::batch`] of solids, kept: the same shapes made again (the
+    /// cells of a grid, each the same before it is moved) are joined once,
+    /// as OpenSCAD's cache of geometry does it.
+    pub fn batch(&mut self, list: &[&Solid], op: Op) -> Option<Result<Solid, String>> {
+        let key = content_key(list, op);
+        if let Some(s) = self.made.get(&key) {
+            return Some(Ok(s.clone()));
+        }
+        let made = Solid::batch(list, op, &mut self.facets)?.map_err(|e| e.to_string());
+        if let Ok(s) = &made {
+            if self.made_size + s.tris.len() > MOST_KEPT {
+                self.made.clear();
+                self.made_size = 0;
+            }
+            self.made_size += s.tris.len();
+            self.made.insert(key, s.clone());
+        }
+        Some(made)
+    }
+
     /// A solid from loose triangles, its faces named anew.
     fn solid(&mut self, tris: &[[V3; 3]]) -> Solid {
         let base = self.next_face + 1;
@@ -227,106 +278,20 @@ impl Builder {
         (!s.is_empty()).then_some(s)
     }
 
-    /// A slab of polygons, the even-odd rule deciding what is inside, as in
+    /// A polygon of paths, the even-odd rule deciding what is inside, as in
     /// OpenSCAD's `polygon` with several paths or a path that crosses
-    /// itself.
-    pub fn polygon(&mut self, paths: &[Vec<V2>]) -> Result<Option<Solid>, String> {
+    /// itself; `None` if nothing is inside.
+    pub fn polygon(&mut self, paths: &[Vec<V2>]) -> Option<Region> {
         let paths: Vec<Vec<V2>> = paths
             .iter()
             .map(|p| clean(p))
             .filter(|p| p.len() >= 3)
             .collect();
-        let loops = crate::region::even_odd_loops(&paths);
-        self.loops_slab(&loops)
+        let r = flat::even_odd(&paths);
+        (!r.is_empty()).then_some(r)
     }
 
-    /// The slab of loops that do not cross, each with the inside on its
-    /// left: each outline triangulated with the holes it holds.
-    fn loops_slab(&mut self, loops: &[Vec<V2>]) -> Result<Option<Solid>, String> {
-        let loops: Vec<Vec<V2>> = loops
-            .iter()
-            .map(|l| clean(l))
-            .filter(|l| l.len() >= 3 && area(l).abs() > 1e-18)
-            .collect();
-        let edges: Vec<[V2; 2]> = loops
-            .iter()
-            .flat_map(|l| (0..l.len()).map(move |i| [l[i], l[(i + 1) % l.len()]]))
-            .collect();
-        if let Some(tris) = triangles_of(&loops) {
-            return Ok((!tris.is_empty()).then(|| self.slab(&tris, &edges)));
-        }
-        let (outers, holes): (Vec<&Vec<V2>>, Vec<&Vec<V2>>) =
-            loops.iter().partition(|l| area(l) > 0.0);
-        let mut held: Vec<Vec<Vec<V2>>> = vec![Vec::new(); outers.len()];
-        for h in holes {
-            // A point just inside the hole: right of its first edge.
-            let (a, b) = (h[0], h[1]);
-            let len = (b[0] - a[0]).hypot(b[1] - a[1]).max(1e-300);
-            let off = len * 1e-4;
-            let q = [
-                (a[0] + b[0]) / 2.0 + (b[1] - a[1]) / len * off,
-                (a[1] + b[1]) / 2.0 - (b[0] - a[0]) / len * off,
-            ];
-            let around = (0..outers.len())
-                .filter(|&o| crate::region::contains(outers[o], q))
-                .min_by(|&x, &y| area(outers[x]).total_cmp(&area(outers[y])));
-            if let Some(o) = around {
-                held[o].push(h.clone());
-            }
-        }
-        let mut tris = Vec::new();
-        for (o, outer) in outers.iter().enumerate() {
-            let poly = crate::region::bridge(outer, &held[o]);
-            let ears = ear_clip(&poly).ok_or("polygon: it cannot be cut into triangles")?;
-            tris.extend(ears.iter().map(|t| t.map(|i| poly[i])));
-        }
-        if tris.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(self.slab(&tris, &edges)))
-    }
-
-    /// The slab of one simple polygon, either way round.
-    fn simple_polygon(&mut self, path: &[V2]) -> Result<Option<Solid>, String> {
-        let mut poly = clean(path);
-        if poly.len() < 3 {
-            return Ok(None);
-        }
-        if area(&poly) < 0.0 {
-            poly.reverse();
-        }
-        if area(&poly).abs() < 1e-12 {
-            return Ok(None);
-        }
-        let tris = match triangles_of(std::slice::from_ref(&poly)) {
-            Some(t) => t,
-            None => {
-                let ears = ear_clip(&poly).ok_or("polygon: a path crosses itself")?;
-                ears.iter().map(|t| t.map(|i| poly[i])).collect()
-            }
-        };
-        let edges: Vec<[V2; 2]> = (0..poly.len())
-            .map(|i| [poly[i], poly[(i + 1) % poly.len()]])
-            .collect();
-        Ok(Some(self.slab(&tris, &edges)))
-    }
-
-    /// A slab from its top's triangles and the edges round them.
-    fn slab(&mut self, tris: &[[V2; 3]], edges: &[[V2; 2]]) -> Solid {
-        let mut soup = Vec::new();
-        let at = |p: V2, z: f64| [p[0], p[1], z];
-        for t in tris {
-            soup.push([at(t[0], 0.0), at(t[2], 0.0), at(t[1], 0.0)]);
-            soup.push([at(t[0], 1.0), at(t[1], 1.0), at(t[2], 1.0)]);
-        }
-        for [a, b] in edges {
-            soup.push([at(*a, 0.0), at(*b, 0.0), at(*b, 1.0)]);
-            soup.push([at(*a, 0.0), at(*b, 1.0), at(*a, 1.0)]);
-        }
-        self.solid(&soup)
-    }
-
-    pub fn square(&mut self, size: V2, center: bool) -> Option<Solid> {
+    pub fn square(&mut self, size: V2, center: bool) -> Option<Region> {
         if size.iter().any(|s| *s <= 0.0 || !s.is_finite()) {
             return None;
         }
@@ -336,63 +301,36 @@ impl Builder {
             [0.0; 2]
         };
         let (x0, y0, x1, y1) = (o[0], o[1], o[0] + size[0], o[1] + size[1]);
-        self.simple_polygon(&[[x0, y0], [x1, y0], [x1, y1], [x0, y1]])
-            .ok()
-            .flatten()
+        self.polygon(&[vec![[x0, y0], [x1, y0], [x1, y1], [x0, y1]]])
     }
 
-    pub fn circle(&mut self, r: f64, n: usize) -> Option<Solid> {
+    pub fn circle(&mut self, r: f64, n: usize) -> Option<Region> {
         if r <= 0.0 || !r.is_finite() {
             return None;
         }
-        self.simple_polygon(&circle(r, n)).ok().flatten()
+        self.polygon(&[circle(r, n)])
     }
 
-    /// `a op b`; with `flat`, of two slabs: what is cut away or kept by `b`
-    /// is made taller first, so that no faces lie on each other.
-    pub fn boolean(&mut self, a: &Solid, b: &Solid, op: Op, flat: bool) -> Result<Solid, String> {
-        let b = if flat && op != Op::Add {
-            let tall = [
-                [1.0, 0.0, 0.0, 0.0],
-                [0.0, 1.0, 0.0, 0.0],
-                [0.0, 0.0, 3.0, -1.0],
-            ];
-            self.transformed(b, &tall)
-        } else {
-            b.clone()
-        };
+    /// `a op b`.
+    pub fn boolean(&mut self, a: &Solid, b: &Solid, op: Op) -> Result<Solid, String> {
         // Apart, a union is both as they are.
         if op == Op::Add
             && let (Some(p), Some(q)) = (a.bounds(), b.bounds())
             && (0..3).any(|i| p.1[i] < q.0[i] - 1e-9 || q.1[i] < p.0[i] - 1e-9)
         {
-            return Ok(Solid::merged(&[a.clone(), b]));
+            return Ok(Solid::merged(&[a.clone(), b.clone()]));
         }
-        a.boolean(&b, op, &mut self.facets)
+        a.boolean(b, op, &mut self.facets)
             .map_err(|e| e.to_string())
     }
 
     /// [`Builder::boolean`] of several pairs at once.
-    pub fn booleans(
-        &mut self,
-        pairs: &[(&Solid, &Solid)],
-        op: Op,
-        flat: bool,
-    ) -> Vec<Result<Solid, String>> {
+    pub fn booleans(&mut self, pairs: &[(&Solid, &Solid)], op: Op) -> Vec<Result<Solid, String>> {
         let mut out: Vec<Option<Result<Solid, String>>> = Vec::with_capacity(pairs.len());
         let mut todo: Vec<(Solid, Solid)> = Vec::new();
         let mut at = Vec::new();
         for (i, (a, b)) in pairs.iter().enumerate() {
-            let b = if flat && op != Op::Add {
-                let tall = [
-                    [1.0, 0.0, 0.0, 0.0],
-                    [0.0, 1.0, 0.0, 0.0],
-                    [0.0, 0.0, 3.0, -1.0],
-                ];
-                self.transformed(b, &tall)
-            } else {
-                (*b).clone()
-            };
+            let b = (*b).clone();
             if op == Op::Add
                 && let (Some(p), Some(q)) = (a.bounds(), b.bounds())
                 && (0..3).any(|i| p.1[i] < q.0[i] - 1e-9 || q.1[i] < p.0[i] - 1e-9)
@@ -430,14 +368,9 @@ impl Builder {
         Solid::from_mesh(&mut self.facets, points, tris, &faces)
     }
 
-    /// A slab mapped by the 2D part of `m`; z stays.
-    pub fn transformed_2d(&mut self, s: &Solid, m: &Matrix) -> Solid {
-        let flat = [
-            [m[0][0], m[0][1], 0.0, m[0][3]],
-            [m[1][0], m[1][1], 0.0, m[1][3]],
-            [0.0, 0.0, 1.0, 0.0],
-        ];
-        self.transformed(s, &flat)
+    /// A 2D shape mapped by the 2D part of `m`.
+    pub fn transformed_2d(&mut self, r: &Region, m: &Matrix) -> Region {
+        flat::transformed(r, m)
     }
 
     /// The convex hull of points; `None` if they span no volume.
@@ -446,10 +379,10 @@ impl Builder {
         Some(self.solid(&tris))
     }
 
-    /// The convex hull of points in the plane, as a slab.
-    pub fn hull_2d(&mut self, points: &[V2]) -> Option<Solid> {
+    /// The convex hull of points in the plane.
+    pub fn hull_2d(&mut self, points: &[V2]) -> Option<Region> {
         let h = hull2(points);
-        self.simple_polygon(&h).ok().flatten()
+        self.polygon(&[h])
     }
 
     /// OpenSCAD's `linear_extrude`: the shape at `slices + 1` heights, each
@@ -457,7 +390,7 @@ impl Builder {
     /// turns it) and scaled by its part of `scale`.
     pub fn linear_extrude(
         &mut self,
-        slab: &Solid,
+        shape: &Region,
         height: f64,
         center: bool,
         twist: f64,
@@ -467,10 +400,9 @@ impl Builder {
         if height <= 0.0 || !height.is_finite() {
             return None;
         }
-        let (tris, loops) = region(slab);
-        if tris.is_empty() {
-            return None;
-        }
+        let shape = shape.parted();
+        let tris = cap(&shape)?;
+        let loops = &shape.loops;
         let z0 = if center { -height / 2.0 } else { 0.0 };
         let n = slices.max(1);
         let layer = |k: usize, p: V2| -> V3 {
@@ -489,7 +421,7 @@ impl Builder {
         // Twisted, a side is no plane: split as OpenSCAD splits it, by the
         // way it turns, the other way in holes.
         let turns_back = sin_deg(-twist / n as f64) >= 0.0;
-        for (a, b, ring) in edges_of(&loops) {
+        for (a, b, ring) in edges_of(loops) {
             let hole = area(ring) < 0.0;
             for k in 0..n {
                 let (a0, b0, a1, b1) = (layer(k, a), layer(k, b), layer(k + 1, a), layer(k + 1, b));
@@ -510,14 +442,15 @@ impl Builder {
     /// part of one on +X.
     pub fn rotate_extrude(
         &mut self,
-        slab: &Solid,
+        shape: &Region,
         angle: f64,
         n: usize,
     ) -> Result<Option<Solid>, String> {
-        let (mut tris, mut loops) = region(slab);
-        if tris.is_empty() {
+        let shape = shape.parted();
+        let Some(mut tris) = cap(&shape) else {
             return Ok(None);
-        }
+        };
+        let mut loops = shape.loops;
         let xs = tris.iter().flatten().map(|p| p[0]);
         let (lo, hi) = xs.fold((f64::MAX, f64::MIN), |(l, h), x| (l.min(x), h.max(x)));
         if lo < -1e-9 && hi > 1e-9 {
@@ -733,57 +666,45 @@ fn ear_clip(p: &[V2]) -> Option<Vec<[usize; 3]>> {
     Some(out)
 }
 
-/// A slab's top: its triangles and the outlines round them, outer ones
-/// counter-clockwise and holes clockwise.
-pub fn region(slab: &Solid) -> (Vec<[V2; 3]>, Vec<Vec<V2>>) {
-    let top: Vec<[u32; 3]> = slab
-        .tris
+/// The triangles of a 2D shape, for the caps of an extrusion: Manifold's,
+/// as OpenSCAD triangulates; where there is none (in the browser), each
+/// outline with the holes it holds bridged into one loop and clipped.
+/// `None` if it has none.
+fn cap(r: &Region) -> Option<Vec<[V2; 3]>> {
+    let loops: Vec<Vec<V2>> = r
+        .loops
         .iter()
-        .copied()
-        .filter(|t| {
-            let [a, b, c] = t.map(|i| slab.points[i as usize]);
-            [a, b, c].iter().all(|p| (p[2] - 1.0).abs() < 1e-6)
-                && cross(sub(b, a), sub(c, a))[2] > 0.0
-        })
+        .map(|l| clean(l))
+        .filter(|l| l.len() >= 3 && area(l).abs() > 1e-18)
         .collect();
-    let mut edges: HashSet<(u32, u32)> = HashSet::new();
-    for t in &top {
-        for k in 0..3 {
-            edges.insert((t[k], t[(k + 1) % 3]));
+    if let Some(tris) = triangles_of(&loops) {
+        return (!tris.is_empty()).then_some(tris);
+    }
+    let (outers, holes): (Vec<&Vec<V2>>, Vec<&Vec<V2>>) = loops.iter().partition(|l| area(l) > 0.0);
+    let mut held: Vec<Vec<Vec<V2>>> = vec![Vec::new(); outers.len()];
+    for h in holes {
+        // A point just inside the hole: right of its first edge.
+        let (a, b) = (h[0], h[1]);
+        let len = (b[0] - a[0]).hypot(b[1] - a[1]).max(1e-300);
+        let off = len * 1e-4;
+        let q = [
+            (a[0] + b[0]) / 2.0 + (b[1] - a[1]) / len * off,
+            (a[1] + b[1]) / 2.0 - (b[0] - a[0]) / len * off,
+        ];
+        let around = (0..outers.len())
+            .filter(|&o| crate::region::contains(outers[o], q))
+            .min_by(|&x, &y| area(outers[x]).total_cmp(&area(outers[y])));
+        if let Some(o) = around {
+            held[o].push(h.clone());
         }
     }
-    let flat = |i: u32| {
-        let p = slab.points[i as usize];
-        [p[0], p[1]]
-    };
-    let tris = top.iter().map(|t| t.map(flat)).collect();
-    let mut open: Vec<(u32, u32)> = edges
-        .iter()
-        .filter(|(a, b)| !edges.contains(&(*b, *a)))
-        .copied()
-        .collect();
-    open.sort_unstable();
-    // Chained into loops, each edge once.
-    let mut from: HashMap<u32, Vec<u32>> = HashMap::new();
-    for &(a, b) in open.iter().rev() {
-        from.entry(a).or_default().push(b);
+    let mut tris = Vec::new();
+    for (o, outer) in outers.iter().enumerate() {
+        let poly = crate::region::bridge(outer, &held[o]);
+        let ears = ear_clip(&poly)?;
+        tris.extend(ears.iter().map(|t| t.map(|i| poly[i])));
     }
-    let mut loops = Vec::new();
-    for &(start, _) in &open {
-        while from.get(&start).is_some_and(|v| !v.is_empty()) {
-            let mut ring = vec![start];
-            let mut at = start;
-            while let Some(next) = from.get_mut(&at).and_then(Vec::pop) {
-                if next == start {
-                    break;
-                }
-                ring.push(next);
-                at = next;
-            }
-            loops.push(ring.into_iter().map(flat).collect());
-        }
-    }
-    (tris, loops)
+    (!tris.is_empty()).then_some(tris)
 }
 
 /// The edges of loops, each from a corner to the next, with its loop.
@@ -1075,17 +996,6 @@ fn convex_patches(s: &Solid) -> Vec<Vec<V3>> {
     out
 }
 
-/// How `offset` joins the offset edges at a corner that grows.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Join {
-    /// An arc of so many pieces a whole turn (`r`).
-    Round(usize),
-    /// The edges lengthened until they meet (`delta`).
-    Miter,
-    /// The corner cut off (`delta`, `chamfer = true`).
-    Chamfer,
-}
-
 /// The most convex pieces a `minkowski` of shapes that are not convex is
 /// put together from: each is one boolean more.
 const MOST_PIECES: usize = 20_000;
@@ -1118,8 +1028,8 @@ impl Builder {
 
     /// Several solids as one, joined as [`Builder::union_many`] joins
     /// them; what fails to join is put together as it is.
-    pub fn union_all(&mut self, list: Vec<Solid>, flat: bool) -> Result<Option<Solid>, String> {
-        Ok(self.union_many(list, flat).0)
+    pub fn union_all(&mut self, list: Vec<Solid>) -> Result<Option<Solid>, String> {
+        Ok(self.union_many(list).0)
     }
 
     /// Several solids as one. Those apart from all others (their surfaces
@@ -1127,13 +1037,13 @@ impl Builder {
     /// that meet are joined in pairs, the pairs again and so on, the pairs
     /// of a round at once. A pair that fails to join is put together as it
     /// is, its error returned.
-    pub fn union_many(&mut self, list: Vec<Solid>, flat: bool) -> (Option<Solid>, Vec<String>) {
+    pub fn union_many(&mut self, list: Vec<Solid>) -> (Option<Solid>, Vec<String>) {
         if list.len() <= 1 {
             return (list.into_iter().next(), Vec::new());
         }
         // All at once where the kernel's library can, as OpenSCAD does.
         let refs: Vec<&Solid> = list.iter().collect();
-        if let Some(Ok(s)) = Solid::batch(&refs, Op::Add, &mut self.facets) {
+        if let Some(Ok(s)) = self.batch(&refs, Op::Add) {
             return ((!s.is_empty()).then_some(s), Vec::new());
         }
         let meeting = {
@@ -1171,11 +1081,7 @@ impl Builder {
             for mut list in groups {
                 // The small ones first, as Manifold batches them: a large
                 // mesh is gone through once, at the end, not every round.
-                // Slabs keep their order: joined otherwise, the corners
-                // where two parts of a shape touch can come out pinched.
-                if !flat {
-                    list.sort_by_key(|s| s.tris.len());
-                }
+                list.sort_by_key(|s| s.tris.len());
                 let mut next = Vec::with_capacity(list.len().div_ceil(2));
                 let mut it = list.into_iter();
                 while let Some(a) = it.next() {
@@ -1191,7 +1097,7 @@ impl Builder {
             }
             let pairs: Vec<(&Solid, &Solid)> = jobs.iter().map(|(a, b)| (a, b)).collect();
             let mut made: Vec<Option<Solid>> = self
-                .booleans(&pairs, Op::Add, flat)
+                .booleans(&pairs, Op::Add)
                 .into_iter()
                 .zip(&jobs)
                 .map(|(r, (a, b))| {
@@ -1279,336 +1185,15 @@ impl Builder {
             parts.push(shift(self, big, x));
             parts.push(shift(self, small, y));
         }
-        self.union_all(parts, false)
+        self.union_all(parts)
     }
 
-    /// The Minkowski sum of two slabs, as [`Builder::minkowski`] in the
-    /// plane: of their tops' triangles where they are not convex.
-    pub fn minkowski_2d(&mut self, a: &Solid, b: &Solid) -> Result<Option<Solid>, String> {
-        let flat = |s: &Solid| -> (Vec<[V2; 3]>, Vec<V2>, bool) {
-            let (tris, _) = region(s);
-            let mut seen = HashSet::new();
-            let pts: Vec<V2> = tris
-                .iter()
-                .flatten()
-                .copied()
-                .filter(|p| seen.insert(p.map(f64::to_bits)))
-                .collect();
-            let area: f64 = tris.iter().map(|t| cross2(t[0], t[1], t[2]) / 2.0).sum();
-            let hull = area_of(&hull2(&pts));
-            let convex = (hull - area).abs() <= 1e-9 * hull.max(1.0);
-            (tris, pts, convex)
-        };
-        let (ta, pa, ca) = flat(a);
-        let (tb, pb, cb) = flat(b);
-        let sums = |p: &[V2], q: &[V2]| -> Vec<V2> {
-            p.iter()
-                .flat_map(|x| q.iter().map(move |y| [x[0] + y[0], x[1] + y[1]]))
-                .collect()
-        };
-        if ca && cb {
-            return Ok(self.hull_2d(&sums(&pa, &pb)));
-        }
-        let pieces = |t: &[[V2; 3]], p: &[V2], convex: bool| -> Vec<Vec<V2>> {
-            if convex {
-                vec![p.to_vec()]
-            } else {
-                t.iter().map(|t| t.to_vec()).collect()
-            }
-        };
-        let (pa_pieces, pb_pieces) = (pieces(&ta, &pa, ca), pieces(&tb, &pb, cb));
-        if pa_pieces.len() * pb_pieces.len() > MOST_PIECES {
-            return Err(format!(
-                "minkowski: {} with {} pieces are too many",
-                pa_pieces.len(),
-                pb_pieces.len()
-            ));
-        }
-        let mut parts = Vec::new();
-        for p in &pa_pieces {
-            for q in &pb_pieces {
-                parts.extend(self.hull_2d(&sums(p, q)));
-            }
-        }
-        let shift = |m: &mut Self, s: &Solid, by: V2| {
-            m.transformed_2d(
-                s,
-                &[
-                    [1.0, 0.0, 0.0, by[0]],
-                    [0.0, 1.0, 0.0, by[1]],
-                    [0.0, 0.0, 1.0, 0.0],
-                ],
-            )
-        };
-        if let (Some(&x), Some(&y)) = (pb.first(), pa.first()) {
-            parts.push(shift(self, a, x));
-            parts.push(shift(self, b, y));
-        }
-        self.union_all(parts, true)
+    /// The Minkowski sum of two 2D shapes, as OpenSCAD's (see
+    /// [`flat::minkowski`]).
+    pub fn minkowski_2d(&mut self, a: &Region, b: &Region) -> Option<Region> {
+        let r = flat::minkowski(&[a, b]);
+        (!r.is_empty()).then_some(r)
     }
-
-    /// OpenSCAD's `offset`: the outlines of a slab moved out by `d` (in
-    /// for a negative one), the corners that grow joined by `join`. Out,
-    /// the shape with a strip along each edge and a piece at each corner
-    /// that grows; in, what is left of a box round it so grown, cut away.
-    pub fn offset(&mut self, slab: &Solid, d: f64, join: Join) -> Result<Option<Solid>, String> {
-        if d == 0.0 || !d.is_finite() {
-            return Ok(Some(slab.clone()));
-        }
-        if d > 0.0 {
-            return self.grow(slab, d, join);
-        }
-        let Some((lo, hi)) = slab.bounds() else {
-            return Ok(None);
-        };
-        let m = 2.0 * d.abs() + 1.0;
-        let Some(boxed) = self.square([hi[0] - lo[0] + 2.0 * m, hi[1] - lo[1] + 2.0 * m], false)
-        else {
-            return Ok(None);
-        };
-        let boxed = self.transformed_2d(
-            &boxed,
-            &[
-                [1.0, 0.0, 0.0, lo[0] - m],
-                [0.0, 1.0, 0.0, lo[1] - m],
-                [0.0, 0.0, 1.0, 0.0],
-            ],
-        );
-        let outside = self.boolean(&boxed, slab, Op::Subtract, true)?;
-        let Some(grown) = self.grow(&outside, -d, join)? else {
-            return Ok(Some(slab.clone()));
-        };
-        let left = self.boolean(&boxed, &grown, Op::Subtract, true)?;
-        Ok(Some(left).filter(|s| !s.is_empty()))
-    }
-
-    fn grow(&mut self, slab: &Solid, d: f64, join: Join) -> Result<Option<Solid>, String> {
-        let (_, loops) = region(slab);
-        // Mostly each outline moved out is a simple loop again: the shape
-        // is these loops, without a boolean of many small pieces.
-        let rings: Option<Vec<Option<Vec<V2>>>> = loops
-            .iter()
-            .filter(|l| l.len() >= 3)
-            .map(|l| offset_ring(l, d, join))
-            .collect();
-        if let Some(rings) = rings {
-            let kept: Vec<Vec<V2>> = rings.into_iter().flatten().collect();
-            if !rings_cross(&kept) {
-                return self.polygon(&kept);
-            }
-        }
-        self.grow_by_pieces(&loops, slab, d, join)
-    }
-
-    /// [`Builder::grow`] as the shape with a strip along each edge and a
-    /// piece at each corner that grows, joined: when the outlines moved
-    /// out cross themselves or each other.
-    fn grow_by_pieces(
-        &mut self,
-        loops: &[Vec<V2>],
-        slab: &Solid,
-        d: f64,
-        join: Join,
-    ) -> Result<Option<Solid>, String> {
-        let mut pieces: Vec<Vec<V2>> = Vec::new();
-        let add = |p: V2, n: V2, k: f64| [p[0] + n[0] * k, p[1] + n[1] * k];
-        for l in loops {
-            let n = l.len();
-            if n < 3 {
-                continue;
-            }
-            let normal = |i: usize| edge_normal(l[i], l[(i + 1) % n]);
-            // Each strip reaches a little into the shape and past its
-            // ends: pieces that overlap join well, pieces that only touch
-            // do not always.
-            let eps = 1e-3 * d;
-            for i in 0..n {
-                let (a, b) = (l[i], l[(i + 1) % n]);
-                let nm = normal(i);
-                let e = [-nm[1], nm[0]];
-                let (a, b) = (add(a, e, -eps), add(b, e, eps));
-                pieces.push(vec![
-                    add(a, nm, -eps),
-                    add(b, nm, -eps),
-                    add(b, nm, d),
-                    add(a, nm, d),
-                ]);
-                let b = l[(i + 1) % n];
-                let n2 = normal((i + 1) % n);
-                if let Some(mut corner) = join_points(b, nm, n2, d, join) {
-                    corner.insert(0, b);
-                    pieces.push(corner);
-                }
-            }
-        }
-        let mut parts = vec![slab.clone()];
-        for p in pieces {
-            if let Ok(Some(s)) = self.simple_polygon(&p) {
-                parts.push(s);
-            }
-        }
-        self.union_all(parts, true)
-    }
-}
-
-/// The outward normal of an edge from `a` to `b` of an outline with the
-/// shape on its left.
-fn edge_normal(a: V2, b: V2) -> V2 {
-    let (dx, dy) = (b[0] - a[0], b[1] - a[1]);
-    let len = dx.hypot(dy).max(1e-300);
-    [dy / len, -dx / len]
-}
-
-/// The points that join, at corner `b`, the edge before (normal `n1`) and
-/// the edge after (normal `n2`) moved out by `d`, from the end of the one
-/// to the start of the other; `None` where the corner does not grow.
-fn join_points(b: V2, n1: V2, n2: V2, d: f64, join: Join) -> Option<Vec<V2>> {
-    let add = |p: V2, n: V2, k: f64| [p[0] + n[0] * k, p[1] + n[1] * k];
-    let turn = n1[0] * n2[1] - n1[1] * n2[0];
-    if turn <= 1e-12 {
-        return None;
-    }
-    let (p1, p2) = (add(b, n1, d), add(b, n2, d));
-    Some(match join {
-        // Squared off at `d` from the corner, as Clipper's square join
-        // does it.
-        Join::Chamfer => {
-            let u = [n1[0] + n2[0], n1[1] + n2[1]];
-            let ul = u[0].hypot(u[1]).max(1e-300);
-            let u = [u[0] / ul, u[1] / ul];
-            let e1 = [-n1[1], n1[0]];
-            let along = e1[0] * u[0] + e1[1] * u[1];
-            let s = if along.abs() < 1e-12 {
-                0.0
-            } else {
-                d * (1.0 - (n1[0] * u[0] + n1[1] * u[1])) / along
-            };
-            let e2 = [-n2[1], n2[0]];
-            vec![p1, add(p1, e1, s), add(p2, e2, -s), p2]
-        }
-        Join::Miter => {
-            let k = d / (1.0 + n1[0] * n2[0] + n1[1] * n2[1]);
-            vec![
-                p1,
-                [b[0] + (n1[0] + n2[0]) * k, b[1] + (n1[1] + n2[1]) * k],
-                p2,
-            ]
-        }
-        Join::Round(steps) => {
-            let a1 = n1[1].atan2(n1[0]);
-            let mut a2 = n2[1].atan2(n2[0]);
-            while a2 < a1 {
-                a2 += std::f64::consts::TAU;
-            }
-            let k = ((a2 - a1) / std::f64::consts::TAU * steps.max(3) as f64)
-                .ceil()
-                .max(1.0) as usize;
-            (0..=k)
-                .map(|j| {
-                    let t = a1 + (a2 - a1) * j as f64 / k as f64;
-                    [b[0] + d * t.cos(), b[1] + d * t.sin()]
-                })
-                .collect()
-        }
-    })
-}
-
-/// Where the lines through `p` along `u` and through `q` along `v` meet,
-/// as the parameters along each.
-fn meet(p: V2, u: V2, q: V2, v: V2) -> Option<(f64, f64)> {
-    let den = u[0] * v[1] - u[1] * v[0];
-    if den.abs() < 1e-14 {
-        return None;
-    }
-    let w = [q[0] - p[0], q[1] - p[1]];
-    Some((
-        (w[0] * v[1] - w[1] * v[0]) / den,
-        (w[0] * u[1] - w[1] * u[0]) / den,
-    ))
-}
-
-/// An outline (shape on its left) moved out by `d`, its corners that grow
-/// joined by `join`, those that shrink cut where the moved edges meet:
-/// `Some(None)` if it closes up to nothing, `None` if it is no simple loop
-/// (an edge shorter than what a corner takes of it).
-fn offset_ring(l: &[V2], d: f64, join: Join) -> Option<Option<Vec<V2>>> {
-    let n = l.len();
-    let normals: Vec<V2> = (0..n).map(|i| edge_normal(l[i], l[(i + 1) % n])).collect();
-    let add = |p: V2, nm: V2, k: f64| [p[0] + nm[0] * k, p[1] + nm[1] * k];
-    // Each moved edge as a part of its line, 0 at its start corner and 1
-    // at its end corner, and the points of each corner.
-    let mut part = vec![(0.0f64, 1.0f64); n];
-    let mut corners: Vec<Vec<V2>> = Vec::with_capacity(n);
-    for i in 0..n {
-        let j = (i + 1) % n;
-        let b = l[j];
-        if let Some(pts) = join_points(b, normals[i], normals[j], d, join) {
-            corners.push(pts);
-            continue;
-        }
-        let pi = add(l[i], normals[i], d);
-        let ui = [b[0] - l[i][0], b[1] - l[i][1]];
-        let turn = normals[i][0] * normals[j][1] - normals[i][1] * normals[j][0];
-        if turn.abs() <= 1e-12 {
-            corners.push(vec![add(b, normals[i], d)]);
-            continue;
-        }
-        // A corner that shrinks: the moved edges meet inside.
-        let pj = add(b, normals[j], d);
-        let next = l[(j + 1) % n];
-        let uj = [next[0] - b[0], next[1] - b[1]];
-        let (s, t) = meet(pi, ui, pj, uj)?;
-        part[i].1 = s;
-        part[j].0 = t;
-        corners.push(vec![[pi[0] + ui[0] * s, pi[1] + ui[1] * s]]);
-    }
-    // An edge shorter than its corners take: no simple loop.
-    if part.iter().any(|(s, e)| s > e) {
-        return None;
-    }
-    let ring = clean(&corners.concat());
-    if ring.len() < 3 || ring_crosses(&ring) {
-        return None;
-    }
-    // Turned round: a hole that closed up, or nothing left.
-    if (area(&ring) > 0.0) != (area(l) > 0.0) {
-        return Some(None);
-    }
-    Some(Some(ring))
-}
-
-/// Whether two segments cross or touch, but not at a shared end.
-fn segments_cross(a: V2, b: V2, c: V2, e: V2) -> bool {
-    let d1 = cross2(a, b, c);
-    let d2 = cross2(a, b, e);
-    let d3 = cross2(c, e, a);
-    let d4 = cross2(c, e, b);
-    ((d1 > 0.0 && d2 < 0.0) || (d1 < 0.0 && d2 > 0.0))
-        && ((d3 > 0.0 && d4 < 0.0) || (d3 < 0.0 && d4 > 0.0))
-}
-
-/// Whether a loop crosses itself.
-fn ring_crosses(r: &[V2]) -> bool {
-    let n = r.len();
-    (0..n).any(|i| {
-        let (a, b) = (r[i], r[(i + 1) % n]);
-        (i + 2..n).any(|j| {
-            let k = (j + 1) % n;
-            k != i && segments_cross(a, b, r[j], r[k])
-        })
-    })
-}
-
-/// Whether loops cross each other.
-fn rings_cross(rings: &[Vec<V2>]) -> bool {
-    rings.iter().enumerate().any(|(x, p)| {
-        rings[x + 1..].iter().any(|q| {
-            (0..p.len()).any(|i| {
-                (0..q.len())
-                    .any(|j| segments_cross(p[i], p[(i + 1) % p.len()], q[j], q[(j + 1) % q.len()]))
-            })
-        })
-    })
 }
 
 /// The area of a polygon, either way round.
@@ -1618,9 +1203,10 @@ fn area_of(p: &[V2]) -> f64 {
 
 impl Builder {
     /// OpenSCAD's `projection()`: the shadow of a solid on the xy plane,
-    /// the union of what its faces that look up cover, a patch of them
-    /// that hang together at a time; with `cut`, its section at z = 0.
-    pub fn projection(&mut self, s: &Solid, cut: bool) -> Result<Option<Solid>, String> {
+    /// the union of what its faces that look up cover, by the outlines of
+    /// the patches of them that hang together; with `cut`, its section at
+    /// z = 0.
+    pub fn projection(&mut self, s: &Solid, cut: bool) -> Result<Option<Region>, String> {
         if cut {
             return self.section(s);
         }
@@ -1663,7 +1249,9 @@ impl Builder {
             let p = s.points[i as usize];
             [p[0], p[1]]
         };
-        let mut parts = Vec::new();
+        // Each outline the way round its faces see it: by the non-zero rule,
+        // what any face covers, also where a patch folds over itself.
+        let mut paths: Vec<Vec<V2>> = Vec::new();
         for p in 0..patches {
             // The outline of a patch: its edges not shared within it.
             let edges: Vec<(u32, u32)> = (0..up.len())
@@ -1674,37 +1262,18 @@ impl Builder {
                 })
                 .filter(|&(a, b)| by_edge.get(&(b, a)).is_none_or(|&n| patch[n] != p))
                 .collect();
-            let loops = chain(&edges);
-            let paths: Vec<Vec<V2>> = loops
-                .iter()
-                .map(|l| l.iter().map(|&i| flat(i)).collect())
-                .collect();
-            // A patch that lies over itself (as a face that folds over)
-            // has an outline that covers less: its triangles one by one.
-            let tris: Vec<[V2; 3]> = (0..up.len())
-                .filter(|&j| patch[j] == p)
-                .map(|j| s.tris[up[j]].map(flat))
-                .collect();
-            let covered: f64 = tris.iter().map(|t| cross2(t[0], t[1], t[2]) / 2.0).sum();
-            let slab = self.polygon(&paths).ok().flatten();
-            let filled = slab.as_ref().map_or(0.0, Solid::volume);
-            if let Some(slab) = slab
-                && (covered - filled).abs() <= 1e-6 * covered.max(1.0)
-            {
-                parts.push(slab);
-            } else {
-                for t in tris {
-                    if let Ok(Some(slab)) = self.simple_polygon(&t) {
-                        parts.push(slab);
-                    }
-                }
-            }
+            paths.extend(
+                chain(&edges)
+                    .iter()
+                    .map(|l| l.iter().map(|&i| flat(i)).collect::<Vec<V2>>()),
+            );
         }
-        self.union_all(parts, true)
+        let r = flat::non_zero(&paths);
+        Ok((!r.is_empty()).then_some(r))
     }
 
-    /// The section of a solid at z = 0, as a slab.
-    fn section(&mut self, s: &Solid) -> Result<Option<Solid>, String> {
+    /// The section of a solid at z = 0.
+    fn section(&mut self, s: &Solid) -> Result<Option<Region>, String> {
         // Where an edge crosses the plane, the same point from either
         // triangle: from its lower end.
         let at = |a: V3, b: V3| -> V2 {
@@ -1751,7 +1320,7 @@ impl Builder {
             .iter()
             .map(|l| l.iter().map(|&i| points[i as usize]).collect())
             .collect();
-        self.polygon(&paths)
+        Ok(self.polygon(&paths))
     }
 }
 
@@ -1848,39 +1417,27 @@ mod tests {
         let mut b = Builder::default();
         let outer = vec![[0.0, 0.0], [10.0, 0.0], [10.0, 10.0], [0.0, 10.0]];
         let hole = vec![[2.0, 2.0], [2.0, 4.0], [4.0, 4.0], [4.0, 2.0]];
-        let s = b.polygon(&[outer, hole]).unwrap().unwrap();
-        assert!((s.volume() - 96.0).abs() < 1e-6, "{}", s.volume());
-        let (tris, loops) = region(&s);
+        let r = b.polygon(&[outer, hole]).unwrap();
+        assert!((r.area() - 96.0).abs() < 1e-6, "{}", r.area());
+        assert_eq!(r.loops.len(), 2);
+        let tris = cap(&r).unwrap();
         let a: f64 = tris.iter().map(|t| cross2(t[0], t[1], t[2]) / 2.0).sum();
         assert!((a - 96.0).abs() < 1e-6);
-        assert_eq!(loops.len(), 2);
-        assert!((loops.iter().map(|l| area(l)).sum::<f64>() - 96.0).abs() < 1e-6);
+        let s = b
+            .linear_extrude(&r, 2.0, false, 0.0, 1, [1.0, 1.0])
+            .unwrap();
+        assert!(s.is_closed());
+        assert!((s.volume() - 192.0).abs() < 1e-6, "{}", s.volume());
     }
 
     #[test]
-    fn slabs_unite_cut_and_intersect() {
+    fn the_shadow_of_a_cylinder_is_its_circle() {
         let mut b = Builder::default();
-        let a = b.square([10.0, 10.0], false).unwrap();
-        let c = b.circle(5.0, 16).unwrap();
-        let c = b.transformed_2d(&c, &[[1.0, 0.0, 0.0, 10.0], [0.0, 1.0, 0.0, 5.0], [0.0; 4]]);
-        let disc = 8.0 * 25.0 * (std::f64::consts::TAU / 16.0).sin();
-        let u = b.boolean(&a, &c, Op::Add, true).unwrap();
-        let d = b.boolean(&a, &c, Op::Subtract, true).unwrap();
-        let i = b.boolean(&a, &c, Op::Intersect, true).unwrap();
-        assert!(
-            (u.volume() - (100.0 + disc / 2.0)).abs() < 1e-6,
-            "{}",
-            u.volume()
-        );
-        assert!(
-            (d.volume() - (100.0 - disc / 2.0)).abs() < 1e-6,
-            "{}",
-            d.volume()
-        );
-        assert!((i.volume() - disc / 2.0).abs() < 1e-6, "{}", i.volume());
-        for s in [&u, &d, &i] {
-            let (lo, hi) = s.bounds().unwrap();
-            assert!(lo[2].abs() < 1e-9 && (hi[2] - 1.0).abs() < 1e-9);
-        }
+        let c = b.cylinder(10.0, 5.0, 5.0, false, 12).unwrap();
+        let r = b.projection(&c, false).unwrap().unwrap();
+        let polygon = 12.0 / 2.0 * 25.0 * (std::f64::consts::TAU / 12.0).sin();
+        assert!((r.area() - polygon).abs() < 1e-4, "{}", r.area());
+        let r = b.projection(&c, true).unwrap();
+        assert!(r.is_none());
     }
 }

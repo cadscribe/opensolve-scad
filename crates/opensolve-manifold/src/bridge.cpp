@@ -23,11 +23,9 @@ manifold::OpType op_of(uint8_t op) {
 
 std::unique_ptr<Solid> solid_new(rust::Slice<const double> points,
                                  rust::Slice<const uint32_t> tris,
-                                 rust::Slice<const uint64_t> faces,
-                                 double tolerance) {
+                                 rust::Slice<const uint64_t> faces) {
   manifold::MeshGL64 mesh;
   mesh.numProp = 3;
-  mesh.tolerance = tolerance;
   mesh.vertProperties.assign(points.begin(), points.end());
   mesh.triVerts.assign(tris.begin(), tris.end());
   mesh.faceID.assign(faces.begin(), faces.end());
