@@ -18,7 +18,7 @@ jobs:
         os: [macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # rustup installs the toolchain of rust-toolchain.toml (with clippy,
       # rustfmt and the wasm target) on the first cargo call.
       - name: Toolchain
