@@ -64,23 +64,24 @@ impl Item<'_> {
     }
 }
 
-/// The groups joined, each in rounds of pairs, the small ones first (as
+/// Each group joined, in rounds of pairs, the small ones first (as
 /// Manifold's own batch does it), the pairs of all groups in a round on
-/// threads of their own; then the groups' results put together without a
-/// boolean, which they must be apart for. `None` if nothing is left.
-pub(crate) fn union(groups: &[Vec<&Mesh>]) -> Result<Option<Mesh>, Error> {
+/// threads of their own; the groups' results, those not empty.
+pub(crate) fn union(groups: &[Vec<&Mesh>]) -> Result<Vec<Mesh>, Error> {
     let mut levels: Vec<Vec<Item<'_>>> = groups
         .iter()
         .map(|g| g.iter().map(|m| Item::Given(m)).collect())
         .collect();
     rounds(&mut levels, Op::Add)?;
-    let done: Vec<&Mesh> = levels.iter().flatten().map(Item::get).collect();
-    let m = match done.as_slice() {
-        [] => return Ok(None),
-        [one] => (*one).clone(),
-        _ => Mesh::compose(&done).map_err(refused)?,
-    };
-    Ok((!m.is_empty()).then_some(m))
+    Ok(levels
+        .into_iter()
+        .flatten()
+        .map(|m| match m {
+            Item::Given(m) => m.clone(),
+            Item::Made(m) => m,
+        })
+        .filter(|m| !m.is_empty())
+        .collect())
 }
 
 /// What all hold, in rounds of pairs as [`union`]; `None` if nothing is.

@@ -160,7 +160,7 @@ impl Builder {
     fn solid(&mut self, tris: &[[V3; 3]]) -> Solid {
         let base = self.next_face + 1;
         self.next_face += tris.len() as u64 + 1;
-        Solid::from_triangles_exact(tris, &mut self.facets, |k| FaceId(base + k as u64))
+        Solid::from_triangles(tris, &mut self.facets, |k| FaceId(base + k as u64))
     }
 
     /// Loose triangles turned inside out if they enclose a negative volume.

@@ -51,27 +51,6 @@ impl Solid {
         facets: &mut Facets,
         face: impl Fn(usize) -> FaceId,
     ) -> Solid {
-        Solid::welded(tris, facets, face, snap)
-    }
-
-    /// [`Solid::from_triangles`] with the corners where they are, not on
-    /// the kernel's grid: four corners of a plane stay in one plane, as the
-    /// boolean library has to see them to join its triangles up again
-    /// (OpenSCAD's shapes, which are not snapped either).
-    pub fn from_triangles_exact(
-        tris: &[[[f64; 3]; 3]],
-        facets: &mut Facets,
-        face: impl Fn(usize) -> FaceId,
-    ) -> Solid {
-        Solid::welded(tris, facets, face, |x| x)
-    }
-
-    fn welded(
-        tris: &[[[f64; 3]; 3]],
-        facets: &mut Facets,
-        face: impl Fn(usize) -> FaceId,
-        place: fn(f64) -> f64,
-    ) -> Solid {
         // Welded on a grid finer than a print and coarser than f32 noise.
         let key = |p: [f64; 3]| p.map(|x| (x * 1e5).round() as i64);
         let mut at: HashMap<[i64; 3], u32, Fx> = HashMap::default();
@@ -80,7 +59,7 @@ impl Solid {
         for t in tris {
             let ids = t.map(|p| {
                 *at.entry(key(p)).or_insert_with(|| {
-                    s.points.push(p.map(place));
+                    s.points.push(p.map(snap));
                     s.points.len() as u32 - 1
                 })
             });
@@ -107,9 +86,9 @@ impl Solid {
         s
     }
 
-    /// A solid from its corners and triangles, as
-    /// [`Solid::from_triangles_exact`] makes one from loose triangles, but
-    /// no two corners at one place may be meant as one. Triangles of one plane are one
+    /// A solid from its corners and triangles, as [`Solid::from_triangles`]
+    /// makes one from loose triangles, the corners on the kernel's grid, but
+    /// no two at one place may be meant as one. Triangles of one plane are one
     /// face, named `face(k)` for the k-th plane; those without area are
     /// left out.
     pub fn from_indexed(
@@ -120,7 +99,7 @@ impl Solid {
     ) -> Solid {
         let mut planes: HashMap<([i64; 3], i64), u32, Fx> = HashMap::default();
         let mut s = Solid {
-            points,
+            points: points.into_iter().map(|p| p.map(snap)).collect(),
             ..Solid::default()
         };
         s.tris.reserve(tris.len());

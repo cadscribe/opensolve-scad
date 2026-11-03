@@ -69,7 +69,7 @@ pub(crate) fn boolean(a: &Mesh, b: &Mesh, op: Op) -> Result<Option<Mesh>, Error>
 /// The library takes two solids at a time: a batch goes in pairs.
 pub(crate) const BATCHES: bool = false;
 
-pub(crate) fn union(_: &[Vec<&Mesh>]) -> Result<Option<Mesh>, Error> {
+pub(crate) fn union(_: &[Vec<&Mesh>]) -> Result<Vec<Mesh>, Error> {
     Err(Error::Boolean("no batch booleans".into()))
 }
 

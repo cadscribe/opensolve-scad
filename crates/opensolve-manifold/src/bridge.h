@@ -39,8 +39,6 @@ std::unique_ptr<Batch> batch_new();
 void batch_push(Batch& batch, const Solid& s);
 // The first and the others by `op`, at once.
 std::unique_ptr<Solid> batch_boolean(const Batch& batch, uint8_t op);
-// All as one without a boolean: they must not meet.
-std::unique_ptr<Solid> batch_compose(const Batch& batch);
 
 // The same solid: Manifold shares the mesh.
 std::unique_ptr<Solid> solid_copy(const Solid& s);

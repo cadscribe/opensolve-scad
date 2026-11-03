@@ -22,7 +22,6 @@ mod ffi {
         fn batch_new() -> UniquePtr<Batch>;
         fn batch_push(batch: Pin<&mut Batch>, s: &Solid);
         fn batch_boolean(batch: &Batch, op: u8) -> Result<UniquePtr<Solid>>;
-        fn batch_compose(batch: &Batch) -> Result<UniquePtr<Solid>>;
         fn solid_copy(s: &Solid) -> UniquePtr<Solid>;
         fn solid_num_tri(s: &Solid) -> usize;
         fn solid_bounds(s: &Solid, out: &mut [f64]);
@@ -148,16 +147,6 @@ impl Solid {
             ffi::batch_push(batch.pin_mut(), &s.0);
         }
         checked(ffi::batch_boolean(&batch, op.code()))
-    }
-
-    /// Solids that do not meet as one, without a boolean: a mesh with a
-    /// part for each.
-    pub fn compose(list: &[&Solid]) -> Result<Solid, Error> {
-        let mut batch = ffi::batch_new();
-        for s in list {
-            ffi::batch_push(batch.pin_mut(), &s.0);
-        }
-        checked(ffi::batch_compose(&batch))
     }
 
     pub fn is_empty(&self) -> bool {

@@ -52,26 +52,6 @@ std::unique_ptr<Solid> batch_boolean(const Batch& batch, uint8_t op) {
       Solid{manifold::Manifold::BatchBoolean(batch.list, op_of(op))});
 }
 
-std::unique_ptr<Solid> batch_compose(const Batch& batch) {
-  // Manifold's own Compose is a union by now: the meshes are put together
-  // here, each keeping its corners.
-  manifold::MeshGL64 all;
-  all.numProp = 3;
-  for (const manifold::Manifold& m : batch.list) {
-    const manifold::MeshGL64 mesh = m.GetMeshGL64();
-    const uint64_t base = all.vertProperties.size() / 3;
-    const size_t n = mesh.NumVert();
-    for (size_t v = 0; v < n; ++v) {
-      for (size_t k = 0; k < 3; ++k) {
-        all.vertProperties.push_back(mesh.vertProperties[v * mesh.numProp + k]);
-      }
-    }
-    for (uint64_t i : mesh.triVerts) all.triVerts.push_back(base + i);
-    all.faceID.insert(all.faceID.end(), mesh.faceID.begin(), mesh.faceID.end());
-  }
-  return std::make_unique<Solid>(Solid{manifold::Manifold(all)});
-}
-
 std::unique_ptr<Solid> solid_copy(const Solid& s) {
   return std::make_unique<Solid>(Solid{s.m});
 }

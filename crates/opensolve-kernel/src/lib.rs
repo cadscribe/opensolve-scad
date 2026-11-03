@@ -493,9 +493,10 @@ impl Solid {
     /// A copy mapped by the affine map `m` (three rows of a 4×4 matrix), a
     /// mirror turned round, on facets of its own: each facet's plane mapped,
     /// so that the triangles of a plane stay one facet (and the boolean
-    /// library joins them up again). The corners are mapped as they are,
-    /// not onto the grid, which would bend planes a hair. `None` if the map
-    /// flattens it.
+    /// library joins them up again). The corners stay on the kernel's grid:
+    /// corners meant to meet (a roof on a wall cut to its slope) then meet,
+    /// where the last bits of a turn would part them and the booleans take
+    /// that literally. `None` if the map flattens it.
     pub fn mapped(&self, facets: &mut Facets, m: &[[f64; 4]; 3]) -> Option<Solid> {
         let row = |i: usize| [m[i][0], m[i][1], m[i][2]];
         let det = dot(row(0), cross(row(1), row(2)));
@@ -527,7 +528,7 @@ impl Solid {
             .collect();
         let flip = det < 0.0;
         Some(Solid {
-            points: self.points.iter().map(|p| at(*p)).collect(),
+            points: self.points.iter().map(|p| at(*p).map(snap)).collect(),
             tris: self
                 .tris
                 .iter()
@@ -874,19 +875,41 @@ impl Solid {
             }
             out
         };
-        let done = catch_unwind(AssertUnwindSafe(|| match op {
-            Op::Add => engine::union(&groups(0)),
-            Op::Intersect => engine::intersection(&refs),
-            Op::Subtract => match engine::union(&groups(1))? {
-                Some(cut) => engine::boolean(refs[0], &cut, op),
-                None => Ok(Some(refs[0].clone())),
-            },
-        }))
-        .unwrap_or_else(|_| Err(Error::Boolean("the mesh library panicked".into())));
-        Some(done.map(|m| match m {
-            Some(m) => Solid::from_manifold(m, facets),
-            None => Solid::default(),
-        }))
+        let caught = |e| Error::Boolean(format!("the mesh library panicked ({e:?})"));
+        let joined = |from: usize| {
+            catch_unwind(AssertUnwindSafe(|| engine::union(&groups(from))))
+                .unwrap_or_else(|e| Err(caught(e)))
+        };
+        // The groups' results, apart from each other, as one solid. They
+        // are put together here, not in the library: a mesh of them read
+        // in again came out with parts of a face moved.
+        let together = |parts: Vec<engine::Mesh>, facets: &mut Facets| {
+            let solids: Vec<Solid> = parts
+                .into_iter()
+                .map(|m| Solid::from_manifold(m, facets))
+                .collect();
+            match solids.len() {
+                1 => solids.into_iter().next().unwrap_or_default(),
+                _ => Solid::merged(&solids),
+            }
+        };
+        let done = match op {
+            Op::Add => joined(0).map(|parts| together(parts, facets)),
+            Op::Intersect => catch_unwind(AssertUnwindSafe(|| engine::intersection(&refs)))
+                .unwrap_or_else(|e| Err(caught(e)))
+                .map(|m| m.map_or_else(Solid::default, |m| Solid::from_manifold(m, facets))),
+            Op::Subtract => joined(1).and_then(|mut parts| {
+                let cut = match parts.len() {
+                    0 => return Ok((*keep[0]).clone()),
+                    1 => Arc::new(parts.remove(0)),
+                    _ => together(parts, facets).manifold()?,
+                };
+                catch_unwind(AssertUnwindSafe(|| engine::boolean(refs[0], &cut, op)))
+                    .unwrap_or_else(|e| Err(caught(e)))
+                    .map(|m| m.map_or_else(Solid::default, |m| Solid::from_manifold(m, facets)))
+            }),
+        };
+        Some(done)
     }
 
     fn from_manifold(m: engine::Mesh, facets: &mut Facets) -> Solid {
