@@ -1,0 +1,95 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/opensolve-glyphs",
+    "crates/opensolve-kernel",
+    "crates/opensolve-manifold",
+    "crates/opensolve-scad",
+    "crates/opensolve-scad-lsp",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/cadscribe/opensolve-scad"
+
+# Every external dependency is pinned exactly (`=x.y.z`), was published at
+# least 7 days before it was added, and is listed here only. The pins are
+# OpenSolve's, so that OpenSolve, which uses these crates, builds one copy
+# of each.
+[workspace.dependencies]
+opensolve-glyphs = { path = "crates/opensolve-glyphs", version = "0.1.0" }
+opensolve-kernel = { path = "crates/opensolve-kernel", version = "0.1.0" }
+opensolve-manifold = { path = "crates/opensolve-manifold", version = "0.1.0" }
+opensolve-scad = { path = "crates/opensolve-scad", version = "0.1.0" }
+opensolve-scad-lsp = { path = "crates/opensolve-scad-lsp", version = "0.1.0" }
+
+# Manifold 3.5.2 and oneTBB 2023.1.0 (both Apache-2.0), compiled from their
+# sources for the mesh booleans (opensolve-manifold, ADR 0019): the C++
+# bridge, cxx and cxx-build 1.0.205 (2026-10-11, MIT OR Apache-2.0); for
+# the build only, the sources downloaded and checked by SHA-256: minreq
+# 3.0.0 (2026-06-15, ISC, rustls against the system's trust store, so
+# TLS-inspecting proxies work), flate2 1.1.10 (2026-08-28), tar 0.4.46
+# (2026-05-18), ring 0.17.14 (2025-03-11), and cc 1.9.0 (2026-10-19, MIT OR
+# Apache-2.0) for TBB's own build.
+cxx = "=1.0.205"
+cxx-build = "=1.0.205"
+minreq = { version = "=3.0.0", features = ["https-rustls-probe"] }
+flate2 = "=1.1.10"
+tar = "=0.4.46"
+ring = "=0.17.14"
+cc = "=1.9.0"
+
+# Mesh booleans in the browser (ADR 0003): boolmesh 0.2.1, published
+# 2026-10-11, MPL-2.0, pure Rust. Adds glam 0.32.1 (2026-03-06, MIT OR
+# Apache-2.0). No default features, so no rayon and no bevy; `f64` is its
+# default precision.
+boolmesh = { version = "=0.2.1", default-features = false }
+
+# 2D shapes of OpenSCAD files (opensolve-scad, ADR 0019): clipper2-rust
+# 1.2.0 (2026-09-18, BSL-1.0, by Lars Brubaker), a pure Rust port of
+# Clipper2, the polygon library OpenSCAD's 2D booleans and offsets use; it
+# builds for wasm. Adds num-traits 0.2.19.
+clipper2-rust = { version = "=1.2.0", default-features = false }
+
+# Glyph outlines of TrueType and OpenType fonts (opensolve-glyphs):
+# ttf-parser 0.25.1, published 2024-11-29, MIT OR Apache-2.0, pure Rust
+# without unsafe and without dependencies. No default features: no layout
+# tables, no glyph names, no variable fonts.
+ttf-parser = { version = "=0.25.1", default-features = false, features = ["std"] }
+
+# The language server (ADR 0012), native only: JSON-RPC messages,
+# serde_json 1.0.154; OpenSCAD's syntax by tree-sitter 0.27.1 (2026-10-08,
+# MIT; brings regex without its default features, streaming-iterator and
+# tree-sitter-language) and OpenSCAD's own grammar, tree-sitter-openscad-ng
+# 0.7.1 (2026-03-21, MIT, github.com/openscad/tree-sitter-openscad), both
+# compiled from C by cc.
+serde_json = { version = "=1.0.154", default-features = false, features = ["std"] }
+tree-sitter = "=0.27.1"
+tree-sitter-openscad-ng = "=0.7.1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+float_cmp = "warn"
+
+# The mesh booleans and the kernel optimised also in debug builds and
+# tests: BOSL2's test suite runs in the tests.
+[profile.dev.package.boolmesh]
+opt-level = 3
+
+[profile.dev.package.opensolve-kernel]
+opt-level = 2
+
+# Manifold and TBB (C++, built by its build script at this level) as well.
+[profile.dev.package.opensolve-manifold]
+opt-level = 3
+
+[profile.dev.package.opensolve-scad]
+opt-level = 2

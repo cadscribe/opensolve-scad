@@ -5,6 +5,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
 
 # The booleans: Manifold's C++ where it builds, boolmesh (Rust) in the
 # browser.

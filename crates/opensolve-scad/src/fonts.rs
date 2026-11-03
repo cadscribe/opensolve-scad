@@ -23,6 +23,8 @@ pub struct Face {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Source {
+    /// A file of the machine: there are none in the browser.
+    #[cfg(not(target_arch = "wasm32"))]
     File(PathBuf, u32),
     BuiltIn(&'static [u8]),
 }
@@ -138,6 +140,7 @@ fn load(f: &Face) -> Option<Found> {
             index: 0,
             stand_in: false,
         }),
+        #[cfg(not(target_arch = "wasm32"))]
         Source::File(path, index) => Some(Found {
             data: read(path)?,
             index: *index,
@@ -159,11 +162,6 @@ fn read(path: &Path) -> Option<&'static [u8]> {
             .ok()
             .map(|b| &*Box::leak(b.into_boxed_slice()))
     })
-}
-
-#[cfg(target_arch = "wasm32")]
-fn read(_: &Path) -> Option<&'static [u8]> {
-    None
 }
 
 /// The faces OpenSolve carries.
@@ -325,6 +323,7 @@ pub fn faces_of_file(_: &Path) -> Vec<Face> {
 
 /// The family and style of a name table: the typographic ones (16, 17)
 /// where it has them, else 1 and 2; English Windows names first, then Mac.
+#[cfg(not(target_arch = "wasm32"))]
 fn names(t: &[u8]) -> Option<(String, String)> {
     let u16_at =
         |i: usize| -> Option<u16> { Some(u16::from_be_bytes([*t.get(i)?, *t.get(i + 1)?])) };

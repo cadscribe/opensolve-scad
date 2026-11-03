@@ -1484,13 +1484,19 @@ impl Interp {
         // Each curve in as many chords as OpenSCAD cuts it into: an eighth
         // of the pieces of a circle of the size, plus one, at least two.
         let steps = (self.fragments(a, f, size, pos) / 8 + 1).max(2);
-        let outlines = opensolve_sketch::text::outlines_in_steps(&words, data, index, steps);
+        let outlines = opensolve_glyphs::outlines(
+            &words,
+            data,
+            index,
+            opensolve_glyphs::Chords::Steps(steps),
+            true,
+        );
         if outlines.is_empty() {
             return None;
         }
-        let cap = opensolve_sketch::text::cap_per_em_in(data, index);
+        let cap = opensolve_glyphs::cap_per_em(data, index);
         let k = size / 0.72 * cap;
-        let width = opensolve_sketch::text::width_in(&words, data, index) * k;
+        let width = opensolve_glyphs::width(&words, data, index, true) * k;
         let mut paths: Vec<Vec<V2>> = outlines
             .into_iter()
             .map(|o| {

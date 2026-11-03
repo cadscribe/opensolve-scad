@@ -5,13 +5,14 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+repository.workspace = true
 
 [dependencies]
 opensolve-kernel.workspace = true
 # 2D booleans, offsets and Minkowski sums as OpenSCAD makes them.
 clipper2-rust.workspace = true
 # The letters of text(): glyph outlines of a TrueType font.
-opensolve-sketch.workspace = true
+opensolve-glyphs.workspace = true
 
 [lints]
 workspace = true
