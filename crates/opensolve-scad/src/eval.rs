@@ -2045,6 +2045,20 @@ impl Interp {
             if let Some((def, home)) = self.find_func(f, name) {
                 return self.call_func(&def, &home, args, pos, f);
             }
+            // `is_undef(x)` is how a file asks whether `x` was set, so an
+            // `x` set nowhere is the answer and not a warning, as in OpenSCAD.
+            if &**name == "is_undef"
+                && let [
+                    Arg {
+                        name: None,
+                        value: Some(Expr::Var(n, _)),
+                    },
+                ] = args
+                && f.get(n).is_none()
+                && !n.starts_with('$')
+            {
+                return Ok(Value::Bool(true));
+            }
             if builtins::is_builtin(name) {
                 let a = self.args(args, f)?;
                 return Ok(self.builtin(name, a));

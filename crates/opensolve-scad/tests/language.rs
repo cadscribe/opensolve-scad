@@ -210,6 +210,34 @@ fn an_assertion_stops_with_its_message() {
 }
 
 #[test]
+fn is_undef_of_a_variable_set_nowhere_is_not_a_warning() {
+    // How a file asks whether an including file set something (RuggedBox's
+    // `is_undef(cfg_x) ? 2 : cfg_x`); OpenSCAD says nothing about it.
+    let out = run_with(
+        &[(
+            "main.scad",
+            "w = is_undef(cfg_w) ? 3 : cfg_w;\ncube(w);\necho(is_undef(other), is_undef(w));\nx = cfg_y + 1;",
+        )],
+        &[],
+    )
+    .unwrap();
+    assert!(
+        !out.notes
+            .iter()
+            .any(|n| n.contains("cfg_w") || n.contains("other")),
+        "{:?}",
+        out.notes
+    );
+    assert!(
+        out.notes
+            .iter()
+            .any(|n| n.contains("unknown variable cfg_y")),
+        "{:?}",
+        out.notes
+    );
+}
+
+#[test]
 fn errors_and_notes_say_where() {
     let e = run_with(&[("main.scad", "cube(1);\nsphere(2\n")], &[]).unwrap_err();
     assert!(e.starts_with("line 3, column 1:"), "{e}");
