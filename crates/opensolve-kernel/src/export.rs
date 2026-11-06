@@ -2,9 +2,10 @@
 //! written by hand, in millimetres.
 //!
 //! STEP holds the mesh as a faceted boundary representation (AP214, a
-//! `FACETED_BREP` of one `CLOSED_SHELL`): every planar face of the part is one
-//! face, so a CAD program sees flat faces as flat, and round ones as the
-//! facets they are printed with.
+//! `FACETED_BREP` of a `CLOSED_SHELL` for each piece): the triangles next to
+//! each other in one plane are one `FACE_SURFACE` on its `PLANE`, so a CAD
+//! program sees flat faces as flat, and round ones as the facets they are
+//! printed with.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -359,58 +360,417 @@ fn loops(tris: &[[u32; 3]]) -> Vec<Vec<u32>> {
     out
 }
 
+/// How far a corner may be from a face's plane and still be on it, in
+/// millimetres: the file's own `distance_accuracy_value`.
+const ON_PLANE: f64 = 1e-6;
+
+/// Corners closer than this are one, in millimetres: the file has corners
+/// to the micrometre, and two that it writes at one place would bound an
+/// edge of no length, on which Open CASCADE drops the whole solid. A
+/// triangle less high than this is a sliver, whose own normal says nothing.
+const WELD: f64 = 1e-5;
+
+fn v_dot(a: [f64; 3], b: [f64; 3]) -> f64 {
+    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+}
+
+fn v_sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+}
+
+fn v_cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    ]
+}
+
+fn v_unit(a: [f64; 3]) -> [f64; 3] {
+    let l = v_dot(a, a).sqrt().max(1e-300);
+    a.map(|x| x / l)
+}
+
+/// The mesh as STEP sees it: corners at the same place made one, so that
+/// faces meet at their edges, and each triangle's outward normal (its
+/// facet's plane, where the facet is the triangle's), area and whether it
+/// is a sliver.
+struct Mesh {
+    points: Vec<[f64; 3]>,
+    tris: Vec<[u32; 3]>,
+    normals: Vec<[f64; 3]>,
+    areas: Vec<f64>,
+    slivers: Vec<bool>,
+}
+
+impl Mesh {
+    fn new(solid: &Solid, facets: &Facets) -> Mesh {
+        let cell = |p: [f64; 3]| p.map(|x| (x / WELD).floor() as i64);
+        let mut at: HashMap<[i64; 3], Vec<u32>> = HashMap::new();
+        let mut points: Vec<[f64; 3]> = Vec::new();
+        let same: Vec<u32> = solid
+            .points
+            .iter()
+            .map(|&p| {
+                let c = cell(p);
+                let mut near = None;
+                'look: for dx in -1..=1 {
+                    for dy in -1..=1 {
+                        for dz in -1..=1 {
+                            let k = [c[0] + dx, c[1] + dy, c[2] + dz];
+                            for &i in at.get(&k).map_or(&[][..], Vec::as_slice) {
+                                let d = v_sub(points[i as usize], p);
+                                if v_dot(d, d) <= WELD * WELD {
+                                    near = Some(i);
+                                    break 'look;
+                                }
+                            }
+                        }
+                    }
+                }
+                near.unwrap_or_else(|| {
+                    points.push(p);
+                    let i = points.len() as u32 - 1;
+                    at.entry(c).or_default().push(i);
+                    i
+                })
+            })
+            .collect();
+        let mut tris = Vec::new();
+        let mut normals = Vec::new();
+        let mut areas = Vec::new();
+        let mut slivers = Vec::new();
+        for (k, t) in solid.tris.iter().enumerate() {
+            let t = t.map(|i| same[i as usize]);
+            if t[0] == t[1] || t[1] == t[2] || t[2] == t[0] {
+                continue;
+            }
+            let [a, b, c] = t.map(|i| points[i as usize]);
+            let n = v_cross(v_sub(b, a), v_sub(c, a));
+            let area = v_dot(n, n).sqrt() / 2.0;
+            let longest = [v_sub(b, a), v_sub(c, b), v_sub(a, c)]
+                .map(|e| v_dot(e, e))
+                .into_iter()
+                .fold(0.0, f64::max)
+                .sqrt();
+            let sliver = 2.0 * area < WELD * longest;
+            let own = v_unit(n);
+            // The facet's plane is exact where the corners are rounded; a
+            // facet that does not face the triangle's way is not taken.
+            let normal = solid
+                .facets
+                .get(k)
+                .filter(|&&f| (f as usize) < facets.len())
+                .map(|&f| v_unit(facets.get(f).normal))
+                .filter(|&f| sliver || v_dot(f, own) > 0.0)
+                .unwrap_or(own);
+            tris.push(t);
+            normals.push(normal);
+            areas.push(area);
+            slivers.push(sliver);
+        }
+        Mesh {
+            points,
+            tris,
+            normals,
+            areas,
+            slivers,
+        }
+    }
+
+    fn point(&self, i: u32) -> [f64; 3] {
+        self.points[i as usize]
+    }
+
+    /// The triangles at each edge, either way round.
+    fn edges(&self) -> HashMap<(u32, u32), Vec<usize>> {
+        let mut out: HashMap<(u32, u32), Vec<usize>> = HashMap::new();
+        for (k, t) in self.tris.iter().enumerate() {
+            for e in 0..3 {
+                let (a, b) = (t[e], t[(e + 1) % 3]);
+                out.entry((a.min(b), a.max(b))).or_default().push(k);
+            }
+        }
+        out
+    }
+
+    /// Six times the volume the triangles close.
+    fn volume6(&self, tris: &[usize]) -> f64 {
+        tris.iter()
+            .map(|&k| {
+                let [a, b, c] = self.tris[k].map(|i| self.point(i));
+                v_dot(a, v_cross(b, c))
+            })
+            .sum()
+    }
+
+    /// Whether `p` is inside the closed triangles: the crossings of a ray
+    /// from it, in a direction no mesh of a CAD program lines up with.
+    fn contains(&self, tris: &[usize], p: [f64; 3]) -> bool {
+        let d = v_unit([0.577_215_664_9, 0.618_033_988_7, 0.533_049_088_1]);
+        let mut inside = false;
+        for &k in tris {
+            let [a, b, c] = self.tris[k].map(|i| self.point(i));
+            // Möller-Trumbore.
+            let (e1, e2) = (v_sub(b, a), v_sub(c, a));
+            let h = v_cross(d, e2);
+            let det = v_dot(e1, h);
+            if det.abs() < 1e-18 {
+                continue;
+            }
+            let s = v_sub(p, a);
+            let u = v_dot(s, h) / det;
+            let q = v_cross(s, e1);
+            let v = v_dot(d, q) / det;
+            if u < 0.0 || v < 0.0 || u + v > 1.0 {
+                continue;
+            }
+            if v_dot(e2, q) / det > 0.0 {
+                inside = !inside;
+            }
+        }
+        inside
+    }
+}
+
+/// The pieces of the mesh that hang together by their edges, in the order
+/// of their first triangles. Only an edge of two triangles holds: solids
+/// that touch along an edge are pieces of their own, each closed.
+fn pieces(mesh: &Mesh, edges: &HashMap<(u32, u32), Vec<usize>>) -> Vec<Vec<usize>> {
+    let mut seen = vec![false; mesh.tris.len()];
+    let mut out = Vec::new();
+    for s in 0..mesh.tris.len() {
+        if seen[s] {
+            continue;
+        }
+        seen[s] = true;
+        let mut piece = vec![s];
+        let mut i = 0;
+        while i < piece.len() {
+            let t = mesh.tris[piece[i]];
+            i += 1;
+            for e in 0..3 {
+                let (a, b) = (t[e], t[(e + 1) % 3]);
+                let by = &edges[&(a.min(b), a.max(b))];
+                if by.len() != 2 {
+                    continue;
+                }
+                for &n in by {
+                    if !seen[n] {
+                        seen[n] = true;
+                        piece.push(n);
+                    }
+                }
+            }
+        }
+        piece.sort_unstable();
+        out.push(piece);
+    }
+    out
+}
+
+/// The faces of a piece: triangles next to each other in one plane made
+/// one, each face its plane's normal and its loops, the outer one first.
+/// `flip` turns the piece inside out, as a void's shell is written.
+fn faces_of(
+    mesh: &Mesh,
+    edges: &HashMap<(u32, u32), Vec<usize>>,
+    piece: &[usize],
+    flip: bool,
+) -> Vec<([f64; 3], Vec<Vec<u32>>)> {
+    // The largest triangles first: a face's plane is its largest one's.
+    let mut order = piece.to_vec();
+    order.sort_by(|&a, &b| mesh.areas[b].total_cmp(&mesh.areas[a]).then(a.cmp(&b)));
+    let mut taken: HashMap<usize, bool> = piece.iter().map(|&k| (k, false)).collect();
+    let mut out = Vec::new();
+    for s in order {
+        if taken[&s] {
+            continue;
+        }
+        taken.insert(s, true);
+        let n = mesh.normals[s];
+        let d = v_dot(n, mesh.point(mesh.tris[s][0]));
+        let mut face = vec![s];
+        let mut i = 0;
+        while i < face.len() {
+            let t = mesh.tris[face[i]];
+            i += 1;
+            for e in 0..3 {
+                let (a, b) = (t[e], t[(e + 1) % 3]);
+                for &u in &edges[&(a.min(b), a.max(b))] {
+                    if taken.get(&u) != Some(&false) {
+                        continue;
+                    }
+                    // A sliver goes with the face it lies on, whichever way
+                    // it seems to face.
+                    let sliver = mesh.slivers[u];
+                    let near = if sliver { WELD } else { ON_PLANE };
+                    let flat = (sliver || v_dot(mesh.normals[u], n) > 0.0)
+                        && mesh.tris[u]
+                            .iter()
+                            .all(|&c| (v_dot(n, mesh.point(c)) - d).abs() <= near);
+                    if flat {
+                        taken.insert(u, true);
+                        face.push(u);
+                    }
+                }
+            }
+        }
+        let tris: Vec<[u32; 3]> = face
+            .iter()
+            .map(|&k| {
+                let [a, b, c] = mesh.tris[k];
+                if flip { [a, c, b] } else { [a, b, c] }
+            })
+            .collect();
+        let normal = if flip { n.map(|x| -x) } else { n };
+        // The outer loop is the one round the most area.
+        let area = |ring: &Vec<u32>| {
+            let mut sum = [0.0; 3];
+            for (j, &p) in ring.iter().enumerate() {
+                let q = ring[(j + 1) % ring.len()];
+                let c = v_cross(mesh.point(p), mesh.point(q));
+                sum = [sum[0] + c[0], sum[1] + c[1], sum[2] + c[2]];
+            }
+            v_dot(sum, normal)
+        };
+        let mut rings = loops(&tris);
+        if rings.is_empty() {
+            continue;
+        }
+        let outer = (0..rings.len())
+            .max_by(|&a, &b| area(&rings[a]).total_cmp(&area(&rings[b])))
+            .unwrap_or(0);
+        rings.swap(0, outer);
+        out.push((normal, rings));
+    }
+    out
+}
+
 /// The solid as STEP (ISO 10303-21, AP214): a faceted boundary
-/// representation, one face per facet of the part with its outer loop and holes.
+/// representation. Each face is a `FACE_SURFACE` on its `PLANE`, bounded by
+/// `POLY_LOOP`s, as the standard wants a faceted B-rep's faces: a bare `FACE`
+/// has no surface, and importers (Open CASCADE's, so FreeCAD's) read none of
+/// it. The triangles of the mesh next to each other in one plane are one
+/// face. Each piece of the solid is a `FACETED_BREP` of its own, a void
+/// inside one a shell of its `BREP_WITH_VOIDS`.
 pub fn step(solid: &Solid, facets: &Facets, name: &str) -> String {
     let mut lines: Vec<String> = Vec::new();
     let mut add = |l: String| {
         lines.push(l);
         lines.len()
     };
-    let mut points = HashMap::new();
-    let mut point = |i: u32, add: &mut dyn FnMut(String) -> usize| -> usize {
-        *points.entry(i).or_insert_with(|| {
-            let p = solid.points[i as usize];
-            add(format!(
-                "CARTESIAN_POINT('',({:.6},{:.6},{:.6}))",
-                p[0], p[1], p[2]
-            ))
-        })
-    };
-    // Triangles grouped by the plane they lie in.
-    let mut by_facet: BTreeMap<u32, Vec<[u32; 3]>> = BTreeMap::new();
-    for (t, &f) in solid.tris.iter().zip(&solid.facets) {
-        by_facet.entry(f).or_default().push(*t);
-    }
-    let mut faces = Vec::new();
-    for tris in by_facet.values() {
-        let mut bounds = Vec::new();
-        for (k, ring) in loops(tris).into_iter().enumerate() {
-            let ids: Vec<String> = ring
-                .iter()
-                .map(|&i| format!("#{}", point(i, &mut add)))
-                .collect();
-            let poly = add(format!("POLY_LOOP('',({}))", ids.join(",")));
-            let kind = if k == 0 {
-                "FACE_OUTER_BOUND"
+    let mesh = Mesh::new(solid, facets);
+    let edges = mesh.edges();
+    let mut points: HashMap<u32, usize> = HashMap::new();
+    let mut shell = |piece: &[usize], flip: bool, add: &mut dyn FnMut(String) -> usize| {
+        let mut faces = Vec::new();
+        for (normal, rings) in faces_of(&mesh, &edges, piece, flip) {
+            let mut bounds = Vec::new();
+            for (k, ring) in rings.iter().enumerate() {
+                let ids: Vec<String> = ring
+                    .iter()
+                    .map(|&i| {
+                        let id = *points.entry(i).or_insert_with(|| {
+                            let p = mesh.point(i);
+                            add(format!(
+                                "CARTESIAN_POINT('',({:.6},{:.6},{:.6}))",
+                                p[0], p[1], p[2]
+                            ))
+                        });
+                        format!("#{id}")
+                    })
+                    .collect();
+                let poly = add(format!("POLY_LOOP('',({}))", ids.join(",")));
+                let kind = if k == 0 {
+                    "FACE_OUTER_BOUND"
+                } else {
+                    "FACE_BOUND"
+                };
+                bounds.push(format!("#{}", add(format!("{kind}('',#{poly},.T.)"))));
+            }
+            // The plane through the outer loop's first corner, its z the
+            // face's normal, its x any direction in it.
+            let at = mesh.point(rings[0][0]);
+            let other = if normal[0].abs() < 0.9 {
+                [1.0, 0.0, 0.0]
             } else {
-                "FACE_BOUND"
+                [0.0, 1.0, 0.0]
             };
-            bounds.push(add(format!("{kind}('',#{poly},.T.)")));
+            let x = v_unit(v_cross(other, normal));
+            let origin = add(format!(
+                "CARTESIAN_POINT('',({:.6},{:.6},{:.6}))",
+                at[0], at[1], at[2]
+            ));
+            let z = add(format!(
+                "DIRECTION('',({:.12},{:.12},{:.12}))",
+                normal[0], normal[1], normal[2]
+            ));
+            let x = add(format!(
+                "DIRECTION('',({:.12},{:.12},{:.12}))",
+                x[0], x[1], x[2]
+            ));
+            let axis = add(format!("AXIS2_PLACEMENT_3D('',#{origin},#{z},#{x})"));
+            let plane = add(format!("PLANE('',#{axis})"));
+            faces.push(format!(
+                "#{}",
+                add(format!(
+                    "FACE_SURFACE('',({}),#{plane},.T.)",
+                    bounds.join(",")
+                ))
+            ));
         }
-        if bounds.is_empty() {
+        add(format!("CLOSED_SHELL('',({}))", faces.join(",")))
+    };
+    // Pieces closing a volume are solids; the others, inside out, voids in
+    // the smallest solid round them (or solids of their own, turned).
+    let all = pieces(&mesh, &edges);
+    let volumes: Vec<f64> = all.iter().map(|p| mesh.volume6(p)).collect();
+    let mut voids: Vec<Vec<usize>> = vec![Vec::new(); all.len()];
+    let mut solids = Vec::new();
+    for (k, piece) in all.iter().enumerate() {
+        // A sheet of no thickness, faces back to back, is no solid.
+        if volumes[k].abs() < 1e-9 {
             continue;
         }
-        let list: Vec<String> = bounds.iter().map(|b| format!("#{b}")).collect();
-        faces.push(add(format!("FACE('',({}))", list.join(","))));
+        if volumes[k] >= 0.0 {
+            solids.push(k);
+            continue;
+        }
+        let p = mesh.point(mesh.tris[piece[0]][0]);
+        let round = (0..all.len())
+            .filter(|&o| volumes[o] > -volumes[k] && mesh.contains(&all[o], p))
+            .min_by(|&a, &b| volumes[a].total_cmp(&volumes[b]));
+        match round {
+            Some(o) => voids[o].push(k),
+            None => solids.push(k),
+        }
     }
-    let _ = facets;
-    let face_list: Vec<String> = faces.iter().map(|f| format!("#{f}")).collect();
-    let shell = add(format!("CLOSED_SHELL('',({}))", face_list.join(",")));
-    let brep = add(format!(
-        "FACETED_BREP('{}',#{shell})",
-        name.replace('\'', "")
-    ));
+    solids.sort_unstable();
+    let label = name.replace('\'', "");
+    let mut breps = Vec::new();
+    let voided = voids.iter().any(|v| !v.is_empty());
+    for k in solids {
+        let outer = shell(&all[k], volumes[k] < 0.0, &mut add);
+        let brep = if voids[k].is_empty() {
+            add(format!("FACETED_BREP('{label}',#{outer})"))
+        } else {
+            let inner: Vec<String> = voids[k]
+                .iter()
+                .map(|&v| {
+                    let s = shell(&all[v], true, &mut add);
+                    format!("#{}", add(format!("ORIENTED_CLOSED_SHELL('',*,#{s},.F.)")))
+                })
+                .collect();
+            // Open CASCADE reads the void of a plain BREP_WITH_VOIDS, and
+            // not of one made a FACETED_BREP as well.
+            add(format!(
+                "BREP_WITH_VOIDS('{label}',#{outer},({}))",
+                inner.join(",")
+            ))
+        };
+        breps.push(format!("#{brep}"));
+    }
     let origin = add("CARTESIAN_POINT('',(0.,0.,0.))".into());
     let z = add("DIRECTION('',(0.,0.,1.))".into());
     let x = add("DIRECTION('',(1.,0.,0.))".into());
@@ -443,9 +803,14 @@ pub fn step(solid: &Solid, facets: &Facets, name: &str) -> String {
         "PRODUCT_DEFINITION('design','',#{formation},#{dctx})"
     ));
     let shape = add(format!("PRODUCT_DEFINITION_SHAPE('','',#{def})"));
-    let rep = add(format!(
-        "FACETED_BREP_SHAPE_REPRESENTATION('',(#{axis},#{brep}),#{ctx})"
-    ));
+    // A faceted B-rep's representation holds faceted B-reps only; with a
+    // void it is a shape's.
+    let kind = if voided {
+        "SHAPE_REPRESENTATION"
+    } else {
+        "FACETED_BREP_SHAPE_REPRESENTATION"
+    };
+    let rep = add(format!("{kind}('',(#{axis},{}),#{ctx})", breps.join(",")));
     add(format!("SHAPE_DEFINITION_REPRESENTATION(#{shape},#{rep})"));
     let mut out =
         String::from("ISO-10303-21;\nHEADER;\nFILE_DESCRIPTION(('OpenSolve part'),'2;1');\n");
@@ -576,10 +941,92 @@ mod tests {
         let (s, f) = holed_block();
         let t = step(&s, &f, "block");
         assert!(t.starts_with("ISO-10303-21;") && t.trim_end().ends_with("END-ISO-10303-21;"));
-        // 4 sides, 4 hole walls, top and bottom: 10 faces; top and bottom
-        // have a hole.
-        assert_eq!(t.matches("=FACE(").count(), 10, "{t}");
+        // 4 sides, 4 hole walls, top and bottom: 10 faces, each on a plane;
+        // top and bottom have a hole.
+        assert_eq!(t.matches("=FACE_SURFACE(").count(), 10, "{t}");
+        assert_eq!(t.matches("=PLANE(").count(), 10);
+        assert!(!t.contains("=FACE("));
         assert_eq!(t.matches("=FACE_BOUND(").count(), 2);
         assert_eq!(t.matches("CLOSED_SHELL").count(), 1);
+        assert_eq!(t.matches("=FACETED_BREP(").count(), 1);
+        assert!(t.contains("=FACETED_BREP_SHAPE_REPRESENTATION("));
+        // A corner is written once, however many faces it is on.
+        assert_eq!(t.matches("CARTESIAN_POINT").count(), 16 + 10 + 1);
+    }
+
+    /// A cube of `size` at `at` from triangles of their own planes, as a
+    /// mesh read from a file is; inside out with `inward`.
+    fn mesh_cube(f: &mut Facets, at: [f64; 3], size: f64, inward: bool) -> Solid {
+        let points: Vec<[f64; 3]> = (0..8)
+            .map(|i| {
+                let c = |b: usize| at[b] + if i >> b & 1 == 1 { size } else { 0.0 };
+                [c(0), c(1), c(2)]
+            })
+            .collect();
+        let quads = [
+            [0, 2, 3, 1],
+            [4, 5, 7, 6],
+            [0, 1, 5, 4],
+            [2, 6, 7, 3],
+            [0, 4, 6, 2],
+            [1, 3, 7, 5],
+        ];
+        let mut tris = Vec::new();
+        for [a, b, c, d] in quads {
+            tris.push([a, b, c]);
+            tris.push([a, c, d]);
+        }
+        if inward {
+            for t in &mut tris {
+                t.swap(1, 2);
+            }
+        }
+        let faces = vec![FaceId(0); tris.len()];
+        Solid::from_mesh(f, points, tris, &faces)
+    }
+
+    fn joined(parts: &[Solid]) -> Solid {
+        let mut s = Solid::default();
+        for p in parts {
+            let base = s.points.len() as u32;
+            s.points.extend(&p.points);
+            s.tris.extend(p.tris.iter().map(|t| t.map(|i| i + base)));
+            s.facets.extend(&p.facets);
+        }
+        s
+    }
+
+    #[test]
+    fn step_makes_a_meshs_triangles_in_one_plane_one_face() {
+        let mut f = Facets::default();
+        let s = mesh_cube(&mut f, [0.0; 3], 10.0, false);
+        assert_eq!(
+            s.facets
+                .iter()
+                .collect::<std::collections::HashSet<_>>()
+                .len(),
+            12
+        );
+        let t = step(&s, &f, "cube");
+        assert_eq!(t.matches("=FACE_SURFACE(").count(), 6, "{t}");
+        assert_eq!(t.matches("=POLY_LOOP(").count(), 6);
+        assert_eq!(t.matches("=FACE_BOUND(").count(), 0);
+        // The top's plane faces up.
+        assert!(t.contains("DIRECTION('',(0.000000000000,0.000000000000,1.000000000000))"));
+    }
+
+    #[test]
+    fn step_writes_each_piece_and_a_void_in_one() {
+        let mut f = Facets::default();
+        let outer = mesh_cube(&mut f, [0.0; 3], 10.0, false);
+        let void = mesh_cube(&mut f, [3.0; 3], 4.0, true);
+        let apart = mesh_cube(&mut f, [20.0, 0.0, 0.0], 5.0, false);
+        let t = step(&joined(&[outer, void, apart]), &f, "pieces");
+        assert_eq!(t.matches("=CLOSED_SHELL(").count(), 3, "{t}");
+        assert_eq!(t.matches("=FACETED_BREP(").count(), 1);
+        assert_eq!(t.matches("=BREP_WITH_VOIDS(").count(), 1);
+        assert_eq!(t.matches("=ORIENTED_CLOSED_SHELL('',*,").count(), 1);
+        assert!(t.contains("=SHAPE_REPRESENTATION("));
+        assert_eq!(t.matches("=FACE_SURFACE(").count(), 18);
     }
 }
