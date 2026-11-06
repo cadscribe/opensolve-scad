@@ -27,6 +27,10 @@ use std::path::{Component, Path, PathBuf};
 use opensolve_kernel::{Facets, Solid};
 
 pub use customizer::{Choices, Kind, Param, parameters};
+
+/// This crate's version, as its release is tagged (`v` and this): the same
+/// for all crates of the workspace.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub use opensolve_kernel::Stop;
 pub use paint::{Rgba, text as rgba_text};
 

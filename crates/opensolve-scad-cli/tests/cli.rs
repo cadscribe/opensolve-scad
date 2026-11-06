@@ -261,6 +261,19 @@ fn errors_warnings_and_usage() {
 }
 
 #[test]
+fn the_version_is_the_crates() {
+    let d = dir("version");
+    for flag in ["--version", "-v"] {
+        let o = run(&d, &[flag]);
+        ok(&o);
+        let line = format!("opensolve-scad {}\n", opensolve_scad::VERSION);
+        assert_eq!(String::from_utf8_lossy(&o.stdout), line);
+    }
+    assert_eq!(opensolve_scad::VERSION, env!("CARGO_PKG_VERSION"));
+    assert_eq!(opensolve_kernel::VERSION, opensolve_scad::VERSION);
+}
+
+#[test]
 fn more_outputs_and_dependencies() {
     let d = dir("deps");
     std::fs::write(d.join("lib.scad"), "module part() cube(3);").unwrap();

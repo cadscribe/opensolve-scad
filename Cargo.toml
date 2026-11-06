@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.4"
 edition = "2024"
 rust-version = "1.95"
 license = "MIT OR Apache-2.0"
@@ -21,11 +21,11 @@ repository = "https://github.com/cadscribe/opensolve-scad"
 # OpenSolve's, so that OpenSolve, which uses these crates, builds one copy
 # of each.
 [workspace.dependencies]
-opensolve-glyphs = { path = "crates/opensolve-glyphs", version = "0.1.0" }
-opensolve-kernel = { path = "crates/opensolve-kernel", version = "0.1.0" }
-opensolve-manifold = { path = "crates/opensolve-manifold", version = "0.1.0" }
-opensolve-scad = { path = "crates/opensolve-scad", version = "0.1.0" }
-opensolve-scad-lsp = { path = "crates/opensolve-scad-lsp", version = "0.1.0" }
+opensolve-glyphs = { path = "crates/opensolve-glyphs", version = "0.1.4" }
+opensolve-kernel = { path = "crates/opensolve-kernel", version = "0.1.4" }
+opensolve-manifold = { path = "crates/opensolve-manifold", version = "0.1.4" }
+opensolve-scad = { path = "crates/opensolve-scad", version = "0.1.4" }
+opensolve-scad-lsp = { path = "crates/opensolve-scad-lsp", version = "0.1.4" }
 
 # Manifold 3.5.2 and oneTBB 2023.1.0 (both Apache-2.0), compiled from their
 # sources for the mesh booleans (opensolve-manifold, ADR 0019): the C++

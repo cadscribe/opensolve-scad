@@ -37,7 +37,7 @@ fails. Details in [ADR 0019](docs/adr/0019-manifold-and-clipper.md).
 ## Command line
 
 ```sh
-cargo install --git https://github.com/cadscribe/opensolve-scad --tag v0.1.0 opensolve-scad-cli
+cargo install --git https://github.com/cadscribe/opensolve-scad --tag v0.1.4 opensolve-scad-cli
 
 opensolve-scad -o part.stl part.scad
 opensolve-scad -o part.3mf -D 'width=40' -D 'label="A"' part.scad
@@ -69,7 +69,7 @@ work as with OpenSCAD.
 ## Language server
 
 ```sh
-cargo install --git https://github.com/cadscribe/opensolve-scad --tag v0.1.0 opensolve-scad-lsp
+cargo install --git https://github.com/cadscribe/opensolve-scad --tag v0.1.4 opensolve-scad-lsp
 ```
 
 `opensolve-scad-lsp` speaks the Language Server Protocol on stdin and
@@ -93,7 +93,7 @@ language-servers = ["opensolve-scad-lsp"]
 
 ```toml
 [dependencies]
-opensolve-scad = { git = "https://github.com/cadscribe/opensolve-scad", tag = "v0.1.0" }
+opensolve-scad = { git = "https://github.com/cadscribe/opensolve-scad", tag = "v0.1.4" }
 ```
 
 ```rust

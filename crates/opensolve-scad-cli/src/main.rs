@@ -95,7 +95,7 @@ fn options(args: impl IntoIterator<Item = String>) -> Result<Option<Options>, Fa
                 return Ok(None);
             }
             "-v" | "--version" => {
-                println!("opensolve-scad {}", env!("CARGO_PKG_VERSION"));
+                println!("opensolve-scad {}", opensolve_scad::VERSION);
                 return Ok(None);
             }
             "-o" | "--o" | "--output" => o.outputs.push(value("-o")?),

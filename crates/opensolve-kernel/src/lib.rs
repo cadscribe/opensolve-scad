@@ -37,6 +37,10 @@ pub use stl::read_stl;
 
 pub use triangulate::triangulate;
 
+/// This crate's version, as its release is tagged (`v` and this): the same
+/// for all crates of the workspace.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// Triangles of loops in the plane: outlines counter-clockwise, holes
 /// clockwise, any of them nested; corners numbered through all loops in
 /// order. Manifold's triangulator (the sharpest ears first, robust on
