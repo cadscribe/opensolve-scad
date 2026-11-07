@@ -190,6 +190,25 @@ fn three_mf_keeps_the_colours() {
 }
 
 #[test]
+fn the_cache_tells_what_it_did() {
+    let d = dir("cache");
+    std::fs::write(d.join("m.scad"), MODEL).unwrap();
+    let o = run(&d, &["--cache-stats", "-o", "m.3mf", "m.scad"]);
+    ok(&o);
+    let line = stderr(&o)
+        .lines()
+        .find(|l| l.starts_with("cache: "))
+        .map(str::to_string)
+        .unwrap_or_default();
+    // The whole and the three colours: four runs.
+    assert!(line.contains("4 runs"), "{line}");
+    assert!(line.contains(" hits, "), "{line}");
+    let o = run(&d, &["-o", "m.stl", "m.scad"]);
+    ok(&o);
+    assert!(!stderr(&o).contains("cache: "));
+}
+
+#[test]
 fn a_colour_cut_by_a_shape_of_none() {
     let d = dir("cut");
     std::fs::write(

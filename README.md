@@ -48,7 +48,9 @@ It takes the options of `openscad` that scripts use: `-o` (more than one
 writes each), `-D name=value` (or any statement, such as a module that
 replaces `color`), `--export-format`, `-q`, `--hardwarnings`, `-d` (make
 dependencies) and `--preview`; `--render`, `--backend` and `--enable` are
-taken and ignored. Formats: `stl` (ASCII, as OpenSCAD writes it), `binstl`,
+taken and ignored. `--cache-stats` writes to stderr what the cache of
+results did (see below; the runs of one call, the whole model and each
+colour, share one). Formats: `stl` (ASCII, as OpenSCAD writes it), `binstl`,
 `off`, `obj`, `3mf`, `step`, `csg`, and for 2D shapes `svg` and `dxf`;
 `echo` writes the echoes.
 
@@ -76,7 +78,9 @@ cargo install --git https://github.com/cadscribe/opensolve-scad --tag v0.1.4 ope
 stdout (`--stdio` is accepted): diagnostics from the syntax and from
 running the file (errors, warnings, echoes, with their places), completion
 of OpenSCAD's names, the file's and those of what it includes and uses
-(BOSL2 too), signature help, hover, definitions and document symbols. In
+(BOSL2 too), signature help, hover, definitions and document symbols. An
+open file keeps the results of its evaluation for the next (up to 128 MB
+each), so that an edit evaluates again only what it reaches. In
 an editor, set it as the server for
 OpenSCAD files, e.g. in Helix:
 
@@ -111,7 +115,7 @@ An evaluation on another thread can be stopped: give `build_with_stop`,
 clone of it. The run ends soon after (between statements, calls, steps of a
 loop and the booleans of a batch; a single boolean runs to its end) with
 the error `CANCELLED` (`Error::is_cancelled` for `make` and `diagnose`),
-and keeps nothing of what it made.
+and keeps nothing of what it made (but what a cache was given of it).
 
 ```rust
 let stop = opensolve_scad::Stop::new();
@@ -124,6 +128,40 @@ stop.stop();
 // Unless it was done before: Err(CANCELLED).
 let out = run.join().unwrap();
 ```
+
+A file that is built again and again while it is open (a parameter
+changed, an edit) keeps the results of one run for the next in a `Cache`
+that its owner gives every run: `build_with_cache`, `diagnose_with_cache`
+or `Run { cache: Some(cache), .. }`. What each module call made is kept
+by a hash of what it depends on: the module's code and, by name, that of
+the functions and modules it calls, the values of the variables they read
+where they are defined, the arguments, the `$` variables the call sees
+(`$fn`, `$fa`, `$fs`, …) and its children; each union, difference,
+intersection, hull, Minkowski sum, extrusion and import by its name,
+arguments and the shapes that go in. A run then makes again only what a
+changed value reaches, and makes the same as without the cache. The cache
+holds at most its capacity in bytes (512 MB unless told), the results used
+longest ago dropped first; a file included, used or imported that changed
+drops the results that depend on it (`Cache::invalidate` drops them at
+once). Clones of a cache are the same cache, and runs on several threads
+may use it at once.
+
+```rust
+let cache = opensolve_scad::Cache::new();
+let read = |p: &std::path::Path| std::fs::read(p).map_err(|e| e.to_string());
+let stop = opensolve_scad::Stop::new();
+let path = std::path::Path::new("part.scad");
+let a = opensolve_scad::build_with_cache(path, &read, &[], &stop, &cache)?;
+// Only what `width` reaches is made again.
+let width = [("width".to_string(), "42".to_string())];
+let b = opensolve_scad::build_with_cache(path, &read, &width, &stop, &cache)?;
+println!("{}", cache.stats());
+```
+
+Set `OPENSOLVE_SCAD_SHARED_CACHE` to have every run without a cache of its
+own use one cache of the whole process, keeping every result however
+quickly made: the test suite run so (`OPENSOLVE_SCAD_SHARED_CACHE=1 cargo
+test`) checks that results of one file used for another change nothing.
 
 ## Building
 

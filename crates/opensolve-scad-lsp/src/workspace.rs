@@ -131,7 +131,12 @@ pub struct Workspace {
     read: Box<Read>,
     /// The variables files are given from outside, by file.
     external: HashMap<PathBuf, Vec<External>>,
+    /// The results of evaluations kept for the next, by open file.
+    results: Mutex<HashMap<PathBuf, opensolve_scad::Cache>>,
 }
+
+/// The bytes of the results kept for each open file.
+const RESULTS: usize = 128 << 20;
 
 impl std::fmt::Debug for Workspace {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -173,6 +178,7 @@ impl Workspace {
             libraries: Mutex::new(HashMap::new()),
             read,
             external: HashMap::new(),
+            results: Mutex::new(HashMap::new()),
         }
     }
 
@@ -204,6 +210,9 @@ impl Workspace {
 
     pub fn close(&mut self, path: &Path) {
         self.open.remove(&plain(path));
+        if let Ok(mut r) = self.results.lock() {
+            r.remove(&plain(path));
+        }
     }
 
     pub fn is_open(&self, path: &Path) -> bool {
@@ -316,10 +325,18 @@ impl Workspace {
             .iter()
             .map(|e| (e.name.clone(), e.value.clone()))
             .collect();
+        // An open file's results are kept from one evaluation to the next.
+        let cache = self.is_open(&path).then(|| {
+            let mut r = self.results.lock().unwrap_or_else(|e| e.into_inner());
+            r.entry(path.clone())
+                .or_insert_with(|| opensolve_scad::Cache::with_capacity(RESULTS))
+                .clone()
+        });
         Evaluation {
             path,
             sources,
             external,
+            cache,
         }
     }
 
@@ -888,6 +905,10 @@ pub struct Evaluation {
     pub sources: HashMap<PathBuf, String>,
     /// The variables it is given from outside: name, value.
     pub external: Vec<(String, String)>,
+    /// The results of the evaluations of the file before, kept while it is
+    /// open (see [`opensolve_scad::Cache`]): what nothing changed in is not
+    /// made again.
+    pub cache: Option<opensolve_scad::Cache>,
 }
 
 impl Evaluation {
@@ -911,7 +932,12 @@ impl Evaluation {
                 .map(|t| t.as_bytes().to_vec())
                 .ok_or_else(|| format!("{} cannot be read", p.display()))
         };
-        let found = opensolve_scad::diagnose_with_stop(&self.path, &read, &self.external, stop);
+        let found = match &self.cache {
+            Some(c) => {
+                opensolve_scad::diagnose_with_cache(&self.path, &read, &self.external, stop, c)
+            }
+            None => opensolve_scad::diagnose_with_stop(&self.path, &read, &self.external, stop),
+        };
         if found
             .error
             .as_ref()

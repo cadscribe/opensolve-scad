@@ -6,7 +6,9 @@
 //!
 //! The booleans keep no colours, so for formats that hold colours (3MF and
 //! CSG) a file's parts are made one colour at a time, by the outermost
-//! `color()` around them, as colorscad makes them with OpenSCAD.
+//! `color()` around them, as colorscad makes them with OpenSCAD. The runs
+//! of one call share a cache of results (`opensolve_scad::Cache`);
+//! `--cache-stats` tells what it did.
 
 mod write;
 
@@ -16,7 +18,7 @@ use std::process::ExitCode;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use opensolve_scad::{Made, Paint, Run, Shape};
+use opensolve_scad::{Cache, Made, Paint, Run, Shape};
 use write::{Dims, Format, Parts, Piece};
 
 const USAGE: &str = "\
@@ -34,6 +36,8 @@ the output's extension or --export-format.
   -d FILE               writes the files read, as a make dependency file
   -q, --quiet           no echoes and warnings on stderr
   --hardwarnings        a warning fails the run
+  --cache-stats         writes to stderr what the cache of results did (the
+                        runs of one call, the whole and each colour, share it)
   --preview             $preview is true
   --render, --backend X, --enable X
                         accepted as OpenSCAD takes them, without effect
@@ -46,6 +50,8 @@ the output's extension or --export-format.
 /// The lines OpenSCAD's console would show, for an `.echo` file.
 static LINES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static QUIET: AtomicBool = AtomicBool::new(false);
+/// The results the runs of this call share.
+static CACHE: std::sync::LazyLock<Cache> = std::sync::LazyLock::new(Cache::new);
 static WARNED: AtomicBool = AtomicBool::new(false);
 
 fn log(line: &str) {
@@ -67,6 +73,7 @@ struct Options {
     defines: Vec<String>,
     deps: Option<String>,
     hard_warnings: bool,
+    cache_stats: bool,
     input: Option<PathBuf>,
 }
 
@@ -108,6 +115,7 @@ fn options(args: impl IntoIterator<Item = String>) -> Result<Option<Options>, Fa
             }
             "-q" | "--quiet" => QUIET.store(true, Ordering::Relaxed),
             "--hardwarnings" => o.hard_warnings = true,
+            "--cache-stats" => o.cache_stats = true,
             "--preview" => o.defines.insert(0, "$preview=true".into()),
             "--render" => {}
             "--backend" | "--enable" => {
@@ -138,13 +146,19 @@ fn options(args: impl IntoIterator<Item = String>) -> Result<Option<Options>, Fa
 fn main() -> ExitCode {
     match options(std::env::args().skip(1)) {
         Ok(None) => ExitCode::SUCCESS,
-        Ok(Some(o)) => match run(&o) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("ERROR: {e}");
-                ExitCode::FAILURE
+        Ok(Some(o)) => {
+            let done = run(&o);
+            if o.cache_stats {
+                eprintln!("cache: {}", CACHE.stats());
             }
-        },
+            match done {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("ERROR: {e}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Err((e, usage)) => {
             eprintln!("opensolve-scad: {e}");
             if usage {
@@ -231,6 +245,7 @@ fn make(
         defines: defines.to_vec(),
         paint,
         log,
+        cache: Some(CACHE.clone()),
         ..Run::default()
     };
     opensolve_scad::make(input, &read, &run).map_err(|mut e| {
@@ -388,6 +403,7 @@ mod tests {
         .unwrap();
         assert_eq!(o.outputs, ["a.stl"]);
         assert_eq!(o.defines, ["w=5"]);
+        assert!(!o.cache_stats);
         assert_eq!(o.format, Some(Format::BinStl));
         assert_eq!(o.input, Some(PathBuf::from("x.scad")));
         assert!(options(args(&["x.scad"])).is_err());
