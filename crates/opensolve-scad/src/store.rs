@@ -95,9 +95,11 @@ type Run = (u64, u32, Arc<[Facet]>);
 
 struct Entry {
     made: Arc<Option<Geom>>,
+    /// Which facets its solid has (see [`fingerprint`]).
+    print: u64,
     events: Arc<[Event]>,
-    /// The keys of the results within it, made or used on the way.
-    inner: Arc<[u128]>,
+    /// The results within it, made or used on the way.
+    inner: Arc<[Use]>,
     /// The facets its solids may index, kept while it is.
     runs: Arc<[Run]>,
     files: Files,
@@ -350,8 +352,9 @@ pub(crate) struct Source {
 /// What a result a run made is kept as until the run ends.
 struct Pending {
     made: Arc<Option<Geom>>,
+    print: u64,
     events: Arc<[Event]>,
-    inner: Arc<[u128]>,
+    inner: Arc<[Use]>,
     files: Files,
     bytes: usize,
 }
@@ -366,13 +369,19 @@ pub(crate) struct Session {
     known: HashSet<u64>,
     /// The runs of facets of the results it used.
     runs: Vec<Run>,
-    /// The keys of the results made or used in this run, in order: those
-    /// within a result are those after the place its making began.
-    log: Vec<u128>,
-    /// The same as a set. A result is used at most once a run, and not when
-    /// it is within one used or made: a run without the cache makes it
-    /// anew there, its faces named anew, and so must this run.
-    taken: HashSet<u128>,
+    /// The results made or used in this run, in order: those within a
+    /// result are those after the place its making began.
+    log: Vec<Use>,
+    /// The same by key, with the facets of each and whether it is shared.
+    ///
+    /// A run without the cache names the faces of what it makes anew each
+    /// time, but for what it shares: a module called again alike within
+    /// the run, a batch of booleans made again alike. So must a run with
+    /// it: a result is used at most once a run, unless it is shared and
+    /// the same as the one met before; and a result is not used when one
+    /// it shared within it was met in this run as another (it would have
+    /// been shared, with this run's names).
+    seen: HashMap<u128, (u64, bool)>,
     pending: HashMap<u128, Pending>,
     pending_bytes: usize,
     pub min_cost: Duration,
@@ -436,7 +445,7 @@ impl Session {
             known: kept.iter().map(|(id, ..)| *id).collect(),
             runs: Vec::new(),
             log: Vec::new(),
-            taken: HashSet::new(),
+            seen: HashMap::new(),
             pending: HashMap::new(),
             pending_bytes: 0,
             min_cost: c.min_cost,
@@ -457,10 +466,20 @@ impl Session {
         self.log.len()
     }
 
-    /// The result kept under `key`, with what it told; none if it was used
-    /// or made in this run already.
-    pub fn recall(&mut self, key: u128) -> Option<(Option<Geom>, Arc<[Event]>)> {
-        if self.taken.contains(&key) {
+    /// The result kept under `key`, with what it told, and whether it was
+    /// met in this run before; none if it was used or made in this run
+    /// already (unless it is `shared` and the same), if what it shared was
+    /// met as another, if `fits` refuses what it told, or, with `again`,
+    /// if it was not met before.
+    pub fn recall(
+        &mut self,
+        key: u128,
+        shared: bool,
+        again: bool,
+        fits: impl FnOnce(&[Event]) -> bool,
+    ) -> Option<(Option<Geom>, Arc<[Event]>, bool)> {
+        let before = self.seen.get(&key).copied();
+        if (before.is_some() && !shared) || (again && before.is_none()) {
             return None;
         }
         let found = {
@@ -476,6 +495,7 @@ impl Session {
                         e.events.clone(),
                         e.runs.clone(),
                         e.inner.clone(),
+                        e.print,
                     );
                     c.lru.remove(&old);
                     c.lru.insert(tick, key);
@@ -485,47 +505,61 @@ impl Session {
                 _ => None,
             }
         };
-        let Some((made, events, runs, inner)) = found else {
+        let Some((made, events, runs, inner, print)) = found else {
             self.misses += 1;
             return None;
         };
+        let met_as_another =
+            |(k, p, shared): &Use| *shared && self.seen.get(k).is_some_and(|(q, _)| q != p);
+        if before.is_some_and(|(p, _)| p != print)
+            || inner.iter().any(met_as_another)
+            || !fits(&events)
+        {
+            self.misses += 1;
+            return None;
+        }
         for r in runs.iter() {
             if !self.runs.iter().any(|(id, ..)| *id == r.0) {
                 self.runs.push(r.clone());
             }
         }
-        self.log.push(key);
-        self.log.extend(inner.iter().copied());
-        self.taken.insert(key);
-        self.taken.extend(inner.iter().copied());
-        self.hits += 1;
-        Some(((*made).clone(), events))
-    }
-
-    /// Forgets the result under `key`: what it imported changed.
-    pub fn forget(&mut self, key: u128) {
-        self.pending.remove(&key);
-        let mut c = self.cache.lock();
-        if c.remove(key) {
-            c.stats.invalidated += 1;
+        self.saw((key, print, shared));
+        for u in inner.iter() {
+            self.saw(*u);
         }
+        self.hits += 1;
+        Some(((*made).clone(), events, before.is_some()))
     }
 
-    /// Keeps what was made under `key` since `mark`, with what it told on
-    /// the way, if it took `cost` or more (unknown: kept).
+    /// Notes a result made or used in this run: its key, its facets
+    /// ([`fingerprint`]) and whether it is shared.
+    pub fn saw(&mut self, u: Use) {
+        self.log.push(u);
+        self.seen.entry(u.0).or_insert((u.1, u.2));
+    }
+
+    /// Keeps what was made under `key` since `mark` (`shared`: a module call
+    /// the run shares), with what it told on the way, if it took `cost` or
+    /// more (unknown: kept) or is shared; notes it only unless `wanted`.
+    #[allow(clippy::too_many_arguments)]
     pub fn keep(
         &mut self,
         key: u128,
+        shared: bool,
         made: &Option<Geom>,
         events: &[Event],
         mark: usize,
         files: Files,
         cost: Option<Duration>,
+        wanted: bool,
     ) {
-        let inner: Arc<[u128]> = self.log.get(mark..).unwrap_or_default().into();
-        self.log.push(key);
-        self.taken.insert(key);
-        if cost.is_some_and(|c| c < self.min_cost) || self.pending.contains_key(&key) {
+        let inner: Arc<[Use]> = self.log.get(mark..).unwrap_or_default().into();
+        let print = fingerprint(made);
+        self.saw((key, print, shared));
+        // A shared one is kept however quickly made: a result kept that
+        // shares it is used with it, its faces' names the same.
+        let cheap = !shared && cost.is_some_and(|c| c < self.min_cost);
+        if !wanted || cheap || self.pending.contains_key(&key) {
             return;
         }
         let bytes = 64
@@ -540,6 +574,7 @@ impl Session {
             key,
             Pending {
                 made: Arc::new(made.clone()),
+                print,
                 events: events.into(),
                 inner,
                 files,
@@ -594,6 +629,7 @@ impl Session {
                 key,
                 Entry {
                     made: p.made,
+                    print: p.print,
                     events: p.events,
                     inner: p.inner,
                     runs: runs.clone(),
@@ -605,6 +641,26 @@ impl Session {
         }
         drop(own);
         c.evict();
+    }
+}
+
+/// A result made or used in a run: its key, its facets, whether shared.
+pub(crate) type Use = (u128, u64, bool);
+
+/// Which facets a result's solid has, by their numbers: two results alike
+/// but made apart have other ones, and so other names of faces.
+pub(crate) fn fingerprint(made: &Option<Geom>) -> u64 {
+    match made {
+        Some(Geom::D3(s)) => {
+            let mut h = H128::new(0xF1A6);
+            h.u64(s.facets.len() as u64);
+            for f in &s.facets {
+                h.u64(u64::from(*f));
+            }
+            h.finish() as u64
+        }
+        Some(Geom::D2(_)) => 1,
+        None => 0,
     }
 }
 

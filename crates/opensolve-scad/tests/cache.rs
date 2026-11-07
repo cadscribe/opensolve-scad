@@ -306,3 +306,47 @@ fn a_run_stopped_leaves_the_cache_sound() {
     stop.stop();
     assert!(build_with_stop(&files.main(), &read, &[], &stop).is_err());
 }
+
+/// A pad shared within a run (a module called again alike): the rows of
+/// pads joined by booleans and the pad on its own have its faces' names
+/// in a run without the cache. The pad's key changes with `$n`, so a later
+/// run makes it anew; a boolean kept of an earlier run's pads, alike in
+/// shape, must not be used for this run's (its faces would have the old
+/// names, not shared with the pad on its own).
+#[test]
+fn a_boolean_of_shapes_made_anew_is_made_anew_with_their_faces() {
+    let text = "w = 3;\n\
+        module pad() cylinder(r = 2, h = 2, $fn = 48);\n\
+        module grid() {\n\
+            for (y = [0 : $n - 1]) translate([0, y * 6, 0])\n\
+                union() { for (x = [0 : 3]) translate([x * 6, 0, 0]) pad(); }\n\
+            translate([-10, 0, 0]) pad();\n\
+        }\n\
+        grid($n = w);\n";
+    let files = Files::new("shared", &[("main.scad", text)]);
+    let cache = Cache::with_limits(64 << 20, Duration::ZERO);
+    for w in ["3", "4", "3", "5"] {
+        let with = files.build(&[("w", w)], Some(&cache));
+        assert_same(&files.build(&[("w", w)], None), &with, w);
+    }
+}
+
+/// A logo cut from a base and shown again in a colour: a run without the
+/// cache uses what the call made outside any colour inside one too, its
+/// faces the same; so must a run whose base is a result kept.
+#[test]
+fn a_call_in_a_colour_shares_what_it_made_outside_one() {
+    let text = "$fn = 500;\nh = 2.2;\n\
+        module logo() scale([0.13, 0.13, 1]) translate([-90, -90, -h / 2])\n\
+            linear_extrude(height = h) scale([70, 60]) circle(r = 1);\n\
+        module base() difference() {\n\
+            color([0.72, 0, 0.2]) cylinder(d = 23, h = h, center = true); logo(); }\n\
+        base();\n\
+        color([1, 1, 0.98]) logo();\n";
+    let files = Files::new("colour", &[("main.scad", text)]);
+    let cache = Cache::with_limits(64 << 20, Duration::ZERO);
+    for h in ["2.2", "2.2", "3", "2.2"] {
+        let with = files.build(&[("h", h)], Some(&cache));
+        assert_same(&files.build(&[("h", h)], None), &with, h);
+    }
+}

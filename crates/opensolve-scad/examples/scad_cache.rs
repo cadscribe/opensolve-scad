@@ -224,12 +224,10 @@ fn surface(s: &opensolve_kernel::Solid, f: &opensolve_kernel::Facets) -> Vec<Vec
         for (j, p) in [c[k], c[(k + 1) % 3], c[(k + 2) % 3]].iter().enumerate() {
             row[3 * j..3 * j + 3].copy_from_slice(p);
         }
-        // -0 and 0 alike: which of a face's coplanar facets names it
-        // (the oldest) is a matter of order.
-        row[9] = (x.normal[0] + 0.0).to_bits();
-        row[10] = (x.normal[1] + 0.0).to_bits();
-        row[11] = (x.normal[2] + 0.0).to_bits();
-        row[12] = (x.offset + 0.0).to_bits();
+        row[9] = x.normal[0].to_bits();
+        row[10] = x.normal[1].to_bits();
+        row[11] = x.normal[2].to_bits();
+        row[12] = x.offset.to_bits();
         faces.entry(x.face.0).or_default().push(row);
     }
     let mut out: Vec<Vec<[u64; 13]>> = faces

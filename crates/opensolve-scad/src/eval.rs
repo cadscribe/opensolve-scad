@@ -229,7 +229,14 @@ type R<T> = Result<T, Error>;
 /// What a module made, with the module and its scope: kept alive, so that
 /// what a key names (their addresses) is not used again by another; and
 /// what it told on the way, when a cache is used.
-type Made = (Option<Geom>, Arc<Module>, Rc<Frame>, Arc<[Event]>, bool);
+type Made = (
+    Option<Geom>,
+    Arc<Module>,
+    Rc<Frame>,
+    Arc<[Event]>,
+    bool,
+    Option<(u128, u64)>,
+);
 
 /// What the tail of a function comes to: a value, or a call of a function
 /// (with its home, its arguments and the frame it is made in).
@@ -1260,9 +1267,10 @@ impl Interp {
             None
         };
         if let Some(k) = &key
-            && let Some((g, .., told, drew)) = self.made.get(k)
+            && let Some((g, .., told, drew, across)) = self.made.get(k)
         {
-            let (g, told, drew) = (g.clone(), told.clone(), *drew);
+            let (g, told, drew, across) = (g.clone(), told.clone(), *drew, *across);
+            self.shared(across);
             for e in told.iter() {
                 self.told(e.clone());
             }
@@ -1279,8 +1287,9 @@ impl Interp {
             if let Some(last) = outside.last_mut() {
                 *last = 0;
             }
-            if let Some((g, .., told, drew)) = self.made.get(&outside) {
-                let (g, told, drew) = (g.clone(), told.clone(), *drew);
+            if let Some((g, .., told, drew, across)) = self.made.get(&outside) {
+                let (g, told, drew, across) = (g.clone(), told.clone(), *drew, *across);
+                self.shared(across);
                 for e in told.iter() {
                     self.told(e.clone());
                 }
@@ -1295,10 +1304,19 @@ impl Interp {
             None
         };
         let mark = self.begin_making();
-        if let Some((k, _)) = across
-            && let Some(g) = self.recall(k, None)
+        // Called again alike, a run without the cache shares it (`made`),
+        // as what it made outside any colour.
+        let shared = key.is_some();
+        if shared
+            && let Some((_, _, Some(o))) = across
+            && let Some(g) = self.recall(o, true, true, None)
         {
-            self.remember(key, &g, def, home, mark);
+            return Ok(g);
+        }
+        if let Some((k, ..)) = across
+            && let Some(g) = self.recall(k, shared, false, None)
+        {
+            self.remember(key, &g, def, home, mark, Some(k));
             return Ok(g);
         }
         let t = self.now();
@@ -1314,10 +1332,10 @@ impl Interp {
         let made = self.exec(&def.body, &frame, None);
         self.depth -= 1;
         let made = self.union(made?, Some(pos))?;
-        if let Some((k, files)) = across {
-            self.keep_result(k, &made, mark, files, Self::since(t));
+        if let Some((k, files, _)) = across {
+            self.keep_result(k, shared, &made, mark, files, Self::since(t));
         }
-        self.remember(key, &made, def, home, mark);
+        self.remember(key, &made, def, home, mark, across.map(|a| a.0));
         Ok(made)
     }
 
@@ -1330,14 +1348,26 @@ impl Interp {
         def: &Arc<Module>,
         home: &Rc<Frame>,
         mark: keys::Mark,
+        across: Option<u128>,
     ) {
         if let Some(k) = key
             && self.root.is_none()
         {
             let told: Arc<[Event]> = self.told_since(mark).into();
             let drew = self.draws != mark.draws;
-            self.made
-                .insert(k, (made.clone(), def.clone(), home.clone(), told, drew));
+            let across = across.map(|a| (a, crate::store::fingerprint(made)));
+            self.made.insert(
+                k,
+                (made.clone(), def.clone(), home.clone(), told, drew, across),
+            );
+        }
+    }
+
+    /// Notes a module's result shared within the run (see
+    /// [`Session::saw`]).
+    fn shared(&mut self, across: Option<(u128, u64)>) {
+        if let (Some(s), Some((k, p))) = (self.session.as_mut(), across) {
+            s.saw((k, p, true));
         }
     }
 
@@ -1542,13 +1572,13 @@ impl Interp {
         let Some(k) = key else {
             return make(self);
         };
-        if let Some(g) = self.recall(k, Some(pos)) {
+        if let Some(g) = self.recall(k, false, false, Some(pos)) {
             return Ok(g);
         }
         let mark = self.begin_making();
         let t = self.now();
         let made = make(self)?;
-        self.keep_result(k, &made, mark, Files::default(), Self::since(t));
+        self.keep_result(k, false, &made, mark, Files::default(), Self::since(t));
         Ok(made)
     }
 

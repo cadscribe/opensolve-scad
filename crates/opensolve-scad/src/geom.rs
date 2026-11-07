@@ -195,6 +195,10 @@ impl Builder {
     pub fn batch(&mut self, list: &[&Solid], op: Op) -> Option<Result<Solid, String>> {
         let key = content_key(list, op);
         if let Some(s) = self.made.get(&key) {
+            // Used again: what a result made with it shares.
+            if let Some(log) = &mut self.log {
+                log.push((key, s.clone()));
+            }
             return Some(Ok((**s).clone()));
         }
         let made = Solid::batch(list, op, &mut self.facets)?.map_err(|e| e.to_string());
@@ -215,6 +219,11 @@ impl Builder {
             self.made.insert(key, kept);
         }
         Some(made)
+    }
+
+    /// The result of a batch kept in this run.
+    pub fn batch_kept(&self, key: (u64, u64)) -> Option<&Arc<Solid>> {
+        self.made.get(&key)
     }
 
     /// Keeps the result of a batch made in a run before, as [`Builder::batch`]

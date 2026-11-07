@@ -25,7 +25,7 @@
 //! drawn before, and change those drawn after) is not kept; nor a call
 //! that includes or uses a file in its body.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -35,7 +35,7 @@ use crate::geom::Geom;
 use crate::store::{Event, Files, H128, Session};
 use crate::value::Value;
 
-use super::{Args, Frame, Fx, Interp};
+use super::{Args, Frame, Interp};
 
 /// What a definition or a list of statements reads from outside: the
 /// names of variables, functions and modules, each once in the order met;
@@ -735,7 +735,7 @@ impl Interp {
         children: &Arc<[Stmt]>,
         count: usize,
         f: &Rc<Frame>,
-    ) -> Option<(u128, Files)> {
+    ) -> Option<(u128, Files, Option<u128>)> {
         let node = self.node(&Def::M(def.clone()), home, &mut Vec::new())?;
         let mut files = node.files;
         let mut h = H128::new(0xCA11);
@@ -787,8 +787,15 @@ impl Interp {
             }
         }
         h.u64(u64::from(self.modules.len() > 1));
+        // When all is made, the key of the same call outside any colour
+        // (see `Interp::user_module`).
+        let outside = (self.paint == crate::Paint::All && self.painted).then(|| {
+            let mut o = h.clone();
+            o.u64(0);
+            o.finish()
+        });
         h.u64(self.paint_state());
-        Some((h.finish(), files))
+        Some((h.finish(), files, outside))
     }
 
     /// The colours made and whether inside a colour or cutting, as far as
@@ -839,25 +846,14 @@ impl Interp {
                 for t in &s.tris {
                     h.u64(u64::from(t[0]) | u64::from(t[1]) << 21 | u64::from(t[2]) << 42);
                 }
-                // The facets as numbered from the first met, each with its
-                // plane and its face, numbered so too.
-                let mut facets: HashMap<u32, u32, Fx> = HashMap::default();
-                let mut faces: HashMap<u64, u32, Fx> = HashMap::default();
+                // The facets themselves, by number: what a boolean keeps of
+                // them names the faces of its result. Alike shapes made
+                // apart have other facets, and what is made of them other
+                // names, in a run without the cache too; so the result is
+                // used only for the very shapes it was made of (those of
+                // results kept, used again).
                 for &f in &s.facets {
-                    let n = facets.len() as u32;
-                    let at = *facets.entry(f).or_insert(n);
-                    if at == n {
-                        let x = self.geo.facets.get(f);
-                        let m = faces.len() as u32;
-                        let face = *faces.entry(x.face.0).or_insert(m);
-                        h.u64(0xFAC);
-                        h.f64(x.normal[0]);
-                        h.f64(x.normal[1]);
-                        h.f64(x.normal[2]);
-                        h.f64(x.offset);
-                        h.u64(u64::from(face));
-                    }
-                    h.u64(u64::from(at));
+                    h.u64(u64::from(f));
                 }
             }
         }
@@ -918,21 +914,45 @@ impl Interp {
     /// The result kept under `key`, its notes told again (at `pos` if
     /// given, where an operation's notes are); `None` if there is none or
     /// a file it imported changed.
-    pub(super) fn recall(&mut self, key: u128, pos: Option<Option<Pos>>) -> Option<Option<Geom>> {
-        let (made, events) = self.session.as_mut()?.recall(key)?;
-        // What it imported must be as it was.
-        for e in events.iter() {
-            if let Event::Read(path, hash) = e
-                && self.content_hash(path).unwrap_or(0) != *hash
-            {
-                if let Some(s) = self.session.as_mut() {
-                    s.forget(key);
+    pub(super) fn recall(
+        &mut self,
+        key: u128,
+        shared: bool,
+        again: bool,
+        pos: Option<Option<Pos>>,
+    ) -> Option<Option<Geom>> {
+        let mut s = self.session.take()?;
+        let found = s.recall(key, shared, again, |events| self.fits(events));
+        self.session = Some(s);
+        let (made, events, before) = found?;
+        if before {
+            // Met in this run before: a run without the cache uses what it
+            // made then, telling nothing again.
+            for e in events.iter() {
+                if let Event::Batch(k, s) = e {
+                    self.geo.remember(*k, s.clone());
                 }
-                return None;
+                self.told(e.clone());
             }
+        } else {
+            self.replay(&events, pos);
         }
-        self.replay(&events, pos);
         Some(made)
+    }
+
+    /// Whether what a result told fits this run: what it imported is as it
+    /// was, and the batches of booleans it made or used are not made
+    /// otherwise in this run already (a run without the cache would have
+    /// used those, with their faces' names).
+    fn fits(&mut self, events: &[Event]) -> bool {
+        events.iter().all(|e| match e {
+            Event::Read(path, hash) => self.content_hash(path).unwrap_or(0) == *hash,
+            Event::Batch(k, s) => self
+                .geo
+                .batch_kept(*k)
+                .is_none_or(|now| now.facets == s.facets),
+            _ => true,
+        })
     }
 
     /// Tells what a result told when it was made: as it was then, or at
@@ -957,6 +977,7 @@ impl Interp {
     pub(super) fn keep_result(
         &mut self,
         key: u128,
+        shared: bool,
         made: &Option<Geom>,
         mark: Mark,
         files: Files,
@@ -964,15 +985,11 @@ impl Interp {
     ) {
         // Not kept, but made: not used again in this run.
         let lost = self.lost || self.geo.log.is_none();
-        let cost = if self.root.is_some() || self.draws != mark.draws || lost {
-            Some(std::time::Duration::ZERO)
-        } else {
-            cost
-        };
+        let wanted = !(self.root.is_some() || self.draws != mark.draws || lost);
         let keys = mark.keys;
         let events = self.told_since(mark);
         if let Some(s) = self.session.as_mut() {
-            s.keep(key, made, &events, keys, files, cost);
+            s.keep(key, shared, made, &events, keys, files, cost, wanted);
         }
     }
 
