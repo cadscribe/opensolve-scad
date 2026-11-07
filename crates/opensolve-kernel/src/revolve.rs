@@ -206,12 +206,11 @@ impl Solid {
                     let on = reflect(sub(on, origin));
                     let on: [f64; 3] = std::array::from_fn(|i| on[i] + origin[i]);
                     let normal = reflect(old.normal);
-                    facets.all.push(Facet {
+                    facets.push(Facet {
                         face: rename(old.face),
                         normal,
                         offset: dot(normal, on),
-                    });
-                    facets.all.len() as u32 - 1
+                    })
                 })
             })
             .collect();

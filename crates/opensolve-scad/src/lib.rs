@@ -18,6 +18,7 @@ pub mod library;
 mod paint;
 mod parser;
 mod region;
+mod store;
 mod trig;
 mod value;
 
@@ -27,6 +28,7 @@ use std::path::{Component, Path, PathBuf};
 use opensolve_kernel::{Facets, Solid};
 
 pub use customizer::{Choices, Kind, Param, parameters};
+pub use store::{Cache, CacheStats};
 
 /// This crate's version, as its release is tagged (`v` and this): the same
 /// for all crates of the workspace.
@@ -137,12 +139,36 @@ pub fn build_with_stop(
     overrides: &[(String, String)],
     stop: &Stop,
 ) -> Result<Output, String> {
+    build_in(path, read, overrides, stop, None)
+}
+
+/// [`build_with_stop`] with a cache of results across runs (see
+/// [`Cache`]): what the runs before made and nothing it depends on
+/// changed since is not made again. The result is the same as without.
+pub fn build_with_cache(
+    path: &Path,
+    read: Reader<'_>,
+    overrides: &[(String, String)],
+    stop: &Stop,
+    cache: &Cache,
+) -> Result<Output, String> {
+    build_in(path, read, overrides, stop, Some(cache))
+}
+
+fn build_in(
+    path: &Path,
+    read: Reader<'_>,
+    overrides: &[(String, String)],
+    stop: &Stop,
+    cache: Option<&Cache>,
+) -> Result<Output, String> {
     let path = plain(path);
     let mut sources = Sources::default();
     gather(&path, read, &mut sources)?;
+    let cache = cache.cloned().or_else(shared_cache);
     deep(move || {
         opensolve_kernel::stopping(stop, || {
-            let out = evaluate(path, sources, overrides, stop);
+            let out = evaluate(path, sources, overrides, stop, cache.as_ref());
             if stop.is_stopped() {
                 return Err(CANCELLED.to_string());
             }
@@ -178,6 +204,8 @@ pub struct Run {
     /// Set (from another thread), the run ends early with
     /// [`Error::cancelled`].
     pub stop: Stop,
+    /// Results kept across runs of the file (see [`Cache`]).
+    pub cache: Option<Cache>,
 }
 
 /// What a file makes, as [`make`] finds it.
@@ -211,21 +239,26 @@ pub fn make(path: &Path, read: Reader<'_>, run: &Run) -> Result<Made, Error> {
     let mut sources = Sources::default();
     gather(&path, read, &mut sources).map_err(|e| Error::at(0, 0, e))?;
     let stop = &run.stop;
+    let cache = run.cache.clone().or_else(shared_cache);
     deep(move || {
-        let mut it = eval::Interp::new(sources.files, sources.blobs);
+        let mut it = interp(sources, &path, cache.as_ref());
         it.paint = run.paint;
         it.log = run.log;
         it.stop = stop.clone();
-        let mut stmts = it.load(path, &mut Vec::new())?;
-        for d in &run.defines {
-            // As OpenSCAD adds them: each after the file, with a `;`.
-            stmts.extend(parser::parse(&format!("{d};\n"), 0).map_err(|mut e| {
-                e.message = format!("-D {d}: {}", e.message);
-                e.line = 0;
-                e
-            })?);
-        }
-        let made = opensolve_kernel::stopping(stop, || it.run(&stmts, &eval::Interp::root()))?;
+        let made = (|| {
+            let mut stmts = it.load(path, &mut Vec::new())?;
+            for d in &run.defines {
+                // As OpenSCAD adds them: each after the file, with a `;`.
+                stmts.extend(parser::parse(&format!("{d};\n"), 0).map_err(|mut e| {
+                    e.message = format!("-D {d}: {}", e.message);
+                    e.line = 0;
+                    e
+                })?);
+            }
+            opensolve_kernel::stopping(stop, || it.run(&stmts, &eval::Interp::root()))
+        })();
+        it.finish();
+        let made = made?;
         if stop.is_stopped() {
             return Err(Error::cancelled());
         }
@@ -261,6 +294,28 @@ pub fn diagnose_with_stop(
     overrides: &[(String, String)],
     stop: &Stop,
 ) -> Diagnosis {
+    diagnose_in(path, read, overrides, stop, None)
+}
+
+/// [`diagnose_with_stop`] with a cache of results across runs (see
+/// [`Cache`]): the notes of results kept are told again.
+pub fn diagnose_with_cache(
+    path: &Path,
+    read: Reader<'_>,
+    overrides: &[(String, String)],
+    stop: &Stop,
+    cache: &Cache,
+) -> Diagnosis {
+    diagnose_in(path, read, overrides, stop, Some(cache))
+}
+
+fn diagnose_in(
+    path: &Path,
+    read: Reader<'_>,
+    overrides: &[(String, String)],
+    stop: &Stop,
+    cache: Option<&Cache>,
+) -> Diagnosis {
     let path = plain(path);
     let mut sources = Sources::default();
     if let Err(e) = gather(&path, read, &mut sources) {
@@ -269,8 +324,9 @@ pub fn diagnose_with_stop(
             notes: Vec::new(),
         };
     }
+    let cache = cache.cloned().or_else(shared_cache);
     deep(move || {
-        let mut it = eval::Interp::new(sources.files, sources.blobs);
+        let mut it = interp(sources, &path, cache.as_ref());
         it.stop = stop.clone();
         let error = it
             .load(path, &mut Vec::new())
@@ -279,6 +335,7 @@ pub fn diagnose_with_stop(
                 opensolve_kernel::stopping(stop, || it.run(&stmts, &eval::Interp::root()))
             })
             .err();
+        it.finish();
         if stop.is_stopped() {
             return Diagnosis {
                 error: Some(Error::cancelled()),
@@ -416,19 +473,62 @@ fn gather_in(
     Ok(())
 }
 
+/// The cache of runs not given one, when `OPENSOLVE_SCAD_SHARED_CACHE` is
+/// set: one for the whole process, which keeps every result however
+/// quickly made. It is there to run the tests with a cache: results of
+/// one test used by the others, of files alike or not, must change
+/// nothing.
+fn shared_cache() -> Option<Cache> {
+    static SHARED: std::sync::OnceLock<Option<Cache>> = std::sync::OnceLock::new();
+    SHARED
+        .get_or_init(|| {
+            std::env::var_os("OPENSOLVE_SCAD_SHARED_CACHE")
+                .map(|_| Cache::with_limits(1 << 30, std::time::Duration::ZERO))
+        })
+        .clone()
+}
+
+/// An interpreter of the files read, with `cache` if given.
+fn interp(sources: Sources, main: &Path, cache: Option<&Cache>) -> eval::Interp {
+    let list: Vec<store::Source> = match cache {
+        Some(_) => sources
+            .files
+            .iter()
+            .map(|(p, f)| store::Source {
+                path: p.clone(),
+                hash: f.hash,
+                code: true,
+            })
+            .chain(sources.blobs.iter().map(|(p, b)| store::Source {
+                path: p.clone(),
+                hash: store::hash_bytes(b),
+                code: false,
+            }))
+            .collect(),
+        None => Vec::new(),
+    };
+    let mut it = eval::Interp::new(sources.files, sources.blobs);
+    if let Some(c) = cache {
+        it.use_cache(c, &list, main);
+    }
+    it
+}
+
 fn evaluate(
     path: PathBuf,
     sources: Sources,
     overrides: &[(String, String)],
     stop: &Stop,
+    cache: Option<&Cache>,
 ) -> Result<Output, String> {
-    let mut it = eval::Interp::new(sources.files, sources.blobs);
+    let mut it = interp(sources, &path, cache);
     it.stop = stop.clone();
-    let mut stmts = it.load(path, &mut Vec::new()).map_err(|e| e.to_string())?;
-    override_values(&mut it, &mut stmts, overrides);
-    let made = it
-        .run(&stmts, &eval::Interp::root())
-        .map_err(|e| e.to_string())?;
+    let made = it.load(path, &mut Vec::new()).and_then(|mut stmts| {
+        override_values(&mut it, &mut stmts, overrides);
+        it.run(&stmts, &eval::Interp::root())
+    });
+    it.finish();
+    let made = made.map_err(|e| e.to_string())?;
     let notes = it.take_notes();
     match made {
         Some(geom::Geom::D3(s)) if !s.is_empty() => {

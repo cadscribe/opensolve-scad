@@ -276,3 +276,31 @@ fn what_a_command_click_goes_to_is_a_link() {
     assert_eq!(link(text.find("cube").unwrap() + 1), None);
     assert_eq!(link(text.find("gone").unwrap()), None);
 }
+
+#[test]
+fn an_open_file_keeps_its_results_from_one_evaluation_to_the_next() {
+    let text = "module part(w) { echo(w = w); difference() { cube(w); \
+        translate([1, 1, -1]) cylinder(r = 1, h = w + 2, $fn = 64); } }\n\
+        part(10);\ntranslate([20, 0, 0]) part(12);\nfrobnicate();\n";
+    let mut w = workspace(&[]);
+    w.set(main_path(), text.to_string());
+    let first = w.diagnostics(main_path());
+    let job = w.evaluation(main_path());
+    let cache = job.cache.clone().expect("an open file has a cache");
+    let again = job.run();
+    let same = |a: &[opensolve_scad_lsp::Diagnostic], b: &[opensolve_scad_lsp::Diagnostic]| {
+        a.len() == b.len()
+            && a.iter().zip(b).all(|(x, y)| {
+                x.range == y.range && x.message == y.message && x.severity == y.severity
+            })
+    };
+    assert!(same(&first, &again), "{first:?}\n{again:?}");
+    assert!(
+        again.iter().any(|d| d.message.contains("ECHO: w = 12")),
+        "{again:?}"
+    );
+    assert!(cache.stats().hits > 0, "{}", cache.stats());
+    // Closed, its results go.
+    w.close(main_path());
+    assert!(w.evaluation(main_path()).cache.is_none());
+}

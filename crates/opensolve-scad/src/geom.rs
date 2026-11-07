@@ -99,13 +99,23 @@ fn det(m: &Matrix) -> f64 {
     )
 }
 
+/// Results of batches of booleans, by what went in (see [`Builder::batch`]).
+pub type Batches = Vec<((u64, u64), Arc<Solid>)>;
+
 /// Builds shapes; their facets all go into one list.
 #[derive(Debug, Default)]
 pub struct Builder {
     pub facets: Facets,
     next_face: u64,
     /// Results of batches by what went in (see [`Builder::batch`]).
-    made: HashMap<(u64, u64), Solid, Fx>,
+    made: HashMap<(u64, u64), Arc<Solid>, Fx>,
+    /// The results of batches as they are kept, while asked for: what a
+    /// cache across runs keeps with a result made with them (see
+    /// [`Builder::remember`]).
+    pub log: Option<Batches>,
+    /// Their triangles: more than [`MOST_KEPT`], and the log ends (and with
+    /// it what a cache keeps of the run).
+    log_size: usize,
     /// Their triangles, all told.
     made_size: usize,
     /// The caps of 2D shapes extruded, by the shape (see [`Builder::cap`]).
@@ -163,13 +173,33 @@ fn content_key(list: &[&Solid], op: Op) -> (u64, u64) {
 }
 
 impl Builder {
+    /// A builder whose facets go on from `facets` (see [`Facets::after`])
+    /// and whose new faces are named from `next_face` on: one that uses
+    /// solids kept from builds before.
+    pub fn after(facets: Facets, next_face: u64) -> Builder {
+        Builder {
+            facets,
+            next_face,
+            ..Builder::default()
+        }
+    }
+
+    /// The next name of a face: all names given so far are below.
+    pub fn next_face(&self) -> u64 {
+        self.next_face
+    }
+
     /// [`Solid::batch`] of solids, kept: the same shapes made again (the
     /// cells of a grid, each the same before it is moved) are joined once,
     /// as OpenSCAD's cache of geometry does it.
     pub fn batch(&mut self, list: &[&Solid], op: Op) -> Option<Result<Solid, String>> {
         let key = content_key(list, op);
         if let Some(s) = self.made.get(&key) {
-            return Some(Ok(s.clone()));
+            // Used again: what a result made with it shares.
+            if let Some(log) = &mut self.log {
+                log.push((key, s.clone()));
+            }
+            return Some(Ok((**s).clone()));
         }
         let made = Solid::batch(list, op, &mut self.facets)?.map_err(|e| e.to_string());
         if let Ok(s) = &made {
@@ -178,9 +208,37 @@ impl Builder {
                 self.made_size = 0;
             }
             self.made_size += s.tris.len();
-            self.made.insert(key, s.clone());
+            let kept = Arc::new(s.clone());
+            if let Some(log) = &mut self.log {
+                self.log_size += s.tris.len();
+                log.push((key, kept.clone()));
+                if self.log_size > MOST_KEPT {
+                    self.log = None;
+                }
+            }
+            self.made.insert(key, kept);
         }
         Some(made)
+    }
+
+    /// The result of a batch kept in this run.
+    pub fn batch_kept(&self, key: (u64, u64)) -> Option<&Arc<Solid>> {
+        self.made.get(&key)
+    }
+
+    /// Keeps the result of a batch made in a run before, as [`Builder::batch`]
+    /// keeps one it makes: the same batch made again is that result, with
+    /// its faces' names, as in a run that made it.
+    pub fn remember(&mut self, key: (u64, u64), s: Arc<Solid>) {
+        if self.made.contains_key(&key) {
+            return;
+        }
+        if self.made_size + s.tris.len() > MOST_KEPT {
+            self.made.clear();
+            self.made_size = 0;
+        }
+        self.made_size += s.tris.len();
+        self.made.insert(key, s);
     }
 
     /// The caps of a 2D shape to extrude ([`cap_indexed`] of it parted),
