@@ -97,6 +97,11 @@ fn a_run_stopped_before_it_begins_makes_nothing() {
 
 #[test]
 fn a_batch_stops_between_its_rounds_and_a_later_run_is_the_same() {
+    // With a cache for all runs (as the tests can be run), the run to stop
+    // finds the whole result kept: nothing to stop.
+    if std::env::var_os("OPENSOLVE_SCAD_SHARED_CACHE").is_some() {
+        return;
+    }
     let start = Instant::now();
     let whole = build(Path::new("main.scad"), &read(BATCH), &[]).unwrap();
     let full = start.elapsed();

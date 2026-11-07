@@ -16,6 +16,8 @@ use crate::ast::Stmt;
 pub struct Parsed {
     pub id: u32,
     pub text: Arc<str>,
+    /// A hash of the text: what tells a cache of results the file changed.
+    pub hash: u64,
     /// The paths of its `include <…>` and `use <…>`, as written.
     pub includes: Vec<String>,
     /// The paths its `import` calls name as text, as written.
@@ -83,6 +85,7 @@ pub fn file(path: &Path, text: String) -> Arc<Parsed> {
     let imports = crate::imports(&text);
     let parsed = Arc::new(Parsed {
         id,
+        hash: crate::store::hash_bytes(text.as_bytes()),
         text: text.into(),
         includes,
         imports,

@@ -18,7 +18,10 @@ use crate::cache::Parsed;
 use crate::flat::{self, Region};
 use crate::geom::{self, Builder, Geom, IDENTITY, Matrix, V2, V3, cos_deg, fragments, sin_deg};
 use crate::paint::{self, Rgba};
+use crate::store::{Event, Files, Session};
 use crate::value::{self, MOST, Value, item, repr};
+
+mod keys;
 
 /// Deeper calls than this end the evaluation: a recursion without end. A
 /// call in a function's tail does not count (see `run_func`); a deep one
@@ -33,6 +36,9 @@ const PIECES: usize = 1000;
 const NOTES: usize = 40;
 /// More marks than this are dropped.
 const MARKS: usize = 500;
+/// More of what is told (notes, echoes) than this in a run, and nothing
+/// more of the run is kept across runs.
+const EVENTS: usize = 200_000;
 
 /// Names and what they stand for in a scope: a list, and an index once
 /// there are many, as in a file that includes BOSL2 (thousands).
@@ -221,8 +227,9 @@ impl Frame {
 type R<T> = Result<T, Error>;
 
 /// What a module made, with the module and its scope: kept alive, so that
-/// what a key names (their addresses) is not used again by another.
-type Made = (Option<Geom>, Arc<Module>, Rc<Frame>);
+/// what a key names (their addresses) is not used again by another; and
+/// what it told on the way, when a cache is used.
+type Made = (Option<Geom>, Arc<Module>, Rc<Frame>, Arc<[Event]>, bool);
 
 /// What the tail of a function comes to: a value, or a call of a function
 /// (with its home, its arguments and the frame it is made in).
@@ -330,6 +337,25 @@ pub struct Interp {
     /// Asked to stop, the evaluation ends with [`Error::cancelled`]: looked
     /// at for each statement, call, step of a loop and before each boolean.
     pub stop: opensolve_kernel::Stop,
+    /// The run's use of a cache across runs (see [`crate::store`]).
+    session: Option<Session>,
+    /// What was told, while a cache is used: what a result kept tells
+    /// again.
+    events: Vec<Event>,
+    /// The definitions worked out for keys (see [`keys`]), by address.
+    analyses: HashMap<usize, (keys::Held, Rc<keys::Names>)>,
+    /// The keys of definitions that stand alone, by their address and the
+    /// address of their scope.
+    nodes: HashMap<(usize, usize), keys::NodeKey>,
+    /// The hashes of files imported, as read in this run.
+    read_hashes: HashMap<PathBuf, Option<u64>>,
+    /// What was told or batched was too much to keep: nothing more is kept
+    /// across runs from this run.
+    lost: bool,
+    /// How often `rands` drew numbers (or a result kept within the run
+    /// that did was used): what a result depends on, and what it changes
+    /// for those after it, when it did.
+    draws: u64,
 }
 
 impl Interp {
@@ -365,6 +391,70 @@ impl Interp {
             colours: Vec::new(),
             log: None,
             stop: opensolve_kernel::Stop::default(),
+            session: None,
+            events: Vec::new(),
+            analyses: HashMap::new(),
+            nodes: HashMap::new(),
+            read_hashes: HashMap::new(),
+            draws: 0,
+            lost: false,
+        }
+    }
+
+    /// Uses `cache` for this run: results kept by runs before are used, and
+    /// those made kept, when the run ends ([`Interp::finish`]). `sources`
+    /// are the files read, `main` the file run.
+    pub fn use_cache(
+        &mut self,
+        cache: &crate::Cache,
+        sources: &[crate::store::Source],
+        main: &std::path::Path,
+    ) {
+        let (session, facets, next_face) = Session::begin(cache, sources, main);
+        self.geo = Builder::after(facets, next_face);
+        self.geo.log = Some(Vec::new());
+        self.session = Some(session);
+    }
+
+    /// Ends the run's use of a cache: what it made is kept.
+    pub fn finish(&mut self) {
+        if let Some(s) = self.session.take() {
+            s.finish(&self.geo.facets, self.geo.next_face());
+        }
+    }
+
+    /// Keeps what was told for the results being made, up to [`EVENTS`].
+    fn told(&mut self, e: Event) {
+        if self.events.len() < EVENTS {
+            self.events.push(e);
+        } else {
+            self.lost = true;
+        }
+    }
+
+    /// A colour of an outermost `color()` met.
+    fn met_colour(&mut self, c: Rgba) {
+        if self.session.is_some() {
+            self.told(Event::Colour(c));
+        }
+        if !self.colours.iter().any(|k| paint::same(k, &c)) {
+            self.colours.push(c);
+        }
+    }
+
+    /// How long since `t`, where that can be known.
+    fn since(t: Option<std::time::Instant>) -> Option<std::time::Duration> {
+        t.map(|t| t.elapsed())
+    }
+
+    fn now(&self) -> Option<std::time::Instant> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.session.as_ref().map(|_| std::time::Instant::now())
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            None
         }
     }
 
@@ -379,6 +469,9 @@ impl Interp {
 
     pub fn note(&mut self, pos: Option<Pos>, text: impl Into<String>) {
         let text = text.into();
+        if self.session.is_some() {
+            self.told(Event::Note(pos, text.clone()));
+        }
         self.mark(pos, &text, false);
         let text = match pos {
             Some(p) => format!("{}: {text}", self.place(p)),
@@ -392,6 +485,9 @@ impl Interp {
 
     /// What `echo` writes: a note without its place, a mark with it.
     fn echo(&mut self, pos: Pos, text: String) {
+        if self.session.is_some() {
+            self.told(Event::Echo(pos, text.clone()));
+        }
         let text = format!("ECHO: {text}");
         if let Some(log) = self.log {
             log(&text);
@@ -1033,10 +1129,8 @@ impl Interp {
                     self.note(Some(pos), format!("color: {name} is no colour"));
                 }
                 let outermost = c.filter(|_| !self.painted);
-                if let Some(c) = outermost
-                    && !self.colours.iter().any(|k| paint::same(k, &c))
-                {
-                    self.colours.push(c);
+                if let Some(c) = outermost {
+                    self.met_colour(c);
                 }
                 let wanted = self.cutting
                     || outermost.is_none_or(|c| match self.paint {
@@ -1075,18 +1169,25 @@ impl Interp {
                 if empty {
                     None
                 } else {
-                    self.fold(made.into_iter().flatten().collect(), op, pos)?
+                    let list: Vec<Geom> = made.into_iter().flatten().collect();
+                    let key = self.op_key(name, &list.iter().collect::<Vec<_>>(), None, None);
+                    self.kept_op(key, Some(pos), |me| me.fold(list, op, pos))?
                 }
             }
             "hull" => {
                 let made = kids(self)?;
                 self.halt()?;
-                self.hull(made, pos)
+                let key = self.op_key(name, &made.iter().collect::<Vec<_>>(), None, None);
+                self.kept_op(key, Some(pos), |me| Ok(me.hull(made, pos)))?
             }
             "linear_extrude" | "rotate_extrude" => {
                 let made = kids(self)?;
                 let shape = self.union(made, Some(pos))?;
-                self.extrude(name, shape, &a, f, pos)?
+                let key = match &shape {
+                    Some(g) => self.op_key(name, &[g], Some(&a), Some(f)),
+                    None => None,
+                };
+                self.kept_op(key, Some(pos), |me| me.extrude(name, shape, &a, f, pos))?
             }
             "children" => self.children(&a, f, pos)?,
             "echo" => {
@@ -1102,7 +1203,8 @@ impl Interp {
             }
             "minkowski" => {
                 let made = kids(self)?;
-                self.minkowski(made, pos)?
+                let key = self.op_key(name, &made.iter().collect::<Vec<_>>(), None, None);
+                self.kept_op(key, Some(pos), |me| me.minkowski(made, pos))?
             }
             "offset" => {
                 let made = kids(self)?;
@@ -1124,7 +1226,11 @@ impl Interp {
                 }
             }
             "text" => self.text(&a, f, pos),
-            "import" => self.import(&a, f, pos),
+            "import" => {
+                let file = if pos.file == 0 { self.main } else { pos.file };
+                let key = self.op_key(&format!("import {file}"), &[], Some(&a), Some(f));
+                self.kept_op(key, Some(pos), |me| Ok(me.import(&a, f, pos)))?
+            }
             "surface" | "roof" | "fill" => {
                 self.note(Some(pos), format!("not supported: {name}"));
                 None
@@ -1154,9 +1260,14 @@ impl Interp {
             None
         };
         if let Some(k) = &key
-            && let Some((g, ..)) = self.made.get(k)
+            && let Some((g, .., told, drew)) = self.made.get(k)
         {
-            return Ok(g.clone());
+            let (g, told, drew) = (g.clone(), told.clone(), *drew);
+            for e in told.iter() {
+                self.told(e.clone());
+            }
+            self.draws += u64::from(drew);
+            return Ok(g);
         }
         // When all is made, what a call outside any colour made does inside
         // one as well: its colours are told already.
@@ -1168,10 +1279,29 @@ impl Interp {
             if let Some(last) = outside.last_mut() {
                 *last = 0;
             }
-            if let Some((g, ..)) = self.made.get(&outside) {
-                return Ok(g.clone());
+            if let Some((g, .., told, drew)) = self.made.get(&outside) {
+                let (g, told, drew) = (g.clone(), told.clone(), *drew);
+                for e in told.iter() {
+                    self.told(e.clone());
+                }
+                self.draws += u64::from(drew);
+                return Ok(g);
             }
         }
+        // Across runs: by what the call depends on, by content.
+        let across = if self.session.is_some() {
+            self.module_key(def, home, &a, children, count, f)
+        } else {
+            None
+        };
+        let mark = self.begin_making();
+        if let Some((k, _)) = across
+            && let Some(g) = self.recall(k, None)
+        {
+            self.remember(key, &g, def, home, mark);
+            return Ok(g);
+        }
+        let t = self.now();
         let frame = Rc::new(Frame {
             parent: Some(home.clone()),
             caller: Some(f.clone()),
@@ -1184,14 +1314,31 @@ impl Interp {
         let made = self.exec(&def.body, &frame, None);
         self.depth -= 1;
         let made = self.union(made?, Some(pos))?;
-        // A `!` inside counts once: not kept.
+        if let Some((k, files)) = across {
+            self.keep_result(k, &made, mark, files, Self::since(t));
+        }
+        self.remember(key, &made, def, home, mark);
+        Ok(made)
+    }
+
+    /// Keeps what a module made within the run, with what it told since
+    /// `mark`. A `!` inside counts once: not kept.
+    fn remember(
+        &mut self,
+        key: Option<Vec<u8>>,
+        made: &Option<Geom>,
+        def: &Arc<Module>,
+        home: &Rc<Frame>,
+        mark: keys::Mark,
+    ) {
         if let Some(k) = key
             && self.root.is_none()
         {
+            let told: Arc<[Event]> = self.told_since(mark).into();
+            let drew = self.draws != mark.draws;
             self.made
-                .insert(k, (made.clone(), def.clone(), home.clone()));
+                .insert(k, (made.clone(), def.clone(), home.clone(), told, drew));
         }
-        Ok(made)
     }
 
     /// What a call of a module without children depends on, as bytes: the
@@ -1384,12 +1531,38 @@ impl Interp {
         Err(self.error(pos, format!("assertion failed: {what}")))
     }
 
+    /// What `make` makes, kept across runs under `key` if there is one (see
+    /// [`keys`]); its notes are at `pos`.
+    fn kept_op(
+        &mut self,
+        key: Option<u128>,
+        pos: Option<Pos>,
+        make: impl FnOnce(&mut Self) -> R<Option<Geom>>,
+    ) -> R<Option<Geom>> {
+        let Some(k) = key else {
+            return make(self);
+        };
+        if let Some(g) = self.recall(k, Some(pos)) {
+            return Ok(g);
+        }
+        let mark = self.begin_making();
+        let t = self.now();
+        let made = make(self)?;
+        self.keep_result(k, &made, mark, Files::default(), Self::since(t));
+        Ok(made)
+    }
+
     /// Several shapes as one: those of the kind of the first joined, the
     /// others left out, as OpenSCAD does.
     fn union(&mut self, made: Vec<Geom>, pos: Option<Pos>) -> R<Option<Geom>> {
         if made.len() <= 1 {
             return Ok(made.into_iter().next());
         }
+        let key = self.op_key("union", &made.iter().collect::<Vec<_>>(), None, None);
+        self.kept_op(key, pos, |me| me.union_of(made, pos))
+    }
+
+    fn union_of(&mut self, made: Vec<Geom>, pos: Option<Pos>) -> R<Option<Geom>> {
         self.halt()?;
         let is_flat = matches!(made[0], Geom::D2(_));
         let (list, other): (Vec<Geom>, Vec<Geom>) = made
@@ -1676,6 +1849,10 @@ impl Interp {
             .and_then(|f| f.parent().map(PathBuf::from))
             .unwrap_or_default();
         let path = crate::plain(&dir.join(&name));
+        if self.session.is_some() {
+            let hash = self.content_hash(&path).unwrap_or(0);
+            self.told(Event::Read(path.clone(), hash));
+        }
         let bytes = match self.blobs.get(&path) {
             Some(b) => b.clone(),
             None => match read_file(&path) {
@@ -2099,6 +2276,7 @@ impl Interp {
             .chain(a.named.into_iter().map(|(n, v)| (Some(n), v)))
             .collect();
         if name == "rands" {
+            self.draws += 1;
             return builtins::rands(&list, &mut self.rng);
         }
         builtins::call(name, &list).unwrap_or_default()
