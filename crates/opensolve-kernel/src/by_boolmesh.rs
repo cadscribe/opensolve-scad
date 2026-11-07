@@ -106,7 +106,7 @@ pub(crate) fn read(m: &Mesh, facets: &mut Facets) -> (Vec<[f64; 3]>, Vec<[u32; 3
             c.iter()
                 .filter(|v| whole(v))
                 .map(|v| v.0.round() as u32)
-                .find(|&f| (f as usize) < facets.all.len() && facets.fits(f, at(*t)))
+                .find(|&f| facets.contains(f) && facets.fits(f, at(*t)))
         })
         .collect();
     // What is left takes the facet of a neighbour in the same plane.
@@ -147,7 +147,7 @@ pub(crate) fn read(m: &Mesh, facets: &mut Facets) -> (Vec<[f64; 3]>, Vec<[u32; 3
                 .iter()
                 .filter(|v| whole(v))
                 .map(|v| v.0.round() as u32)
-                .filter(|&f| (f as usize) < facets.all.len())
+                .filter(|&f| facets.contains(f))
                 .collect();
             names.extend(
                 (0..3).filter_map(|k| edges.get(&(t[(k + 1) % 3], t[k])).and_then(|&n| out[n])),

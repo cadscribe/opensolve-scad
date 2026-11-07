@@ -196,10 +196,12 @@ pub(crate) fn read(m: &Mesh, facets: &mut Facets) -> (Vec<[f64; 3]>, Vec<[u32; 3
         .zip(&tris)
         .zip(run_of)
         .map(|((&f, t), r)| match u32::try_from(f) {
-            Ok(f) if (f as usize) < known => match maps.get(r).and_then(Option::as_ref) {
-                None => f,
-                Some(a) => *moved.entry((f, r)).or_insert_with(|| a.facet(facets, f)),
-            },
+            Ok(f) if (f as usize) < known && facets.contains(f) => {
+                match maps.get(r).and_then(Option::as_ref) {
+                    None => f,
+                    Some(a) => *moved.entry((f, r)).or_insert_with(|| a.facet(facets, f)),
+                }
+            }
             _ => nearest_facet(facets, t.map(|i| points[i as usize])),
         })
         .collect();

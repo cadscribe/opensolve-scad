@@ -63,38 +63,104 @@ pub struct Facet {
 }
 
 /// The facets of everything built so far; solids index into it.
+///
+/// A table may go on from facets kept from builds before ([`Facets::after`]):
+/// those are read where they are, shared and not copied, under the numbers
+/// they had, so that solids kept from those builds (and the boolean
+/// library's meshes of them, which carry the numbers) are used as they are.
 #[derive(Clone, Debug, Default)]
 pub struct Facets {
+    /// The facets kept, as runs by their first number, in order; all below
+    /// `start`.
+    kept: Arc<[(u32, Arc<[Facet]>)]>,
+    /// The number of the first facet of `all`.
+    start: u32,
     all: Vec<Facet>,
 }
 
 impl Facets {
+    /// A table that goes on from the facets `kept` (runs by their first
+    /// number, any order; none at or above `start`), its own facets
+    /// numbered from `start`.
+    pub fn after(mut kept: Vec<(u32, Arc<[Facet]>)>, start: u32) -> Facets {
+        kept.sort_by_key(|(at, _)| *at);
+        Facets {
+            kept: kept.into(),
+            start,
+            all: Vec::new(),
+        }
+    }
+
+    /// The number of the first of this table's own facets (0 unless it goes
+    /// on from kept ones), and those facets: what another table can go on
+    /// from.
+    pub fn own(&self) -> (u32, &[Facet]) {
+        (self.start, &self.all)
+    }
+
+    /// Adds a facet as it is; its number.
+    pub fn push(&mut self, f: Facet) -> u32 {
+        self.all.push(f);
+        self.start + self.all.len() as u32 - 1
+    }
+
     /// A new facet of `face`: the plane with `normal` through `on`.
     pub fn add(&mut self, face: FaceId, normal: [f64; 3], on: [f64; 3]) -> u32 {
         let offset = dot(normal, on);
-        self.all.push(Facet {
+        self.push(Facet {
             face,
             normal,
             offset,
-        });
-        self.all.len() as u32 - 1
+        })
     }
 
     pub fn get(&self, facet: u32) -> Facet {
-        self.all[facet as usize]
+        match facet.checked_sub(self.start) {
+            Some(i) => self.all[i as usize],
+            None => self.kept_one(facet).expect("a facet that is not kept"),
+        }
     }
 
+    fn kept_one(&self, facet: u32) -> Option<Facet> {
+        let i = self.kept.partition_point(|(at, _)| *at <= facet);
+        let (at, run) = self.kept.get(i.checked_sub(1)?)?;
+        run.get((facet - at) as usize).copied()
+    }
+
+    /// Whether there is a facet of this number.
+    pub fn contains(&self, facet: u32) -> bool {
+        match facet.checked_sub(self.start) {
+            Some(i) => (i as usize) < self.all.len(),
+            None => self.kept_one(facet).is_some(),
+        }
+    }
+
+    /// One more than the highest number: every facet's number is below.
     pub fn len(&self) -> usize {
-        self.all.len()
+        self.start as usize + self.all.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.all.is_empty()
+        self.all.is_empty() && self.kept.is_empty()
+    }
+
+    /// Every facet with its number.
+    fn each(&self) -> impl Iterator<Item = (u32, &Facet)> {
+        let kept = self
+            .kept
+            .iter()
+            .flat_map(|(at, run)| run.iter().enumerate().map(move |(i, f)| (at + i as u32, f)));
+        let own = self
+            .all
+            .iter()
+            .enumerate()
+            .map(|(i, f)| (self.start + i as u32, f));
+        kept.chain(own)
     }
 
     /// Forgets the facets from `len` on, which no solid may still use.
     pub fn truncate(&mut self, len: usize) {
-        self.all.truncate(len);
+        self.all.truncate(len.saturating_sub(self.start as usize));
     }
 
     fn fits(&self, facet: u32, tri: [[f64; 3]; 3]) -> bool {
@@ -495,8 +561,7 @@ impl Solid {
                         normal: old.normal,
                         offset: old.offset + dot(old.normal, delta),
                     };
-                    facets.all.push(shifted);
-                    facets.all.len() as u32 - 1
+                    facets.push(shifted)
                 })
             })
             .collect();
@@ -668,18 +733,32 @@ impl Solid {
         let facets = self
             .facets
             .iter()
-            .map(|&f| {
-                *moved.entry(f).or_insert_with(|| {
-                    into.all.push(from.get(f));
-                    into.all.len() as u32 - 1
-                })
-            })
+            .map(|&f| *moved.entry(f).or_insert_with(|| into.push(from.get(f))))
             .collect();
         Solid {
             points: self.points.clone(),
             tris: self.tris.clone(),
             facets,
             mesh: None,
+        }
+    }
+
+    /// Whether the boolean library's own mesh of the solid is kept with it
+    /// (see [`Solid::prepared`]).
+    pub fn has_mesh(&self) -> bool {
+        self.mesh.is_some()
+    }
+
+    /// About how many bytes the solid takes, with the boolean library's
+    /// mesh of it if it has one: what a cache of solids counts.
+    pub fn bytes(&self) -> usize {
+        let own = self.points.len() * 24 + self.tris.len() * 16 + std::mem::size_of::<Solid>();
+        // Manifold's half-edges, corners and the references of each
+        // triangle: about a hundred bytes a triangle.
+        own + if self.mesh.is_some() {
+            self.tris.len() * 100
+        } else {
+            0
         }
     }
 
@@ -1441,9 +1520,10 @@ fn nearest_facet(facets: &Facets, tri: [[f64; 3]; 3]) -> u32 {
             .map(|p| (dot(f.normal, *p) - f.offset).abs())
             .sum::<f64>()
     };
-    (0..facets.all.len())
-        .min_by(|&a, &b| off(&facets.all[a]).total_cmp(&off(&facets.all[b])))
-        .unwrap_or(0) as u32
+    facets
+        .each()
+        .min_by(|a, b| off(a.1).total_cmp(&off(b.1)))
+        .map_or(0, |(i, _)| i)
 }
 
 #[cfg(test)]
