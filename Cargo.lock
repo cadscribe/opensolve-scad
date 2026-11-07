@@ -484,14 +484,14 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
 name = "opensolve-glyphs"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "ttf-parser",
 ]
 
 [[package]]
 name = "opensolve-kernel"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "boolmesh",
  "opensolve-manifold",
@@ -499,7 +499,7 @@ dependencies = [
 
 [[package]]
 name = "opensolve-manifold"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "cc",
  "cxx",
@@ -512,7 +512,7 @@ dependencies = [
 
 [[package]]
 name = "opensolve-scad"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "clipper2-rust",
  "opensolve-glyphs",
@@ -521,7 +521,7 @@ dependencies = [
 
 [[package]]
 name = "opensolve-scad-cli"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "opensolve-kernel",
  "opensolve-scad",
@@ -529,7 +529,7 @@ dependencies = [
 
 [[package]]
 name = "opensolve-scad-lsp"
-version = "0.1.4"
+version = "0.2.0"
 dependencies = [
  "opensolve-scad",
  "serde_json",
